@@ -323,6 +323,21 @@ textarea {
   transform: none;
 }
 
+.danger {
+  background: var(--danger, #c44);
+  color: #fff;
+  border: none;
+  border-radius: 0.45rem;
+  padding: 0.48rem 1rem;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.85rem;
+  transition: opacity 0.15s;
+}
+.danger:hover {
+  opacity: 0.85;
+}
+
 /* ——— Progress ——— */
 
 .progress-wrap {

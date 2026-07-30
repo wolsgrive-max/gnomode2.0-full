@@ -19,10 +19,23 @@ from .models import (
     TokenParseResult,
 )
 from .replay import parse_token
+from .wallet_metrics import (
+    balance_filter_active,
+    hold_time_filter_active,
+    tokens_7d_filter_active,
+)
 
 logger = logging.getLogger(__name__)
 
 _LOG_MAX = 250
+
+
+def _wallet_filters_active(req: ParseRequest) -> bool:
+    return (
+        balance_filter_active(req)
+        or hold_time_filter_active(req)
+        or tokens_7d_filter_active(req)
+    )
 
 
 class JobStore:
@@ -32,6 +45,20 @@ class JobStore:
 
     def get(self, job_id: str) -> JobResponse | None:
         return self._jobs.get(job_id)
+
+    async def cancel(self, job_id: str) -> bool:
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if not job or job.status not in (JobStatus.queued, JobStatus.running):
+                return False
+            job.status = JobStatus.error
+            job.error = "Cancelled by user"
+            job.progress = JobProgress(stage="error", message="Отменено пользователем", percent=100)
+        return True
+
+    def _is_cancelled(self, job_id: str) -> bool:
+        job = self._jobs.get(job_id)
+        return job is not None and job.status == JobStatus.error
 
     def has_active(self) -> bool:
         """True if any parse job is queued or running (used to yield resources)."""
@@ -88,6 +115,9 @@ class JobStore:
                     setattr(job, k, v)
 
     async def _run(self, job_id: str, req: ParseRequest) -> None:
+        # If already cancelled before we started, bail.
+        if self._is_cancelled(job_id):
+            return
         threshold = (
             req.mcap_threshold
             if req.mcap_threshold is not None
@@ -102,17 +132,24 @@ class JobStore:
         results: list[TokenParseResult] = []
         tokens = [t.strip() for t in req.tokens if t.strip()]
         n = max(len(tokens), 1)
+        # Parallel tokens + wallet filters (hold getLogs / Blockscout) starve the
+        # public RPC and look "frozen". Keep concurrency for bare parses only.
+        if _wallet_filters_active(req):
+            concurrency = 1
+        else:
+            concurrency = max(1, min(settings.parse_token_concurrency, len(tokens) or 1))
+        sem = asyncio.Semaphore(concurrency)
+        token_frac = [0.0] * len(tokens)
+        slots: list[TokenParseResult | None] = [None] * len(tokens)
 
-        try:
-            for i, token in enumerate(tokens):
-                base = i / n
-                span = 1.0 / n
+        async def run_one(i: int, token: str) -> None:
+            async with sem:
                 await self._update(
                     job_id,
                     progress=JobProgress(
                         stage="token",
-                        message=f"Token {i + 1}/{n}: {token[:10]}…",
-                        percent=round(base * 100, 2),
+                        message=f"Token {i + 1}/{len(tokens)}: {token[:10]}…",
+                        percent=round((sum(token_frac) / n) * 100, 2),
                         current_token=token,
                     ),
                 )
@@ -122,47 +159,75 @@ class JobStore:
                     message: str,
                     percent: float,
                     _i=i,
-                    _base=base,
-                    _span=span,
                     _token=token,
                 ):
+                    token_frac[_i] = min(max(percent, 0.0), 0.99)
                     await self._update(
                         job_id,
                         progress=JobProgress(
                             stage=stage,
                             message=message,
-                            percent=round((_base + percent * _span) * 100, 2),
+                            percent=round((sum(token_frac) / n) * 100, 2),
                             current_token=_token,
                         ),
                     )
 
                 try:
-                    result = await parse_token(
-                        rpc,
-                        token,
-                        threshold,
-                        on_progress=on_progress,
-                        exclude_honeypots=req.exclude_honeypots,
-                        wallet_filters=req,
+                    result = await asyncio.wait_for(
+                        parse_token(
+                            rpc,
+                            token,
+                            threshold,
+                            on_progress=on_progress,
+                            exclude_honeypots=req.exclude_honeypots,
+                            wallet_filters=req,
+                        ),
+                        timeout=600,
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("Failed parsing %s", token)
                     result = TokenParseResult(token=token, error=str(exc))
                     await on_progress("error", f"Token failed: {exc}", 1.0)
-                results.append(result)
-                await self._update(job_id, results=list(results))
 
-            total_wallets = sum(len(r.buyers) for r in results)
-            await self._update(
-                job_id,
-                status=JobStatus.done,
-                results=results,
-                progress=JobProgress(
-                    stage="done",
-                    message=f"Done — {total_wallets} wallets across {len(results)} token(s)",
-                    percent=100,
-                ),
-            )
+                token_frac[i] = 1.0
+                slots[i] = result
+                # Preserve token order in the live results list.
+                ordered = [r for r in slots if r is not None]
+                await self._update(job_id, results=ordered)
+
+        try:
+            if not tokens:
+                if not self._is_cancelled(job_id):
+                    await self._update(
+                        job_id,
+                        status=JobStatus.done,
+                        results=[],
+                        progress=JobProgress(
+                            stage="done", message="Done — no tokens", percent=100
+                        ),
+                    )
+                return
+
+            if concurrency == 1:
+                for i, token in enumerate(tokens):
+                    await run_one(i, token)
+            else:
+                await asyncio.gather(*[run_one(i, t) for i, t in enumerate(tokens)])
+
+            # Don't overwrite cancelled status.
+            if not self._is_cancelled(job_id):
+                results = [r for r in slots if r is not None]
+                total_wallets = sum(len(r.buyers) for r in results)
+                await self._update(
+                    job_id,
+                    status=JobStatus.done,
+                    results=results,
+                    progress=JobProgress(
+                        stage="done",
+                        message=f"Done — {total_wallets} wallets across {len(results)} token(s)",
+                        percent=100,
+                    ),
+                )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Job %s failed", job_id)
             await self._update(

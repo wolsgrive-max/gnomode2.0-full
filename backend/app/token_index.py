@@ -163,6 +163,35 @@ class TokenIndex:
             gmgn_url=f"https://gmgn.ai/robinhood/token/{entry.address}",
         )
 
+    def _maybe_track_mcap(self, entry: TokenEntry) -> None:
+        """Fire-and-forget: track sub-target tokens / analyze those already above."""
+        from .config import settings
+
+        if not settings.mcap_tracker_enabled:
+            return
+        screened = entry.screened
+        if not screened or not screened.market_cap or screened.market_cap <= 0:
+            return
+        target = settings.mcap_tracker_target
+        mcap = float(screened.market_cap)
+        if mcap < target:
+            from .mcap_checker import add_token_to_tracker
+
+            asyncio.ensure_future(
+                add_token_to_tracker(
+                    token_address=entry.address,
+                    symbol=screened.symbol or "",
+                    name=screened.name or "",
+                    dex=entry.dex or screened.dex_id or "",
+                    pool_id=entry.pool_id or "",
+                    first_seen_mcap=mcap,
+                )
+            )
+        else:
+            from .mcap_checker import analyze_already_above
+
+            asyncio.ensure_future(analyze_already_above(entry.address, mcap))
+
     def _prune(self) -> None:
         if not self.last_tip:
             return
@@ -238,9 +267,13 @@ class TokenIndex:
             topics = log["topics"]
             if len(topics) < 2:
                 continue
-            # V4 Initialize data = (currency0, currency1, fee, tickSpacing, hooks, ...)
-            currency0 = _data_word_addr(log["data"], 0)
-            currency1 = _data_word_addr(log["data"], 1)
+            # RH V4 Initialize: currency0/currency1 are indexed (topics[2], topics[3]).
+            if len(topics) >= 4:
+                currency0 = _topic_addr(topics[2])
+                currency1 = _topic_addr(topics[3])
+            else:
+                currency0 = _data_word_addr(log["data"], 0)
+                currency1 = _data_word_addr(log["data"], 1)
             pool_id = topics[1]
             pool_id_hex = (
                 pool_id.hex() if isinstance(pool_id, (bytes, bytearray)) else str(pool_id)
@@ -330,6 +363,7 @@ class TokenIndex:
                 elif entry.screened is None:
                     entry.screened = self._minimal(entry)
                 entry.enriched_at = stamp
+                self._maybe_track_mcap(entry)
             done += 1
             if on_progress and (done == total or done % 5 == 0):
                 await on_progress(
@@ -346,8 +380,9 @@ class TokenIndex:
     def _parse_active() -> bool:
         try:
             from .jobs import jobs
+            from .watch import watch_runner
 
-            return jobs.has_active()
+            return jobs.has_active() or bool(getattr(watch_runner, "running", False))
         except Exception:  # noqa: BLE001
             return False
 
@@ -363,12 +398,25 @@ class TokenIndex:
                 self.building = True
             parse_busy = self._parse_active()
             if parse_busy and not cold:
-                # Yield the entire RPC budget to the wallet parser — skip both
-                # the getLogs scan and stale enrichment while a parse is running.
-                logger.info("parse job active — skipping index scan/enrich this cycle")
+                # Yield the entire RPC budget to the wallet parser / watch —
+                # skip getLogs scan and stale enrichment while they run.
+                logger.info("parse/watch active — skipping index scan/enrich this cycle")
                 return
             await self.scan_new_pools(full=cold, on_progress=on_progress)
             self._prune()
+            # Mid-cold: background builds yield to *manual* parse jobs so they
+            # aren't starved by index RPC. Never defer when ensure_ready/screen
+            # is driving this refresh (on_progress set) — watch itself waits on
+            # enrich, so skipping it returns an empty screener pool.
+            # Leave cold_started=False so the next idle cycle finishes enrich.
+            if (
+                cold
+                and on_progress is None
+                and self._parse_active()
+            ):
+                logger.info("parse/watch active mid-cold — deferring enrich")
+                self.building = False
+                return
             if cold:
                 # One-time full enrichment — complete coverage.
                 stale_limit: int | None = None
@@ -385,9 +433,13 @@ class TokenIndex:
         """Block until the first cold build completes (used by a screen job)."""
         if self.cold_started:
             return
-        if self._refreshing:
-            while self._refreshing and not self.cold_started:
-                await asyncio.sleep(0.5)
+        # Wait out an in-flight background build; if it deferred enrich we
+        # finish the cold start ourselves (must not return with empty pool).
+        while self._refreshing:
+            await asyncio.sleep(0.5)
+            if self.cold_started:
+                return
+        if self.cold_started:
             return
         await self.refresh(full=True, on_progress=on_progress)
 

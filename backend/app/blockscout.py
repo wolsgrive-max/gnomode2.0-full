@@ -56,12 +56,14 @@ async def fetch_token_info(token: str) -> dict[str, Any] | None:
         return None
 
 
-async def iter_token_transfers(token: str) -> AsyncIterator[dict[str, Any]]:
+async def iter_token_transfers(token: str, max_pages: int = 50) -> AsyncIterator[dict[str, Any]]:
     """Paginate ERC-20 transfers for a token (newest first on Blockscout)."""
     url = f"{_base_url()}/tokens/{token}/transfers"
     params: dict[str, Any] = {}
     client = http_client()
-    while True:
+    page = 0
+    while page < max_pages:
+        page += 1
         try:
             resp = await client.get(url, params=params, headers=_headers())
             if resp.status_code != 200:

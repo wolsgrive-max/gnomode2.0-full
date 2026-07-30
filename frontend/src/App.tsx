@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import ScreenerPage from './ScreenerPage'
 import WatchPage from './WatchPage'
+import SnipersPage from './SnipersPage'
 import { FilterPresets } from './FilterPresets'
 import { loadJson, saveJson } from './session'
 import { useVisitedGmgnWallets } from './useVisitedGmgnWallets'
@@ -83,7 +84,7 @@ type SortKey =
   | 'wallet_balance_eth'
   | 'hold_time_minutes'
   | 'tokens_traded_7d'
-type AppPage = 'buyers' | 'screener' | 'watch'
+type AppPage = 'buyers' | 'screener' | 'watch' | 'snipers'
 
 type WalletFilters = {
   min_wallet_balance_eth: string
@@ -309,11 +310,23 @@ function EarlyBuyersPage({
   useEffect(() => {
     if (!job || (job.status !== 'queued' && job.status !== 'running')) return
     const id = job.job_id
+    const staleTimer = setTimeout(() => {
+      setJob((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: 'error',
+              error: 'Задача зависла — превышено 10 мин. Попробуйте снова.',
+              progress: { ...prev.progress, stage: 'error', message: 'Timeout' },
+            }
+          : prev,
+      )
+      setBusy(false)
+    }, 10 * 60 * 1000)
     const t = setInterval(async () => {
       try {
         const res = await fetch(`/api/parse/${id}`)
         if (res.status === 404) {
-          // Server restarted — keep last snapshot from localStorage/state.
           setJob((prev) =>
             prev
               ? {
@@ -343,8 +356,20 @@ function EarlyBuyersPage({
         setBusy(false)
       }
     }, 1200)
-    return () => clearInterval(t)
+    return () => {
+      clearInterval(t)
+      clearTimeout(staleTimer)
+    }
   }, [job?.job_id, job?.status])
+
+  const cancelParse = useCallback(async () => {
+    if (!job) return
+    try {
+      await fetch(`/api/parse/${job.job_id}`, { method: 'DELETE' })
+    } catch { /* ignore */ }
+    setJob(null)
+    setBusy(false)
+  }, [job])
 
   const startParse = useCallback(async () => {
     setError(null)
@@ -450,6 +475,11 @@ function EarlyBuyersPage({
           >
             {busy ? 'Парсинг…' : 'Парсить'}
           </button>
+          {busy && (
+            <button className="danger" onClick={cancelParse} style={{ marginLeft: 8 }}>
+              Отмена
+            </button>
+          )}
         </div>
         <FilterPresets
           storageKey="gnomode.presets.wallets"
@@ -825,6 +855,13 @@ export default function App() {
         >
           Автопарс
         </button>
+        <button
+          type="button"
+          className={page === 'snipers' ? 'nav-link active' : 'nav-link'}
+          onClick={() => setPage('snipers')}
+        >
+          Миграции
+        </button>
       </nav>
 
       {/* Keep pages mounted so results survive tab switches */}
@@ -836,6 +873,9 @@ export default function App() {
       </div>
       <div hidden={page !== 'watch'}>
         <WatchPage />
+      </div>
+      <div hidden={page !== 'snipers'}>
+        <SnipersPage />
       </div>
 
       <footer className="foot">

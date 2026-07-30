@@ -1,4 +1,4 @@
-"""Scheduled watch pipeline: catch-up → screen → parse → dedup → Telegram."""
+"""Scheduled watch pipeline: catch-up → screen → parse → dedup → Telegram → track."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import time
 from .chain import RpcClient
 from .config import settings
 from .jobs import jobs
+from .launchpads.types import SniperHit
 from .models import (
     BuyerRow,
     JobLogEntry,
@@ -19,6 +20,7 @@ from .models import (
 )
 from .replay import parse_token
 from .screener import screen_tokens
+from .sniper_score import record_sniper_trade
 from .telegram import resolve_chat_id, resolve_topic_id, send_buyers, telegram_configured
 from .watch_store import WatchStore, catchup_lookback_hours, watch_store
 
@@ -27,6 +29,54 @@ logger = logging.getLogger(__name__)
 _LOG_MAX = 400
 # Reloads / brief downtime must not open a useless 0.2–0.5h catch-up window.
 _MIN_CATCHUP_GAP_SEC = 3600.0
+
+
+async def track_one_token_buyers(
+    buyers: list[BuyerRow],
+    *,
+    max_first_mcap: float | None = None,
+) -> int:
+    """Push wallets with exactly one distinct 7d token into sniper follow tracking.
+
+    Requires tokens_traded_7d == 1 and first-buy mcap ≤ max_first_mcap.
+    RayBot rule: 1 token = 1 trade_count. Returns how many new wallet+token pairs
+    were recorded.
+    """
+    mcap_cap = (
+        settings.sniper_max_first_mcap
+        if max_first_mcap is None
+        else float(max_first_mcap)
+    )
+    tracked = 0
+    for b in buyers:
+        if b.tokens_traded_7d is None or int(b.tokens_traded_7d) != 1:
+            continue
+        first_mcap = float(b.mcap_at_first_buy or 0)
+        if first_mcap <= 0 or first_mcap > mcap_cap:
+            continue
+        try:
+            ok = await record_sniper_trade(
+                b.wallet,
+                b.token,
+                hit=SniperHit(
+                    wallet=b.wallet,
+                    block=int(b.first_block or 0),
+                    tx=b.first_tx or "",
+                    amount_usd=float(b.bought_usd or 0),
+                    mcap_at_trade=first_mcap,
+                ),
+                min_buy_usd=0.0,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to track one-token wallet %s on %s",
+                b.wallet[:10],
+                b.token[:10],
+            )
+            continue
+        if ok:
+            tracked += 1
+    return tracked
 
 
 def apply_catchup_to_screen(
@@ -68,6 +118,10 @@ class WatchRunner:
         self._last_buyers_sent = 0
         self._last_buyers_skipped = 0
         self._log: list[JobLogEntry] = []
+
+    @property
+    def running(self) -> bool:
+        return self._running
 
     def _append_log(
         self,
@@ -315,6 +369,7 @@ class WatchRunner:
                         )
                     # Unrelated config edits: keep the same deadline (do not reset timer).
         except asyncio.CancelledError:
+            logger.warning("Watch runner cancelled")
             await announce_death_async("задача автопарса отменена (shutdown)")
             raise
         except Exception as exc:  # noqa: BLE001
@@ -469,6 +524,16 @@ class WatchRunner:
             percent=20,
         )
 
+        # MCAP tracker runs in its own background loop — don't block parse here.
+        # A stuck 10k+ tracker tick previously froze the whole watch cycle.
+        mt_cfg = getattr(cfg, "mcap_tracker", None)
+        if mt_cfg is None or mt_cfg.enabled:
+            self._append_log(
+                "mcap_tracker",
+                "MCAP tracker — фоновый цикл (не блокирует парсинг)",
+                percent=22,
+            )
+
         tokens = [t.address for t in screened[: cfg.max_tokens_per_cycle]]
         if not tokens:
             self._last_tokens_parsed = 0
@@ -496,6 +561,9 @@ class WatchRunner:
             min_tokens_traded_7d=cfg.wallet.min_tokens_traded_7d,
             max_tokens_traded_7d=cfg.wallet.max_tokens_traded_7d,
         )
+        min_buy_usd = getattr(cfg.wallet, "min_buy_usd", None)
+        if min_buy_usd is None:
+            min_buy_usd = settings.min_buy_usd or None
 
         rpc = RpcClient()
         parsed = 0
@@ -508,126 +576,178 @@ class WatchRunner:
         tg_failed = False
         seen = self._store.load_seen()
 
-        for i, token in enumerate(tokens):
-            if self._stop_requested:
-                self._last_message = f"Остановлено ({parsed}/{n})"
-                self._append_log("stop", self._last_message)
-                interrupted = True
-                break
+        # Parallel only when heavy wallet filters are off — otherwise RPC/Blockscout
+        # contention makes the cycle look frozen (same as manual parse).
+        heavy_filters = any(
+            x is not None
+            for x in (
+                cfg.wallet.min_wallet_balance_eth,
+                cfg.wallet.max_wallet_balance_eth,
+                cfg.wallet.min_hold_time_minutes,
+                cfg.wallet.max_hold_time_minutes,
+                cfg.wallet.min_tokens_traded_7d,
+                cfg.wallet.max_tokens_traded_7d,
+            )
+        )
+        parse_conc = 1 if heavy_filters else min(2, max(1, n))
+        parse_sem = asyncio.Semaphore(parse_conc)
+        parse_lock = asyncio.Lock()
+
+        async def _parse_one(i: int, token: str) -> None:
+            nonlocal parsed, found_total, new_total, sent_total, skipped_total
+            nonlocal interrupted, tg_failed, seen
+            if self._stop_requested or interrupted or tg_failed:
+                return
             if jobs.has_active():
+                interrupted = True
                 self._last_message = f"Остановлено — ручной парсинг ({parsed}/{n})"
                 self._append_log("skip", self._last_message)
-                logger.info("Watch cycle interrupted by manual parse")
-                interrupted = True
-                break
-            self._last_message = f"Парсинг {i + 1}/{n}: {token[:10]}…"
-            self._append_log(
-                "parse",
-                self._last_message,
-                percent=20 + 70 * (i / max(n, 1)),
-                token=token,
-            )
+                return
 
-            async def on_tok_progress(
-                stage: str,
-                message: str,
-                percent: float,
-                _i=i,
-                _n=n,
-                _token=token,
-            ) -> None:
-                overall = 20 + 70 * ((_i + percent) / max(_n, 1))
-                self._last_message = message
-                self._append_log(stage, message, percent=round(overall, 1), token=_token)
-
-            try:
-                result = await parse_token(
-                    rpc,
-                    token,
-                    threshold,
-                    on_progress=on_tok_progress,
-                    exclude_honeypots=cfg.wallet.exclude_honeypots,
-                    wallet_filters=wallet_req,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Watch parse failed for %s", token)
-                self._append_log("error", f"Ошибка парса {token[:10]}…: {exc}", token=token)
-                continue
-            parsed += 1
-            buyers = list(result.buyers)
-            found_total += len(buyers)
-            self._last_tokens_parsed = parsed
-            self._last_buyers_found = found_total
-            self._append_log(
-                "parse",
-                f"{token[:10]}… → {len(buyers)} кош."
-                + (f" ({result.error})" if result.error else ""),
-                token=token,
-            )
-
-            # Dedup + send immediately per token (don't wait for the full cycle).
-            new_buyers: list[BuyerRow] = []
-            for b in buyers:
-                key = f"{b.wallet.lower()}:{b.token.lower()}"
-                if key in seen:
-                    skipped_total += 1
-                else:
-                    new_buyers.append(b)
-            self._last_buyers_skipped = skipped_total
-            self._last_buyers_new = new_total + len(new_buyers)
-
-            if not new_buyers:
-                continue
-            if self._stop_requested:
-                interrupted = True
-                self._last_message = "Остановлено перед отправкой в Telegram"
-                self._append_log("stop", self._last_message)
-                break
-
-            self._last_message = (
-                f"Telegram: отправка {len(new_buyers)} кош. "
-                f"({token[:10]}…, {i + 1}/{n})"
-            )
-            self._append_log("telegram", self._last_message, token=token)
-            try:
-                header = (
-                    f"Автопарс · догон · {len(new_buyers)} кош."
-                    if catchup
-                    else f"Автопарс · {len(new_buyers)} кош."
-                )
-                _msgs, sent = await send_buyers(
-                    chat, new_buyers, header=header, topic_id=topic_id
-                )
-            except Exception as exc:  # noqa: BLE001
-                self._last_error = str(exc)
-                self._last_message = f"Ошибка Telegram: {exc}"
-                self._append_log("error", self._last_message, token=token)
-                tg_failed = True
-                # Keep parsing other tokens; unsent pairs stay unseen for retry.
-                continue
-
-            if sent:
-                pairs = [(b.wallet, b.token) for b in sent]
-                self._store.mark_seen(pairs)
-                for b in sent:
-                    seen.add(f"{b.wallet.lower()}:{b.token.lower()}")
-                sent_total += len(sent)
-                new_total += len(sent)
-            self._last_buyers_sent = sent_total
-            self._last_buyers_new = new_total
-            partial = len(new_buyers) - len(sent)
-            if partial > 0:
-                self._last_error = (
-                    f"Частичная отправка в Telegram: {len(sent)}/{len(new_buyers)}"
-                )
-                self._append_log("error", self._last_error, token=token)
-            else:
+            async with parse_sem:
+                if self._stop_requested or interrupted or tg_failed:
+                    return
+                self._last_message = f"Парсинг {i + 1}/{n}: {token[:10]}…"
                 self._append_log(
-                    "telegram",
-                    f"Отправлено {len(sent)} кош. по {token[:10]}… "
-                    f"(всего за цикл {sent_total})",
+                    "parse",
+                    self._last_message,
+                    percent=20 + 70 * (i / max(n, 1)),
                     token=token,
                 )
+
+                async def on_tok_progress(
+                    stage: str,
+                    message: str,
+                    percent: float,
+                    _i=i,
+                    _n=n,
+                    _token=token,
+                ) -> None:
+                    overall = 20 + 70 * ((_i + percent) / max(_n, 1))
+                    self._last_message = message
+                    self._append_log(stage, message, percent=round(overall, 1), token=_token)
+
+                try:
+                    result = await parse_token(
+                        rpc,
+                        token,
+                        threshold,
+                        on_progress=on_tok_progress,
+                        exclude_honeypots=cfg.wallet.exclude_honeypots,
+                        wallet_filters=wallet_req,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Watch parse failed for %s", token)
+                    self._append_log(
+                        "error", f"Ошибка парса {token[:10]}…: {exc}", token=token
+                    )
+                    return
+
+                buyers = list(result.buyers)
+                async with parse_lock:
+                    parsed += 1
+                    found_total += len(buyers)
+                    self._last_tokens_parsed = parsed
+                    self._last_buyers_found = found_total
+                self._append_log(
+                    "parse",
+                    f"{token[:10]}… → {len(buyers)} кош."
+                    + (f" ({result.error})" if result.error else ""),
+                    token=token,
+                )
+
+                # Eligible for Telegram + tracking (mcap / min buy only).
+                eligible: list[BuyerRow] = []
+                new_buyers: list[BuyerRow] = []
+                local_skipped = 0
+                for b in buyers:
+                    if threshold is not None and b.mcap_at_first_buy > threshold:
+                        local_skipped += 1
+                        continue
+                    if min_buy_usd and (b.bought_usd or 0) < float(min_buy_usd):
+                        local_skipped += 1
+                        continue
+                    eligible.append(b)
+                    key = f"{b.wallet.lower()}:{b.token.lower()}"
+                    if key in seen:
+                        local_skipped += 1
+                    else:
+                        new_buyers.append(b)
+
+                # One-token wallets (7d==1, first mcap ≤ threshold) → sniper follow.
+                tracked_n = await track_one_token_buyers(
+                    eligible,
+                    max_first_mcap=(
+                        float(threshold)
+                        if threshold is not None
+                        else settings.sniper_max_first_mcap
+                    ),
+                )
+                if tracked_n:
+                    self._append_log(
+                        "track",
+                        f"На отслеживание: {tracked_n} кош. (1 токен) по {token[:10]}…",
+                        token=token,
+                    )
+
+                async with parse_lock:
+                    skipped_total += local_skipped
+                    self._last_buyers_skipped = skipped_total
+                    self._last_buyers_new = new_total + len(new_buyers)
+
+                if not new_buyers:
+                    return
+
+                async with parse_lock:
+                    if tg_failed or self._stop_requested:
+                        return
+                    header = (
+                        f"Автопарс · догон · {len(new_buyers)} кош."
+                        if catchup
+                        else f"Автопарс · {len(new_buyers)} кош."
+                    )
+                    try:
+                        _msgs, sent_buyers = await send_buyers(
+                            chat, new_buyers, header=header, topic_id=topic_id
+                        )
+                        if sent_buyers:
+                            pairs = [(b.wallet, b.token) for b in sent_buyers]
+                            self._store.mark_seen(pairs)
+                            for b in sent_buyers:
+                                seen.add(f"{b.wallet.lower()}:{b.token.lower()}")
+                            new_total += len(sent_buyers)
+                            sent_total += len(sent_buyers)
+                            self._last_buyers_new = new_total
+                            self._last_buyers_sent = sent_total
+                        partial = len(new_buyers) - len(sent_buyers)
+                        if partial > 0:
+                            self._last_error = (
+                                f"Частичная отправка в Telegram: "
+                                f"{len(sent_buyers)}/{len(new_buyers)}"
+                            )
+                            self._append_log("error", self._last_error, token=token)
+                        else:
+                            self._append_log(
+                                "telegram",
+                                f"Отправлено {len(sent_buyers)} кош. по {token[:10]}… "
+                                f"(всего за цикл {sent_total})",
+                                token=token,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception("Telegram send failed")
+                        self._last_error = str(exc)
+                        tg_failed = True
+                        self._append_log("error", f"Telegram: {exc}", token=token)
+
+        if parse_conc == 1:
+            for i, token in enumerate(tokens):
+                if self._stop_requested or interrupted or tg_failed:
+                    break
+                await _parse_one(i, token)
+        else:
+            await asyncio.gather(*[_parse_one(i, t) for i, t in enumerate(tokens)])
+            if jobs.has_active() and parsed < n:
+                interrupted = True
 
         self._last_tokens_parsed = parsed
         self._last_buyers_found = found_total

@@ -67,6 +67,14 @@ def classify_security(address: str, info: dict[str, Any] | None) -> TokenSecurit
         return TokenSecurity(addr, True, "cannot_buy", info)
     if _truthy(info.get("is_blacklisted")):
         return TokenSecurity(addr, True, "is_blacklisted", info)
+    if _truthy(info.get("is_in_dest_blacklist")):
+        return TokenSecurity(addr, True, "is_in_dest_blacklist", info)
+    if _truthy(info.get("selfdestruct")) or _truthy(info.get("is_self_destruct")):
+        return TokenSecurity(addr, True, "selfdestruct", info)
+    if _truthy(info.get("owner_change_balance")):
+        return TokenSecurity(addr, True, "owner_change_balance", info)
+    if _truthy(info.get("can_take_back_ownership")):
+        return TokenSecurity(addr, True, "can_take_back_ownership", info)
     if _truthy(info.get("is_anti_whale")) and _truthy(info.get("anti_whale_modifiable")):
         return TokenSecurity(addr, True, "anti_whale_modifiable", info)
     if _truthy(info.get("trading_cooldown")):

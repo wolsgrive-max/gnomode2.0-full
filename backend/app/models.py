@@ -184,6 +184,166 @@ class WatchWalletFilters(BaseModel):
     max_hold_time_minutes: float | None = None
     min_tokens_traded_7d: float | None = None
     max_tokens_traded_7d: float | None = None
+    min_buy_usd: float | None = None
+
+
+class SniperRow(BaseModel):
+    address: str
+    first_seen: str | None = None
+    trade_count: int = 0
+    winrate: float | None = None
+    first_token: str | None = None
+    first_mcap: float | None = None
+    is_active: bool = True
+
+
+class UserFilters(BaseModel):
+    chat_id: str
+    min_buy_usd: float = 50.0
+    max_mcap_usd: float = 150_000.0
+    exclude_honeypots: bool = True
+    min_liq_usd: float = 0.0
+    max_liq_usd: float = 0.0
+    updated_at: str | None = None
+
+
+class UserFiltersUpdate(BaseModel):
+    min_buy_usd: float | None = None
+    max_mcap_usd: float | None = None
+    exclude_honeypots: bool | None = None
+    min_liq_usd: float | None = None
+    max_liq_usd: float | None = None
+
+
+class SniperFollowStatus(BaseModel):
+    enabled: bool = True
+    running: bool = False
+    last_block: int = 0
+    tracked_cached: int = 0
+    trades_seen: int = 0
+    alerts_sent: int = 0
+    last_message: str = ""
+
+
+class MigratedTokenRow(BaseModel):
+    address: str
+    symbol: str | None = None
+    name: str | None = None
+    launchpad_id: str | None = None
+    dex: str | None = None
+    pool_id: str | None = None
+    curve_address: str | None = None
+    migration_block: int | None = None
+    migration_tx: str | None = None
+    honeypot: bool = False
+    start_mcap: float | None = None
+    mcap_usd: float | None = None
+    liquidity_usd: float | None = None
+    created_at: str | None = None
+
+
+class WalletTradeRow(BaseModel):
+    id: int
+    wallet: str
+    token: str
+    mcap_at_trade: float | None = None
+    amount_usd: float | None = None
+    tx_hash: str | None = None
+    block: int | None = None
+    trade_number: int | None = None
+    created_at: str | None = None
+
+
+class BlacklistRow(BaseModel):
+    address: str
+    reason: str | None = None
+    source: str | None = None
+    created_at: str | None = None
+
+
+class BlacklistRequest(BaseModel):
+    address: str
+    reason: str = ""
+    source: str = "manual"
+
+
+class MigrationParseRequest(BaseModel):
+    token: str
+    launchpad_id: str | None = None  # auto-detect if omitted
+
+
+class MigrationParseResult(BaseModel):
+    ok: bool
+    token: str
+    launchpad_id: str = ""
+    dex: str = ""
+    honeypot: bool = False
+    snipers: int = 0
+    new_pairs: int = 0
+    message: str = ""
+
+
+class MigrationBusStatus(BaseModel):
+    enabled: bool = True
+    running: bool = False
+    last_seen_block: int = 0
+    queue_size: int = 0
+    wss_url: str = ""
+
+
+class MigrationScanRequest(BaseModel):
+    hours: float = Field(default=168.0, ge=1.0, le=720.0)
+    max_tokens: int = Field(default=500, ge=1, le=2000)
+
+
+class MigrationScanJobResponse(BaseModel):
+    job_id: str
+    status: JobStatus
+    progress: JobProgress
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+
+class McapTrackerConfig(BaseModel):
+    enabled: bool = True
+    interval_sec: int = Field(default=300, ge=60, le=86400)
+    target_mcap: float = Field(default=50_000.0, ge=0)
+    max_age_days: int = Field(default=7, ge=1, le=90)
+
+
+class McapTrackerRow(BaseModel):
+    address: str
+    symbol: str | None = None
+    name: str | None = None
+    launchpad_id: str | None = None
+    dex: str | None = None
+    pool_id: str | None = None
+    first_seen_mcap: float | None = None
+    current_mcap: float | None = None
+    peak_mcap: float | None = None
+    last_checked_at: str | None = None
+    trend: str = "unknown"
+    trend_since: str | None = None
+    added_at: str | None = None
+    target_reached_at: str | None = None
+
+
+class McapSnapshotRow(BaseModel):
+    id: int
+    token_address: str
+    mcap: float
+    price_usd: float | None = None
+    liquidity_usd: float | None = None
+    checked_at: str
+
+
+class McapTrackerAddRequest(BaseModel):
+    address: str
+    symbol: str = ""
+    name: str = ""
+    launchpad_id: str = ""
+    dex: str = ""
+    first_seen_mcap: float = 0.0
 
 
 class WatchConfig(BaseModel):
@@ -197,6 +357,7 @@ class WatchConfig(BaseModel):
     gnome_banter_enabled: bool = True
     screen: WatchScreenFilters = Field(default_factory=WatchScreenFilters)
     wallet: WatchWalletFilters = Field(default_factory=WatchWalletFilters)
+    mcap_tracker: McapTrackerConfig = Field(default_factory=McapTrackerConfig)
 
 
 class WatchStatus(BaseModel):

@@ -76,8 +76,8 @@ def _retry_delay(exc: BaseException, attempt: int, base: float = 0.5) -> float:
                 return min(float(ra), 30.0)
             except ValueError:
                 pass
-    # Cap grows with attempt: 0.5 → 1 → 2 → 4 → 8 → 12
-    return min(base * (2**attempt), 12.0)
+    # Cap grows with attempt: 0.5 → 1 → 2 → 4 → 8 → 6
+    return min(base * (2**attempt), 6.0)
 
 
 class CallRevert(Exception):
@@ -118,7 +118,7 @@ class RpcClient:
         self._code_cache: dict[str, bool] = {}
         self._rpc_id = 0
 
-    async def _call(self, coro_factory, retries: int = 8):
+    async def _call(self, coro_factory, retries: int = 5):
         last_exc: Exception | None = None
         for attempt in range(retries):
             async with self._sem:
@@ -156,7 +156,7 @@ class RpcClient:
 
         data = None
         last_exc: Exception | None = None
-        for attempt in range(8):
+        for attempt in range(5):
             try:
                 data = await do_post()
                 break

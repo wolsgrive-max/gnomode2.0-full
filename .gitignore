@@ -13,6 +13,8 @@ __pycache__/
 backend/app/data/watch.json
 backend/app/data/watch_seen.json
 backend/app/data/watch_state.json
+backend/app/data/gnomode.db
+backend/app/data/gnomode.db-*
 
 # Node
 frontend/node_modules/

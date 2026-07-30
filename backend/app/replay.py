@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -37,6 +38,9 @@ from .security import honeypot_reason_for_token
 from .wallet_metrics import enrich_and_filter_buyers
 
 logger = logging.getLogger(__name__)
+
+_MAX_REPLAY_ITERATIONS = 200
+_MAX_REPLAY_SECONDS = 600
 
 ProgressCb = Callable[[str, str, float], Awaitable[None]]
 
@@ -198,7 +202,7 @@ async def parse_token(
 
     if exclude_honeypots:
         await prog("security", "Checking honeypot (GMGN)…", 0.03)
-        reason = await honeypot_reason_for_token(token)
+        reason = await asyncio.wait_for(honeypot_reason_for_token(token), timeout=30)
         if reason:
             meta = await rpc.token_meta(token)
             return TokenParseResult(
@@ -216,9 +220,33 @@ async def parse_token(
     pool_task = asyncio.create_task(pick_best_pool(rpc, token))
     eth_task = asyncio.create_task(_eth_usd_price())
     tip_task = asyncio.create_task(rpc.block_number())
-    meta, pool, eth_usd, latest = await asyncio.gather(
-        meta_task, pool_task, eth_task, tip_task
+
+    def _safe_result(t, default=None):
+        try:
+            return t.result()
+        except Exception:
+            return default
+
+    # Meta/price/tip are cheap; pool discovery can stall under RPC 429 —
+    # don't cancel it with the short gather timeout (false "no pool").
+    done, pending = await asyncio.wait(
+        {meta_task, eth_task, tip_task}, timeout=45
     )
+    for t in pending:
+        t.cancel()
+    if not pool_task.done():
+        try:
+            await asyncio.wait_for(pool_task, timeout=120)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pool_task.cancel()
+            try:
+                await pool_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+    meta = _safe_result(meta_task, {"symbol": "", "name": "", "decimals": 18, "total_supply_raw": 0})
+    pool = _safe_result(pool_task, None)
+    eth_usd = _safe_result(eth_task, 0.0)
+    latest = _safe_result(tip_task, 0)
 
     if not meta["symbol"]:
         bs = await fetch_token_info(token)
@@ -244,7 +272,7 @@ async def parse_token(
 
     await prog("pools", "Discovering pools…", 0.08)
     if not pool:
-        result.error = "No Uniswap V2/V3 pool found for this token"
+        result.error = "No Uniswap V2/V3/V4 pool found for this token"
         return result
     result.pool = pool
 
@@ -400,98 +428,142 @@ async def _replay_v2(
     mcap_threshold: float,
     on_progress: ProgressCb,
 ) -> list[BuyerRow]:
-    async def log_prog(frac: float, _a: int, _b: int) -> None:
-        await on_progress("logs", "Fetching Sync/Swap/Transfer logs…", 0.12 + 0.55 * frac)
-
-    # Fetch Sync, Swap, Transfer in parallel topic batches to reduce payload
-    sync_logs, swap_logs, xfer_logs = await _gather_three(
-        rpc.get_logs_chunked(
-            address=pool.address,
-            topics=[SYNC_TOPIC],
-            from_block=start_block,
-            to_block=end_block,
-            on_progress=log_prog,
-        ),
-        rpc.get_logs_chunked(
-            address=pool.address,
-            topics=[V2_SWAP_TOPIC],
-            from_block=start_block,
-            to_block=end_block,
-        ),
-        rpc.get_logs_chunked(
-            address=token,
-            topics=[TRANSFER_TOPIC, "0x" + "0" * 24 + pool.address.lower().replace("0x", "")],
-            from_block=start_block,
-            to_block=end_block,
-        ),
-    )
-
-    await on_progress("replay", "Replaying mcap timeline…", 0.72)
-
-    # Map block+tx → reserves after Sync (Sync usually before Swap in same tx)
-    # Build timeline of all events sorted by (block, logIndex)
-    events: list[tuple[int, int, str, Any]] = []
-    for log in sync_logs:
-        events.append((int(log["blockNumber"]), int(log["logIndex"]), "sync", log))
-    for log in swap_logs:
-        events.append((int(log["blockNumber"]), int(log["logIndex"]), "swap", log))
-    for log in xfer_logs:
-        events.append((int(log["blockNumber"]), int(log["logIndex"]), "xfer", log))
-    events.sort(key=lambda x: (x[0], x[1]))
-
-    # Index transfers from pool by tx hash
-    xfers_by_tx: dict[str, list[Any]] = defaultdict(list)
-    for log in xfer_logs:
-        tx = log["transactionHash"]
-        txh = tx.hex() if isinstance(tx, bytes) else str(tx)
-        xfers_by_tx[txh.lower()].append(log)
-
+    """Stream V2 Sync+Swap windows until mcap crosses threshold; then transfers only to stop."""
+    chunk = min(max(settings.log_chunk_size, 40_000), 50_000)
     reserve0 = 0
     reserve1 = 0
     mcap = 0.0
     crossed = False
-    aggs: dict[str, WalletAgg] = {}
-    early_stop_block: int | None = None
+    stop_block = start_block
+    # (swap_log, mcap_at_buy) — mcap from last Sync reserves before this swap
+    early_swaps: list[tuple[Any, float]] = []
+    cursor = start_block
+    total = max(end_block - start_block + 1, 1)
+    _v2_start = time.monotonic()
+    _v2_iter = 0
 
-    for block, _idx, kind, log in events:
-        if kind == "sync":
-            data = log["data"]
-            reserve0 = decode_uint256(data, 0)
-            reserve1 = decode_uint256(data, 1)
+    while cursor <= end_block and not crossed:
+        _v2_iter += 1
+        if _v2_iter > _MAX_REPLAY_ITERATIONS:
+            logger.warning("V2 replay iteration limit hit for %s", token)
+            break
+        if time.monotonic() - _v2_start > _MAX_REPLAY_SECONDS:
+            logger.warning("V2 replay time limit hit for %s", token)
+            break
+        end = min(cursor + chunk - 1, end_block)
+        await on_progress(
+            "logs",
+            f"V2 Sync/Swap {cursor}–{end}…",
+            0.12 + 0.5 * ((cursor - start_block) / total),
+        )
+        try:
+            sync_logs, swap_logs = await _gather_two(
+                rpc.get_logs(
+                    address=pool.address,
+                    topics=[SYNC_TOPIC],
+                    from_block=cursor,
+                    to_block=end,
+                ),
+                rpc.get_logs(
+                    address=pool.address,
+                    topics=[V2_SWAP_TOPIC],
+                    from_block=cursor,
+                    to_block=end,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            if chunk > 2_000 and any(
+                x in msg
+                for x in (
+                    "limit",
+                    "range",
+                    "too large",
+                    "response",
+                    "timed out",
+                    "timeout",
+                    "query",
+                )
+            ):
+                chunk = max(chunk // 2, 2_000)
+                continue
+            raise
+
+        events: list[tuple[int, int, str, Any]] = []
+        for log in sync_logs:
+            events.append((int(log["blockNumber"]), int(log["logIndex"]), "sync", log))
+        for log in swap_logs:
+            events.append((int(log["blockNumber"]), int(log["logIndex"]), "swap", log))
+        events.sort(key=lambda x: (x[0], x[1]))
+
+        for block, _idx, kind, log in events:
+            if kind == "sync":
+                data = log["data"]
+                reserve0 = decode_uint256(data, 0)
+                reserve1 = decode_uint256(data, 1)
+                price = v2_price_token_in_quote(
+                    reserve0, reserve1, token_is_token0, decimals, quote_decimals
+                )
+                mcap = price * quote_usd * supply_tokens
+                if mcap >= mcap_threshold:
+                    crossed = True
+                    stop_block = block
+                    break
+                continue
+
+            if kind != "swap":
+                continue
+            if reserve0 == 0 and reserve1 == 0:
+                continue
+
             price = v2_price_token_in_quote(
                 reserve0, reserve1, token_is_token0, decimals, quote_decimals
             )
-            mcap = price * quote_usd * supply_tokens
-            if mcap >= mcap_threshold and not crossed:
+            mcap_now = price * quote_usd * supply_tokens if reserve0 and reserve1 else mcap
+            if mcap_now >= mcap_threshold:
                 crossed = True
-                early_stop_block = block
-            continue
+                stop_block = block
+                break
 
-        if kind != "swap":
-            continue
+            early_swaps.append((log, mcap_now))
+            stop_block = block
 
-        # Use mcap BEFORE this swap's sync if sync comes after swap in ordering —
-        # on V2 Sync is emitted after reserves update, often after Swap in log order.
-        # Prefer last known mcap; if Sync follows Swap in same tx, we may use post-price.
-        # Recompute from current reserves (updated by prior Sync events).
-        price = v2_price_token_in_quote(
-            reserve0, reserve1, token_is_token0, decimals, quote_decimals
-        )
-        mcap_now = price * quote_usd * supply_tokens if reserve0 and reserve1 else mcap
+        if crossed:
+            break
+        cursor = end + 1
 
-        if reserve0 == 0 and reserve1 == 0:
-            continue
-        if mcap_now >= mcap_threshold:
-            crossed = True
-            continue
+    if not early_swaps:
+        await on_progress("replay", "No buys under mcap threshold", 0.9)
+        return []
 
+    xfer_to = min(end_block, stop_block + 5)
+    await on_progress("logs", f"Fetching V2 transfers ≤ block {xfer_to}…", 0.72)
+    xfer_logs = await rpc.get_logs_chunked(
+        address=token,
+        topics=[
+            TRANSFER_TOPIC,
+            "0x" + "0" * 24 + pool.address.lower().replace("0x", ""),
+        ],
+        from_block=start_block,
+        to_block=xfer_to,
+        chunk_size=chunk,
+    )
+    xfers_by_tx: dict[str, list[Any]] = defaultdict(list)
+    for log in xfer_logs:
+        tx = log["transactionHash"]
+        txh = (tx.hex() if isinstance(tx, bytes) else str(tx)).lower()
+        xfers_by_tx[txh].append(log)
+
+    await on_progress("replay", f"Resolving {len(early_swaps)} V2 buyers…", 0.85)
+    aggs: dict[str, WalletAgg] = {}
+
+    for log, mcap_now in early_swaps:
         tx = log["transactionHash"]
         txh = (tx.hex() if isinstance(tx, bytes) else str(tx)).lower()
         topics = log["topics"]
-        # topics[2] = `to` indexed
         to_addr = topic_address(topics[2]) if len(topics) > 2 else ""
+        block = int(log["blockNumber"])
 
-        # Prefer Transfer from pool → real wallet
         buyer = None
         amount_raw = 0
         for xfer in xfers_by_tx.get(txh, []):
@@ -503,19 +575,20 @@ async def _replay_v2(
             if frm.lower() != pool.address.lower():
                 continue
             if is_excluded(to, pool.address):
-                # might be router — look for further hop? for v1 take swap `to` if EOA-like
                 continue
             buyer = to
             amount_raw = decode_uint256(xfer["data"], 0)
             break
 
+        data = log["data"]
+        amount0_in = decode_uint256(data, 0)
+        amount1_in = decode_uint256(data, 1)
+        amount0_out = decode_uint256(data, 2)
+        amount1_out = decode_uint256(data, 3)
+
         if buyer is None:
             if is_excluded(to_addr, pool.address):
                 continue
-            # Decode amount out from swap data
-            data = log["data"]
-            amount0_out = decode_uint256(data, 2)
-            amount1_out = decode_uint256(data, 3)
             amount_raw = amount0_out if token_is_token0 else amount1_out
             if amount_raw == 0:
                 continue
@@ -524,12 +597,8 @@ async def _replay_v2(
         if amount_raw == 0:
             continue
 
-        amount_tokens = amount_raw / (10**decimals)
-        # Approximate USD spent: quote amount in
-        data = log["data"]
-        amount0_in = decode_uint256(data, 0)
-        amount1_in = decode_uint256(data, 1)
         quote_in = amount1_in if token_is_token0 else amount0_in
+        amount_tokens = amount_raw / (10**decimals)
         amount_usd = (quote_in / (10**quote_decimals)) * quote_usd
 
         _record_buy(
@@ -542,8 +611,6 @@ async def _replay_v2(
             block=block,
         )
 
-    # Optional early stop note
-    _ = early_stop_block
     return _aggs_to_rows(aggs, token, "")
 
 
@@ -702,8 +769,17 @@ async def _replay_v3(
     crossed = False
     cursor = start_block
     total = max(end_block - start_block + 1, 1)
+    _v3_start = time.monotonic()
+    _v3_iter = 0
 
     while cursor <= end_block and not crossed:
+        _v3_iter += 1
+        if _v3_iter > _MAX_REPLAY_ITERATIONS:
+            logger.warning("V3 replay iteration limit hit for %s", token)
+            break
+        if time.monotonic() - _v3_start > _MAX_REPLAY_SECONDS:
+            logger.warning("V3 replay time limit hit for %s", token)
+            break
         end = min(cursor + chunk - 1, end_block)
         await on_progress(
             "logs",
@@ -855,8 +931,17 @@ async def _replay_v4(
     crossed = False
     cursor = start_block
     total = max(end_block - start_block + 1, 1)
+    _v4_start = time.monotonic()
+    _v4_iter = 0
 
     while cursor <= end_block and not crossed:
+        _v4_iter += 1
+        if _v4_iter > _MAX_REPLAY_ITERATIONS:
+            logger.warning("V4 replay iteration limit hit for %s", token)
+            break
+        if time.monotonic() - _v4_start > _MAX_REPLAY_SECONDS:
+            logger.warning("V4 replay time limit hit for %s", token)
+            break
         end = min(cursor + chunk - 1, end_block)
         await on_progress(
             "logs",
@@ -914,15 +999,7 @@ async def _replay_v4(
         return []
 
     xfer_to = min(end_block, stop_block + 5)
-    await on_progress("logs", f"Fetching transfers ≤ block {xfer_to}…", 0.7)
-    router_froms = [
-        manager,
-        checksum(UNIVERSAL_ROUTER),
-        checksum(UNI_V2_ROUTER),
-        checksum(UNI_V3_ROUTER),
-    ]
-
-    import asyncio
+    await on_progress("logs", f"Fetching V4 transfers ≤ block {xfer_to}…", 0.7)
 
     async def transfers_from(frm: str):
         return await rpc.get_logs_chunked(
@@ -933,15 +1010,17 @@ async def _replay_v4(
             chunk_size=chunk,
         )
 
-    xfer_batches = await asyncio.gather(*[transfers_from(a) for a in router_froms])
-    xfers_by_tx: dict[str, list[Any]] = defaultdict(list)
-    for batch in xfer_batches:
+    def _merge_xfers(batch: list[Any], dest: dict[str, list[Any]]) -> None:
         for log in batch:
             tx = log["transactionHash"]
             txh = (tx.hex() if isinstance(tx, bytes) else str(tx)).lower()
-            xfers_by_tx[txh].append(log)
+            dest[txh].append(log)
 
-    await on_progress("replay", f"Resolving {len(early_swaps)} buyers…", 0.85)
+    # Manager first — covers most V4 buys; routers only if still unresolved.
+    xfers_by_tx: dict[str, list[Any]] = defaultdict(list)
+    _merge_xfers(await transfers_from(manager), xfers_by_tx)
+
+    await on_progress("replay", f"Resolving {len(early_swaps)} buyers…", 0.82)
     buyers_map = await _resolve_buyers_batch(
         rpc,
         token=token,
@@ -949,6 +1028,35 @@ async def _replay_v4(
         early_swaps=early_swaps,
         xfers_by_tx=xfers_by_tx,
     )
+
+    unresolved = []
+    for log in early_swaps:
+        tx = log["transactionHash"]
+        txh = (tx.hex() if isinstance(tx, bytes) else str(tx)).lower()
+        if txh not in buyers_map:
+            unresolved.append(log)
+
+    if unresolved:
+        await on_progress(
+            "logs",
+            f"Router transfers for {len(unresolved)} unresolved swaps…",
+            0.86,
+        )
+        extra_froms = [
+            checksum(UNIVERSAL_ROUTER),
+            checksum(UNI_V2_ROUTER),
+            checksum(UNI_V3_ROUTER),
+        ]
+        extra_batches = await asyncio.gather(*[transfers_from(a) for a in extra_froms])
+        for batch in extra_batches:
+            _merge_xfers(batch, xfers_by_tx)
+        buyers_map = await _resolve_buyers_batch(
+            rpc,
+            token=token,
+            pool_or_manager=manager,
+            early_swaps=early_swaps,
+            xfers_by_tx=xfers_by_tx,
+        )
     aggs: dict[str, WalletAgg] = {}
 
     for log in early_swaps:

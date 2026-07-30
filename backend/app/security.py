@@ -1,7 +1,9 @@
 """Combined honeypot checks for Robinhood Chain.
 
 Primary gate: GMGN token security (same data shown on gmgn.ai) — fast & accurate.
+Secondary: GoPlus token_security (taxes, selfdestruct, owner_change_balance).
 Fallback: DexScreener buy/sell heuristics when GMGN returns unknown.
+RHJ stock tokens are blacklisted via rhj_assets / SQLite.
 On-chain sim is available as an optional deep check but is not used for screener.
 """
 
@@ -11,6 +13,7 @@ import logging
 from typing import Any
 
 from .gmgn import GmgnSecurity, check_token_security, check_tokens_security
+from .goplus import check_token_security as goplus_check
 from .pools import fetch_dexscreener_pairs
 
 logger = logging.getLogger(__name__)
@@ -98,12 +101,26 @@ async def assess_honeypot(
     if blocked:
         return blocked
 
-    # Confident not-honeypot from GMGN → keep
+    go = await goplus_check(address)
+    if go.blocked:
+        return f"goplus:{go.reason or 'blocked'}"
+
     if sec.is_honeypot is False:
         return None
 
-    # Unknown on GMGN → light DexScreener fallback only
     return dexscreener_honeypot_reason(buys_24h=buys_24h, sells_24h=sells_24h)
+
+
+async def assess_migration_security(address: str) -> str | None:
+    """Full gate for migration pipeline: RHJ → GMGN → GoPlus → DexScreener."""
+    from .database import get_db
+    from .rhj_assets import is_rhj_token
+
+    if await get_db().ais_blacklisted(address):
+        return "blacklist"
+    if await is_rhj_token(address):
+        return "rhj_stock_token"
+    return await honeypot_reason_for_token(address)
 
 
 async def assess_tokens_honeypot(
@@ -124,6 +141,10 @@ async def assess_tokens_honeypot(
         if blocked:
             out[key] = blocked
             continue
+        go = await goplus_check(addr)
+        if go.blocked:
+            out[key] = f"goplus:{go.reason or 'blocked'}"
+            continue
         if sec.is_honeypot is False:
             out[key] = None
             continue
@@ -132,7 +153,7 @@ async def assess_tokens_honeypot(
 
 
 async def honeypot_reason_for_token(address: str) -> str | None:
-    """Full check for a single token (GMGN + DexScreener fallback)."""
+    """Full check for a single token (GMGN + GoPlus + DexScreener fallback)."""
     pairs = await fetch_dexscreener_pairs(address)
     pair = best_rh_pair(pairs, address)
     buys, sells = pair_txns_24h(pair)

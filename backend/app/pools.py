@@ -39,14 +39,39 @@ def _norm_hex(value: str) -> str:
 
 
 async def fetch_dexscreener_pairs(token: str) -> list[dict[str, Any]]:
+    """Fetch DexScreener pairs with short retries (empty/429 under load)."""
     url = f"{DEXSCREENER_API}/latest/dex/tokens/{token}"
-    resp = await http_client().get(url)
-    if resp.status_code != 200:
-        logger.warning("DexScreener %s: %s", resp.status_code, resp.text[:200])
-        return []
-    pairs = resp.json().get("pairs") or []
-    rh = [p for p in pairs if str(p.get("chainId", "")).lower() in ("robinhood", "4663")]
-    return rh or pairs
+    last_status: int | None = None
+    for attempt in range(3):
+        try:
+            resp = await http_client().get(url)
+            last_status = resp.status_code
+            if resp.status_code == 429:
+                await asyncio.sleep(0.4 * (attempt + 1))
+                continue
+            if resp.status_code != 200:
+                logger.warning("DexScreener %s: %s", resp.status_code, resp.text[:200])
+                if attempt < 2:
+                    await asyncio.sleep(0.25 * (attempt + 1))
+                    continue
+                return []
+            pairs = resp.json().get("pairs") or []
+            if not pairs and attempt < 2:
+                await asyncio.sleep(0.3 * (attempt + 1))
+                continue
+            rh = [
+                p
+                for p in pairs
+                if str(p.get("chainId", "")).lower() in ("robinhood", "4663")
+            ]
+            return rh or pairs
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("DexScreener attempt %s failed: %s", attempt + 1, exc)
+            if attempt < 2:
+                await asyncio.sleep(0.3 * (attempt + 1))
+    if last_status is not None:
+        logger.warning("DexScreener exhausted retries (last=%s) for %s", last_status, token[:12])
+    return []
 
 
 def _quote_rank(addr: str) -> int:
@@ -190,17 +215,23 @@ async def discover_pools(rpc: RpcClient, token: str, *, deep: bool = False) -> l
     # Fast path: DexScreener already has a liquid trading pool — only enrich the winners
     liquid = [p for p in pools if p.liquidity_usd > 0 or p.dex == "uniswap_v4"]
     if liquid and not deep:
-        # Enrich top V2/V3 candidates in parallel (max 3)
+        # Enrich top V2/V3 candidates in parallel (max 3). On RPC failure keep
+        # the DexScreener row — dropping it caused "no pool" under 429 storms.
         to_enrich = [p for p in liquid if p.dex in ("uniswap_v2", "uniswap_v3")][:3]
         if to_enrich:
-            enriched = await asyncio.gather(*[_enrich_v2v3(rpc, p, token) for p in to_enrich])
+            enriched = await asyncio.gather(
+                *[_enrich_v2v3(rpc, p, token) for p in to_enrich]
+            )
             keep_v4 = [p for p in liquid if p.dex == "uniswap_v4"]
-            pools = [p for p in enriched if p] + keep_v4
+            merged = [enr if enr is not None else orig for orig, enr in zip(to_enrich, enriched)]
+            # Also keep any liquid V2/V3 beyond the top-3 enrich set.
+            rest = [p for p in liquid if p.dex in ("uniswap_v2", "uniswap_v3")][3:]
+            pools = merged + rest + keep_v4
         else:
             pools = liquid
     elif deep or not pools:
         # Slow fallback: factory lookups
-        seen = { (p.pool_id or p.address).lower() for p in pools }
+        seen = {(p.pool_id or p.address).lower() for p in pools}
         tasks = []
         for quote in (USDG, WETH):
             tasks.append(("v2", quote, None))
@@ -244,7 +275,8 @@ async def discover_pools(rpc: RpcClient, token: str, *, deep: bool = False) -> l
         to_enrich = [p for p in pools if p.dex in ("uniswap_v2", "uniswap_v3")]
         enriched = await asyncio.gather(*[_enrich_v2v3(rpc, p, token) for p in to_enrich])
         v4 = [p for p in pools if p.dex == "uniswap_v4"]
-        pools = [p for p in enriched if p] + v4
+        merged = [enr if enr is not None else orig for orig, enr in zip(to_enrich, enriched)]
+        pools = merged + v4
 
     pools.sort(
         key=lambda p: (
@@ -301,7 +333,9 @@ async def estimate_start_block(rpc: RpcClient, pool: PoolInfo) -> int:
                     pass
 
     del lookup
-    return max(1, latest - 300_000)
+    # ~2.2h at ~10 blocks/sec — wide enough when creation time is unknown,
+    # without scanning ~8h of tip history on every parse.
+    return max(1, latest - 80_000)
 
 
 async def find_pair_created_block(rpc: RpcClient, pair: str, token: str) -> int | None:

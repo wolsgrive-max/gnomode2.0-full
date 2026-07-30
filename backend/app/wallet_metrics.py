@@ -11,8 +11,9 @@ Speed / completeness:
 - No stage budgets that abandon wallets mid-fetch.
 - Cheap filters first (balance → hold → tokens 7d); expensive work only on
   survivors.
-- Hold scan walks logs chronologically and stops once every wallet's first
-  sell is known (or the range ends).
+- Hold scan walks logs chronologically (parallel prefetch), drops wallets
+  early once max hold is exceeded without a sell, and stops once every
+  wallet's first sell is known (or the range ends).
 - Tokens-7d stops early when min (pass) or max (fail) is already decided.
 - Bounded retries + shared Blockscout pacing (no infinite spin on 429).
 """
@@ -35,17 +36,21 @@ logger = logging.getLogger(__name__)
 
 ProgressCb = Callable[[str, str, float], Awaitable[None]]
 
-_BLOCKSCOUT_CONCURRENCY = 4
-_BS_MIN_INTERVAL = 0.12  # ~8 req/s shared across the process
+# Blockscout: Pro key → higher throughput; free tier stays conservative.
+# Keep concurrency modest so paced waiters don't look "stuck".
+_BLOCKSCOUT_CONCURRENCY = 6 if settings.blockscout_api_key else 4
+_BS_MIN_INTERVAL = 0.06 if settings.blockscout_api_key else 0.1  # ~16 / ~10 req/s
 _MAX_TRANSFER_PAGES = 12
-_BALANCE_CHUNK_PARALLEL = 2
+_BALANCE_CHUNK_PARALLEL = 3
+_HOLD_PREFETCH = 2  # parallel getLogs windows while scanning hold time
 _MAX_METRIC_ATTEMPTS = 8
+_MAX_HOLD_SECONDS = 300  # 5 min timeout for hold-time prefetch
 
 _BALANCE_TTL = 120.0
 _balance_cache: dict[str, tuple[float, float]] = {}
 
 _TOKENS7D_TTL = 600.0
-_TOKENS7D_CACHE_VER = "v3"
+_TOKENS7D_CACHE_VER = "v4"
 _tokens7d_cache: dict[str, tuple[int, float]] = {}
 
 _HOLDING_TTL = 180.0
@@ -57,6 +62,7 @@ _CACHE_PRUNE_AGE = 3600.0
 _bs_sem = asyncio.Semaphore(_BLOCKSCOUT_CONCURRENCY)
 _bs_pace_lock = asyncio.Lock()
 _bs_next_ok = 0.0
+_bs_interval = _BS_MIN_INTERVAL  # adaptive; grows on 429, shrinks on success
 
 
 def _prune_cache(cache: dict, now: float) -> None:
@@ -207,6 +213,10 @@ async def _fetch_logs_range(
     return out
 
 
+def _blocks_for_minutes(minutes: float) -> int:
+    return max(int(minutes * 60 * BLOCKS_PER_SECOND), 1)
+
+
 async def compute_hold_times(
     rpc: RpcClient,
     *,
@@ -215,12 +225,17 @@ async def compute_hold_times(
     start_block: int,
     end_block: int,
     min_minutes: float | None = None,
+    max_minutes: float | None = None,
+    on_progress: ProgressCb | None = None,
 ) -> dict[str, float | None]:
     """Hold time in minutes per wallet (lowercased key).
 
-    Walks Transfer logs chronologically and stops as soon as every tracked
-    wallet has a first outbound transfer. Wallets whose max possible hold
-    (buy → tip) is already below ``min_minutes`` are failed without a scan.
+    Walks Transfer logs chronologically (with parallel prefetch) and stops as
+    soon as every tracked wallet has a first outbound transfer — or, when
+    ``max_minutes`` is set, as soon as hold without a sell already exceeds max
+    (no need to walk all the way to tip for long holders that already fail).
+    Wallets whose max possible hold (buy → tip) is already below
+    ``min_minutes`` are failed without a scan.
     """
     tkey = token.lower()
     now = time.time()
@@ -250,63 +265,140 @@ async def compute_hold_times(
         return out
 
     from_block = max(min(need_scan.values()), start_block)
-    scanned_first_out: dict[str, int] = {}
+    span = max(end_block - from_block, 1)
+    first_out_block: dict[str, int] = {}
+    # Wallets failed on max without a real sell (hold lower-bound only).
+    max_failed: set[str] = set()
     pending = set(need_scan)
     chunk = max(settings.log_chunk_size, 20_000)
     cur = from_block
     delay = 0.8
     attempts_left = _MAX_METRIC_ATTEMPTS
+    max_blocks = _blocks_for_minutes(max_minutes) if max_minutes is not None else None
+    last_prog = 0.0
+    _hold_start = time.monotonic()
+
+    async def _heartbeat(upto: int) -> None:
+        nonlocal last_prog
+        if not on_progress:
+            return
+        frac = min(max((upto - from_block) / span, 0.0), 1.0)
+        # Throttle UI updates (~every 3% of the range).
+        if frac - last_prog < 0.03 and upto < end_block and pending:
+            return
+        last_prog = frac
+        # Keep message stable so the job log refreshes in-place (not flood).
+        await on_progress(
+            "filter",
+            f"Hold time: scanning transfers for {len(need_scan)} wallets…",
+            0.90 + 0.05 * frac,
+        )
+
+    def _drop_past_max(upto: int) -> None:
+        if max_blocks is None:
+            return
+        for wallet in list(pending):
+            fb = need_scan[wallet]
+            cutoff = fb + max_blocks
+            if upto < cutoff:
+                continue
+            out[wallet] = _hold_minutes(fb, cutoff)
+            max_failed.add(wallet)
+            pending.discard(wallet)
 
     while cur <= end_block and pending:
-        end = min(cur + chunk - 1, end_block)
+        if time.monotonic() - _hold_start > _MAX_HOLD_SECONDS:
+            logger.warning("Hold-time prefetch time limit hit, falling back for %d wallets", len(pending))
+            for wallet in pending:
+                fb = need_scan[wallet]
+                out[wallet] = _hold_minutes(fb, end_block)
+                _hold_cache[(tkey, wallet)] = (fb, None, time.time())
+            pending.clear()
+            break
+        ranges: list[tuple[int, int]] = []
+        c = cur
+        for _ in range(_HOLD_PREFETCH):
+            if c > end_block:
+                break
+            # With max set, never fetch past the furthest fail-cutoff.
+            if max_blocks is not None and pending:
+                furthest = max(need_scan[w] + max_blocks for w in pending)
+                if c > furthest:
+                    break
+            end = min(c + chunk - 1, end_block)
+            if max_blocks is not None and pending:
+                furthest = max(need_scan[w] + max_blocks for w in pending)
+                end = min(end, furthest)
+            ranges.append((c, end))
+            c = end + 1
+        if not ranges:
+            # Soft-cap stopped us with pending wallets → they exceed max.
+            if max_blocks is not None:
+                _drop_past_max(max(need_scan[w] + max_blocks for w in pending))
+            break
+
         try:
-            logs = await _fetch_logs_range(
-                rpc, token=token, from_block=cur, to_block=end
+            parts = await asyncio.gather(
+                *[
+                    _fetch_logs_range(rpc, token=token, from_block=a, to_block=b)
+                    for a, b in ranges
+                ]
             )
         except Exception as exc:  # noqa: BLE001
             attempts_left -= 1
             logger.warning(
-                "hold-time chunk %s-%s failed (%s left): %s",
-                cur, end, attempts_left, exc,
+                "hold-time prefetch %s-%s failed (%s left): %s",
+                ranges[0][0], ranges[-1][1], attempts_left, exc,
             )
             if attempts_left <= 0:
+                stamp = time.time()
                 for wallet in pending:
                     fb = need_scan[wallet]
                     out[wallet] = _hold_minutes(fb, end_block)
-                    _hold_cache[(tkey, wallet)] = (fb, None, time.time())
+                    _hold_cache[(tkey, wallet)] = (fb, None, stamp)
                 return out
             await asyncio.sleep(delay)
             delay = min(delay * 1.7, 12.0)
             continue
 
-        # Sort within the chunk so first_out is the earliest block.
-        logs.sort(key=lambda lg: int(lg["blockNumber"]))
-        for log in logs:
+        total_logs = 0
+        for (_a, b), logs in zip(ranges, parts, strict=True):
+            total_logs += len(logs)
+            logs.sort(key=lambda lg: int(lg["blockNumber"]))
+            for log in logs:
+                if not pending:
+                    break
+                topics = log.get("topics") or []
+                if len(topics) < 3:
+                    continue
+                frm = topic_address(topics[1]).lower()
+                if frm not in pending:
+                    continue
+                fb = need_scan[frm]
+                block = int(log["blockNumber"])
+                if block < fb:
+                    continue
+                prev = first_out_block.get(frm)
+                if prev is None or block < prev:
+                    first_out_block[frm] = block
+                    pending.discard(frm)
+            _drop_past_max(b)
+            await _heartbeat(b)
             if not pending:
                 break
-            topics = log.get("topics") or []
-            if len(topics) < 3:
-                continue
-            frm = topic_address(topics[1]).lower()
-            if frm not in pending:
-                continue
-            fb = need_scan[frm]
-            block = int(log["blockNumber"])
-            if block < fb:
-                continue
-            prev = scanned_first_out.get(frm)
-            if prev is None or block < prev:
-                scanned_first_out[frm] = block
-                pending.discard(frm)
 
-        cur = end + 1
-        # Adaptive: grow chunk after successes, keep RPC load bounded.
-        if len(logs) < 2000 and chunk < 200_000:
+        cur = ranges[-1][1] + 1
+        if total_logs < 2000 * len(ranges) and chunk < 200_000:
             chunk = min(chunk * 2, 200_000)
 
     stamp = time.time()
     for wallet, fb in need_scan.items():
-        first_out = scanned_first_out.get(wallet)
+        if wallet in max_failed:
+            # Already set out[]; cache as still-holding so a later run can
+            # re-check if tip advanced / max tightened.
+            _hold_cache[(tkey, wallet)] = (fb, None, stamp)
+            continue
+        first_out = first_out_block.get(wallet)
         out[wallet] = _hold_minutes(fb, first_out if first_out is not None else end_block)
         _hold_cache[(tkey, wallet)] = (fb, first_out, stamp)
     _prune_cache(_hold_cache, stamp)
@@ -323,28 +415,34 @@ def _parse_ts(raw: object) -> datetime | None:
 
 
 async def _bs_get(url: str, params: dict[str, object]):
-    """Paced Blockscout GET with 429/5xx retries."""
-    global _bs_next_ok
+    """Paced Blockscout GET with 429/5xx retries and adaptive interval.
+
+    Pace scheduling happens *before* taking the concurrency semaphore so
+    waiters don't pin worker slots idle (which made the UI look frozen).
+    """
+    global _bs_next_ok, _bs_interval
     resp = None
     delay = 0.5
     for attempt in range(_MAX_METRIC_ATTEMPTS):
-        async with _bs_sem:
-            async with _bs_pace_lock:
-                now = time.time()
-                wait = _bs_next_ok - now
-                if wait > 0:
-                    await asyncio.sleep(wait)
-                _bs_next_ok = time.time() + _BS_MIN_INTERVAL
-            try:
+        async with _bs_pace_lock:
+            now = time.time()
+            wait = _bs_next_ok - now
+            _bs_next_ok = max(_bs_next_ok, now) + _bs_interval
+        if wait > 0:
+            await asyncio.sleep(wait)
+        try:
+            async with _bs_sem:
                 resp = await http_client().get(
                     url, params=params, headers=blockscout_headers()
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Blockscout GET error attempt %s: %s", attempt + 1, exc)
-                await asyncio.sleep(delay)
-                delay = min(delay * 1.6, 12.0)
-                continue
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Blockscout GET error attempt %s: %s", attempt + 1, exc)
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.6, 12.0)
+            continue
         if resp.status_code in (429, 502, 503):
+            async with _bs_pace_lock:
+                _bs_interval = min(_bs_interval * 1.5, 0.5)
             ra = resp.headers.get("Retry-After")
             try:
                 sleep_for = min(float(ra), 20.0) if ra else delay
@@ -353,6 +451,9 @@ async def _bs_get(url: str, params: dict[str, object]):
             await asyncio.sleep(sleep_for)
             delay = min(delay * 1.6, 12.0)
             continue
+        if resp.status_code == 200:
+            async with _bs_pace_lock:
+                _bs_interval = max(_BS_MIN_INTERVAL, _bs_interval * 0.92)
         break
     return resp
 
@@ -383,11 +484,22 @@ async def _tokens_traded_7d_one(
     """
     wallet_l = wallet.lower()
     url = f"{blockscout_api_base()}/addresses/{wallet}/token-transfers"
-    params: dict[str, object] = {}
+    # Prefer ERC-20 only — skips NFT noise and usually fewer pages.
+    use_type_filter = True
+    params: dict[str, object] = {"type": "ERC-20"}
     tokens: set[str] = set()
     try:
         for _ in range(_MAX_TRANSFER_PAGES):
             resp = await _bs_get(url, params)
+            if (
+                use_type_filter
+                and resp is not None
+                and resp.status_code in (400, 422)
+            ):
+                # Older Blockscout builds may not accept type= — retry bare.
+                use_type_filter = False
+                params = {k: v for k, v in params.items() if k != "type"}
+                resp = await _bs_get(url, params)
             if resp is None or resp.status_code not in (200, 404):
                 return None
             if resp.status_code == 404:
@@ -412,14 +524,16 @@ async def _tokens_traded_7d_one(
                     tokens.add(addr)
                 elif to_h == wallet_l and _is_contract(frm):
                     tokens.add(addr)
-                if enough is not None and len(tokens) >= enough:
+                if enough is not None and too_many is None and len(tokens) >= enough:
                     return len(tokens), False
                 if too_many is not None and len(tokens) > too_many:
                     return len(tokens), False
             next_params = data.get("next_page_params")
             if reached_cutoff or not next_params or not items:
                 break
-            params = next_params
+            params = dict(next_params)
+            if use_type_filter:
+                params["type"] = "ERC-20"
     except Exception as exc:  # noqa: BLE001
         logger.warning("tokens-7d lookup failed for %s: %s", wallet, exc)
         return None
@@ -486,7 +600,7 @@ async def batch_tokens_traded_7d(
                     0.9 + 0.08 * done / max(total, 1),
                 )
 
-    await asyncio.gather(*[one(w) for w in misses])
+    await asyncio.wait_for(asyncio.gather(*[one(w) for w in misses]), timeout=300)
     unresolved = sum(1 for w in misses if out.get(w) is None)
     if unresolved:
         logger.warning("tokens-7d unresolved for %d/%d after retries", unresolved, total)
@@ -573,6 +687,8 @@ async def enrich_and_filter_buyers(
             start_block=start_block,
             end_block=end_block,
             min_minutes=req.min_hold_time_minutes,
+            max_minutes=req.max_hold_time_minutes,
+            on_progress=on_progress,
         )
         survivors = []
         for row in kept:

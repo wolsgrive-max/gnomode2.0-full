@@ -14,7 +14,8 @@ from .models import BuyerRow
 
 logger = logging.getLogger(__name__)
 
-_TG_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
+_TG_TIMEOUT = httpx.Timeout(40.0, connect=10.0)
+
 _MSG_LIMIT = 3500
 # Ignore HTTP(S)_PROXY — corporate/system proxies often 403 Telegram API.
 _TG_CLIENT_KW = {"timeout": _TG_TIMEOUT, "trust_env": False}

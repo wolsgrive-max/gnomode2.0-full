@@ -28,6 +28,7 @@ type WalletFiltersForm = {
   max_hold_time_minutes: string
   min_tokens_traded_7d: string
   max_tokens_traded_7d: string
+  min_buy_usd: string
 }
 
 type WatchConfig = {
@@ -60,6 +61,7 @@ type WatchConfig = {
     max_hold_time_minutes: number | null
     min_tokens_traded_7d: number | null
     max_tokens_traded_7d: number | null
+    min_buy_usd?: number | null
   }
 }
 
@@ -142,14 +144,15 @@ const DEFAULT_SCREEN: ScreenFiltersForm = {
 }
 
 const DEFAULT_WALLET: WalletFiltersForm = {
-  mcap_threshold: '15000',
+  mcap_threshold: '20000',
   exclude_honeypots: true,
-  min_wallet_balance_eth: '',
+  min_wallet_balance_eth: '0.001',
   max_wallet_balance_eth: '',
   min_hold_time_minutes: '',
   max_hold_time_minutes: '',
-  min_tokens_traded_7d: '',
-  max_tokens_traded_7d: '',
+  min_tokens_traded_7d: '1',
+  max_tokens_traded_7d: '1',
+  min_buy_usd: '',
 }
 
 function parseOpt(raw: string): number | null {
@@ -217,7 +220,7 @@ function configToForms(cfg: WatchConfig): {
       exclude_honeypots: cfg.screen.exclude_honeypots,
     },
     wallet: {
-      mcap_threshold: numToStr(cfg.wallet.mcap_threshold) || '15000',
+      mcap_threshold: numToStr(cfg.wallet.mcap_threshold) || '20000',
       exclude_honeypots: cfg.wallet.exclude_honeypots,
       min_wallet_balance_eth: numToStr(cfg.wallet.min_wallet_balance_eth),
       max_wallet_balance_eth: numToStr(cfg.wallet.max_wallet_balance_eth),
@@ -225,6 +228,7 @@ function configToForms(cfg: WatchConfig): {
       max_hold_time_minutes: numToStr(cfg.wallet.max_hold_time_minutes),
       min_tokens_traded_7d: numToStr(cfg.wallet.min_tokens_traded_7d),
       max_tokens_traded_7d: numToStr(cfg.wallet.max_tokens_traded_7d),
+      min_buy_usd: numToStr(cfg.wallet.min_buy_usd ?? null),
     },
   }
 }
@@ -322,6 +326,7 @@ export default function WatchPage() {
         max_hold_time_minutes: parseOpt(wallet.max_hold_time_minutes),
         min_tokens_traded_7d: parseOpt(wallet.min_tokens_traded_7d),
         max_tokens_traded_7d: parseOpt(wallet.max_tokens_traded_7d),
+        min_buy_usd: parseOpt(wallet.min_buy_usd),
       },
     }
   }, [enabled, intervalMin, maxTokens, chatId, topicId, gnomeBanter, screen, wallet])
@@ -781,6 +786,10 @@ export default function WatchPage() {
           <label className="field">
             <span>Макс. токенов за 7д</span>
             <input type="number" min={0} value={wallet.max_tokens_traded_7d} onChange={(e) => setWalletField('max_tokens_traded_7d', e.target.value)} placeholder="любой" />
+          </label>
+          <label className="field">
+            <span>Мин. buy USD</span>
+            <input type="number" min={0} step={1} value={wallet.min_buy_usd} onChange={(e) => setWalletField('min_buy_usd', e.target.value)} placeholder="0" />
           </label>
           <label className="field check-field">
             <span>Безопасность</span>
