@@ -290,10 +290,10 @@ class WatchStatus(BaseModel):
 
 
 class FollowupConfig(BaseModel):
-    """Watchlist of early buyers → alert on 2nd/3rd new-token buy @ low mcap."""
+    """Watchlist of early buyers → alert on later new-token buys @ low mcap."""
 
     enabled: bool = False
-    # Target seconds between follow-up cycle starts (alerts for deals #2/#3).
+    # Target seconds between follow-up cycle starts (alerts for deals #2…#5).
     interval_sec: int = Field(default=5, ge=5, le=86400)
     # Alert only when buy mcap is at or below this (USD). High mcap → record, no alert.
     max_mcap_alert: float = Field(default=20_000.0, ge=0)
@@ -302,9 +302,9 @@ class FollowupConfig(BaseModel):
     # Optional size filters on bought_usd (when known).
     min_bought_usd: float | None = None
     max_bought_usd: float | None = None
-    # Deal indices that trigger Telegram (1 = discovery only in watch; 2/3 = follow-up).
-    alert_on_deals: list[int] = Field(default_factory=lambda: [2, 3])
-    max_deals: int = Field(default=3, ge=1, le=20)
+    # Deal indices that trigger Telegram (1 = discovery in watch; 2+ = follow-up).
+    alert_on_deals: list[int] = Field(default_factory=lambda: [2, 3, 4, 5])
+    max_deals: int = Field(default=5, ge=1, le=20)
     # One distinct token = one deal (always). Buys-only: only inbound from contract (DEX).
     buys_only: bool = True
     # When False (default), ignore wallet↔wallet token transfers (RayBot-style EVM).

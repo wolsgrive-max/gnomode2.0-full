@@ -1,11 +1,11 @@
 """Wallet-level metrics for parsed buyers: native balance, token hold time,
-distinct tokens traded in the last 7 days — plus range filtering.
+distinct tokens bought in the lookback window — plus range filtering.
 
 Balance comes from batched ``eth_getBalance``; hold time is derived from the
 token's Transfer logs (first outgoing transfer after the first buy, or "still
-holding" up to the chain tip); 7d traded tokens are distinct non-quote token
-contracts from Blockscout token-transfers where the wallet sold (from=wallet)
-or bought via a contract (to=wallet, from.is_contract) — EOA airdrops ignored.
+holding" up to the chain tip); unique-token count is distinct non-quote tokens
+**bought** via contract (DEX/router/pool → wallet). Outbound sells/sends and
+EOA gifts («скинули») are ignored.
 
 Speed / completeness:
 - No stage budgets that abandon wallets mid-fetch.
@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
 from .blockscout import blockscout_api_base, blockscout_headers
+from .buy_gate import is_wallet_initiated_buy
 from .chain import RpcClient, checksum, http_client, topic_address
 from .config import settings
 from .constants import BLOCKS_PER_SECOND, QUOTE_TOKENS, TRANSFER_TOPIC
@@ -45,7 +46,7 @@ _BALANCE_TTL = 120.0
 _balance_cache: dict[str, tuple[float, float]] = {}
 
 _TOKENS7D_TTL = 600.0
-_TOKENS7D_CACHE_VER = "v3"
+_TOKENS7D_CACHE_VER = "v7"  # fail-open on unknown + sender retries / quote-spend
 _tokens7d_cache: dict[str, tuple[int, float]] = {}
 
 _HOLDING_TTL = 180.0
@@ -395,7 +396,10 @@ async def _tokens_traded_7d_one(
     enough: int | None = None,
     too_many: int | None = None,
 ) -> tuple[int, bool] | None:
-    """Distinct non-quote tokens traded in 30d.
+    """Distinct non-quote tokens **bought by this wallet** since ``cutoff``.
+
+    A transfer counts only when ``tx.from == wallet`` (wallet-initiated swap).
+    Airdrops / third-party multicalls that credit the wallet are ignored.
 
     Returns ``(count, exact)``. May stop early when:
     - ``enough`` is met (min-only pass) → ``exact=False``
@@ -404,7 +408,8 @@ async def _tokens_traded_7d_one(
     """
     wallet_l = wallet.lower()
     url = f"{blockscout_api_base()}/addresses/{wallet}/token-transfers"
-    params: dict[str, object] = {}
+    # Inbound-only pages: sells/outbound noise must not fill the window.
+    params: dict[str, object] = {"filter": "to"}
     tokens: set[str] = set()
     try:
         for _ in range(_MAX_TRANSFER_PAGES):
@@ -423,16 +428,11 @@ async def _tokens_traded_7d_one(
                     break
                 tok = item.get("token") or {}
                 addr = str(tok.get("address") or tok.get("address_hash") or "").lower()
-                if not addr or addr in QUOTE_TOKENS:
+                if not addr or addr in QUOTE_TOKENS or addr in tokens:
                     continue
-                frm = item.get("from")
-                to = item.get("to")
-                frm_h = _addr_hash(frm)
-                to_h = _addr_hash(to)
-                if frm_h == wallet_l:
-                    tokens.add(addr)
-                elif to_h == wallet_l and _is_contract(frm):
-                    tokens.add(addr)
+                if not await is_wallet_initiated_buy(item, wallet_l):
+                    continue
+                tokens.add(addr)
                 if enough is not None and too_many is None and len(tokens) >= enough:
                     return len(tokens), False
                 if too_many is not None and len(tokens) > too_many:
@@ -440,7 +440,9 @@ async def _tokens_traded_7d_one(
             next_params = data.get("next_page_params")
             if reached_cutoff or not next_params or not items:
                 break
-            params = next_params
+            params = dict(next_params)
+            if "filter" not in params:
+                params["filter"] = "to"
     except Exception as exc:  # noqa: BLE001
         logger.warning("tokens-7d lookup failed for %s: %s", wallet, exc)
         return None
@@ -649,9 +651,13 @@ async def enrich_and_filter_buyers(
         for row in kept:
             row.tokens_traded_7d = tokens_7d.get(row.wallet.lower())
             if row.tokens_traded_7d is None:
+                # Blockscout flake: keep candidate (fail-open) so one-trade wallets
+                # are not dropped when unique lookup temporarily fails.
                 unknown += 1
+                survivors.append(row)
+                continue
             if _passes(
-                None if row.tokens_traded_7d is None else float(row.tokens_traded_7d),
+                float(row.tokens_traded_7d),
                 req.min_tokens_traded_7d,
                 req.max_tokens_traded_7d,
             ):
@@ -660,7 +666,7 @@ async def enrich_and_filter_buyers(
         await prog(
             "filter",
             f"Tokens 7d: {before} → {len(kept)} kept"
-            + (f" ({unknown} unknown dropped)" if unknown else ""),
+            + (f" ({unknown} unknown kept)" if unknown else ""),
             0.96,
         )
 

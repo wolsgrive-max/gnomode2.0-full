@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
 from app.followup import should_alert_deal
@@ -643,27 +645,66 @@ def test_estimate_bought_usd_from_transfer():
     assert estimate_bought_usd(item, None) is None
 
 
-def test_is_buy_like_transfer_gates():
+@pytest.mark.asyncio
+async def test_is_buy_like_transfer_gates():
     from app.followup import _is_buy_like_transfer
 
     wallet = "0xaaa0000000000000000000000000000000000001"
     dex_in = {
         "to": {"hash": wallet},
         "from": {"hash": "0xdex", "is_contract": True},
+        "method": "multicall",
+        "transaction_hash": "0xown",
     }
     eoa_in = {
         "to": {"hash": wallet},
         "from": {"hash": "0xeoa", "is_contract": False},
+        "method": "transfer",
     }
     out_tx = {
         "to": {"hash": "0xother"},
         "from": {"hash": wallet, "is_contract": False},
     }
-    assert _is_buy_like_transfer(dex_in, wallet, buys_only=True, track_transfers=False)
-    assert not _is_buy_like_transfer(eoa_in, wallet, buys_only=True, track_transfers=False)
-    assert not _is_buy_like_transfer(eoa_in, wallet, buys_only=False, track_transfers=False)
-    assert _is_buy_like_transfer(eoa_in, wallet, buys_only=False, track_transfers=True)
-    assert not _is_buy_like_transfer(out_tx, wallet, buys_only=True, track_transfers=True)
+    disperse = {
+        "to": {"hash": wallet},
+        "from": {"hash": "0xair", "is_contract": True},
+        "method": "disperseToken",
+        "transaction_hash": "0xairtx",
+    }
+    third_party = {
+        "to": {"hash": wallet},
+        "from": {"hash": "0xpool", "is_contract": True},
+        "method": "multicall",
+        "transaction_hash": "0xother",
+    }
+
+    async def fake_sender(tx: str) -> str | None:
+        if tx.lower() == "0xown":
+            return wallet
+        return "0xsomebodyelse00000000000000000000000001"
+
+    with patch("app.buy_gate.transaction_sender", new=fake_sender):
+        assert await _is_buy_like_transfer(
+            dex_in, wallet, buys_only=True, track_transfers=False
+        )
+        assert not await _is_buy_like_transfer(
+            eoa_in, wallet, buys_only=True, track_transfers=False
+        )
+        assert not await _is_buy_like_transfer(
+            eoa_in, wallet, buys_only=False, track_transfers=False
+        )
+        assert await _is_buy_like_transfer(
+            eoa_in, wallet, buys_only=False, track_transfers=True
+        )
+        assert not await _is_buy_like_transfer(
+            out_tx, wallet, buys_only=True, track_transfers=True
+        )
+        assert not await _is_buy_like_transfer(
+            disperse, wallet, buys_only=True, track_transfers=False
+        )
+        assert not await _is_buy_like_transfer(
+            third_party, wallet, buys_only=True, track_transfers=False
+        )
 
 
 def test_config_track_transfers_default(tmp_path):
@@ -837,9 +878,13 @@ async def test_scan_wallet_records_buy_before_watermark_advance(tmp_path, monkey
     async def fake_hp(_token: str):
         return None
 
+    async def fake_sender(tx: str) -> str | None:
+        return wallet.lower()
+
     monkeypatch.setattr("app.followup.scan_address_token_transfers", fake_scan)
     monkeypatch.setattr("app.followup.estimate_token_quote", fake_quote)
     monkeypatch.setattr("app.security.honeypot_reason_for_token", fake_hp)
+    monkeypatch.setattr("app.buy_gate.transaction_sender", fake_sender)
 
     runner = FollowupRunner(store=store)
     deals = await runner._scan_wallet(

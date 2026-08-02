@@ -190,7 +190,12 @@ class TokenIndex:
 
     def _apply_ath(self, entry: TokenEntry, row: ScreenedToken) -> ScreenedToken:
         """Bump entry ATH from current mcap and mirror it onto the screened row."""
-        peak = max(entry.ath_mcap, row.ath_mcap, row.market_cap)
+        # Drop absurd peaks from the old price×1e9 bug (billions on low-supply
+        # tokens); real RH meme ATH almost never reaches $1B.
+        prev = entry.ath_mcap
+        if prev >= 1_000_000_000.0 and row.market_cap > 0 and prev > row.market_cap * 50:
+            prev = 0.0
+        peak = max(prev, row.ath_mcap, row.market_cap)
         entry.ath_mcap = peak
         if row.ath_mcap != peak:
             return row.model_copy(update={"ath_mcap": peak})
@@ -717,7 +722,14 @@ class TokenIndex:
             entry.gecko_ath_at = time.time()
             if result.ath_mcap <= 0:
                 return
-            peak = max(entry.ath_mcap, result.ath_mcap)
+            prev = entry.ath_mcap
+            if (
+                prev >= 1_000_000_000.0
+                and result.ath_mcap > 0
+                and prev > result.ath_mcap * 50
+            ):
+                prev = 0.0
+            peak = max(prev, result.ath_mcap)
             entry.ath_mcap = peak
             if entry.screened is not None:
                 entry.screened = self._apply_ath(entry, entry.screened)

@@ -632,9 +632,23 @@ class WatchRunner:
                 self._append_log("error", f"Ошибка парса {token[:10]}…: {exc}", token=token)
                 continue
             parsed += 1
-            if gate_on and should_mark_parsed(result.error):
-                self._store.mark_token_parsed(token)
             buyers = [b for b in result.buyers if b.buys_count == 1]
+            before_filters = int(
+                (result.stats or {}).get("buyers_before_wallet_filters") or 0
+            )
+            if gate_on and should_mark_parsed(
+                result.error,
+                buyers_before_filters=before_filters,
+                buyers_after_filters=len(buyers),
+            ):
+                self._store.mark_token_parsed(token)
+            elif gate_on and before_filters > 0 and not buyers:
+                self._append_log(
+                    "hold",
+                    f"{token[:10]}… не в parsed — {before_filters} early → 0 после "
+                    "фильтров (повтор позже)",
+                    token=token,
+                )
             found_total += len(buyers)
             self._last_tokens_parsed = parsed
             self._last_buyers_found = found_total

@@ -319,7 +319,7 @@ def _short_mcap(n: float | None) -> str:
 
 
 def _format_filters(cfg: FollowupConfig) -> str:
-    deals = ",".join(str(x) for x in (cfg.alert_on_deals or [2, 3]))
+    deals = ",".join(str(x) for x in (cfg.alert_on_deals or [2, 3, 4, 5]))
     return (
         f"<b>Фильтры Follow-up</b>\n"
         f"max_mcap ≤ {cfg.max_mcap_alert:,.0f}\n"

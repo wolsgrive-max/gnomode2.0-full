@@ -18,8 +18,10 @@ from .watch_store import watch_store
 
 # First buy and subsequent-alert mcap caps (USD).
 HVAT_MCAP = 20_000.0
-# Dedicated forum topic for deal #2/#3 alerts (watch discovery may use another topic).
+# Dedicated forum topic for deal #2+ alerts (watch discovery may use another topic).
 HVAT_FOLLOWUP_TOPIC = "9245"
+HVAT_ALERT_DEALS = [2, 3, 4, 5]
+HVAT_MAX_DEALS = 5
 
 
 def _followup_topic(fcfg: FollowupConfig) -> str:
@@ -54,13 +56,20 @@ def apply_hvat_profile(*, enable: bool = True) -> dict[str, Any]:
     alert_mcap = float(wallet.get("mcap_threshold") or HVAT_MCAP)
     tg_chat = (fcfg.telegram_chat_id or wcfg.telegram_chat_id or "").strip()
     tg_topic = _followup_topic(fcfg)
+    deals = list(fcfg.alert_on_deals or []) or list(HVAT_ALERT_DEALS)
+    # Ensure #4/#5 are tracked when enabling Хвать (keep any extras user added).
+    for d in HVAT_ALERT_DEALS:
+        if d not in deals:
+            deals.append(d)
+    deals = sorted({int(x) for x in deals if int(x) >= 1})
+    max_deals = max(int(fcfg.max_deals or 0), HVAT_MAX_DEALS, max(deals, default=HVAT_MAX_DEALS))
     fcfg = FollowupConfig.model_validate(
         {
             **fcfg.model_dump(),
             "enabled": enable,
             "max_mcap_alert": alert_mcap,
-            "alert_on_deals": list(fcfg.alert_on_deals or [2, 3]) or [2, 3],
-            "max_deals": 3,
+            "alert_on_deals": deals,
+            "max_deals": max_deals,
             "buys_only": True,
             "ingest_from_watch": True,
             "telegram_chat_id": tg_chat,
@@ -72,6 +81,7 @@ def apply_hvat_profile(*, enable: bool = True) -> dict[str, Any]:
         }
     )
     followup_store.save_config(fcfg)
+    followup_store.reopen_under_max_deals(max_deals)
     followup_runner.notify_config_changed()
 
     return {
@@ -135,7 +145,15 @@ def save_hvat_filters(
             updates["telegram_chat_id"] = str(followup["telegram_chat_id"] or "").strip()
         if "alert_on_deals" in followup and followup["alert_on_deals"] is not None:
             deals = [int(x) for x in followup["alert_on_deals"]]
-            updates["alert_on_deals"] = deals or [2, 3]
+        if "alert_on_deals" in followup and followup["alert_on_deals"] is not None:
+            deals = [int(x) for x in followup["alert_on_deals"]]
+            updates["alert_on_deals"] = deals or list(HVAT_ALERT_DEALS)
+            # Keep tracking at least through the highest alerted deal.
+            hi = max(updates["alert_on_deals"], default=HVAT_MAX_DEALS)
+            cur_max = int(followup.get("max_deals") or fcfg.max_deals or HVAT_MAX_DEALS)
+            updates["max_deals"] = max(cur_max, hi, HVAT_MAX_DEALS)
+        elif "max_deals" in followup and followup["max_deals"] is not None:
+            updates["max_deals"] = max(1, int(followup["max_deals"]))
         if "prune_enabled" in followup and followup["prune_enabled"] is not None:
             updates["prune_enabled"] = bool(followup["prune_enabled"])
         if "prune_min_ath_mcap" in followup and followup["prune_min_ath_mcap"] is not None:
@@ -152,6 +170,8 @@ def save_hvat_filters(
     if updates:
         fcfg = FollowupConfig.model_validate({**fcfg.model_dump(), **updates})
         followup_store.save_config(fcfg)
+        if "max_deals" in updates:
+            followup_store.reopen_under_max_deals(int(fcfg.max_deals))
         followup_runner.notify_config_changed()
 
     return {"ok": True, "watch": saved, "followup": fcfg}
@@ -177,7 +197,7 @@ def hvat_status() -> dict[str, Any]:
             "min_tokens_traded_7d": cfg.wallet.min_tokens_traded_7d,
             "tokens_unique_period": cfg.wallet.tokens_unique_period,
             "first_buy_max_mcap": cfg.wallet.mcap_threshold,
-            "alert_deals": list(fcfg.alert_on_deals or [2, 3]),
+            "alert_deals": list(fcfg.alert_on_deals or HVAT_ALERT_DEALS),
             "alert_max_mcap": fcfg.max_mcap_alert,
             "alert_min_mcap": fcfg.min_mcap_alert,
             "alert_min_bought": fcfg.min_bought_usd,

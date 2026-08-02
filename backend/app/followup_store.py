@@ -559,6 +559,19 @@ class FollowupStore:
             ).fetchone()["c"]
         return int(watching), int(done)
 
+    def reopen_under_max_deals(self, max_deals: int) -> int:
+        """Move ``done`` wallets back to ``watching`` when max_deals was raised."""
+        self._ensure()
+        limit = max(1, int(max_deals))
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE wallets SET status='watching', updated_at=? "
+                "WHERE status='done' AND deal_count < ?",
+                (time.time(), limit),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+
     def list_wallets(
         self,
         *,

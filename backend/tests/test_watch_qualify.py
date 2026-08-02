@@ -128,3 +128,16 @@ def test_should_mark_parsed():
     assert should_mark_parsed("Honeypot skipped (gmgn)") is True
     assert should_mark_parsed("No Uniswap V2/V3 pool found for this token") is False
     assert should_mark_parsed("no pool available") is False
+    # Early buyers existed but wallet filters wiped all — retry later
+    assert (
+        should_mark_parsed(
+            None, buyers_before_filters=3, buyers_after_filters=0
+        )
+        is False
+    )
+    assert (
+        should_mark_parsed(
+            None, buyers_before_filters=2, buyers_after_filters=1
+        )
+        is True
+    )

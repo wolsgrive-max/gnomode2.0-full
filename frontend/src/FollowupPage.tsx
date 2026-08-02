@@ -74,8 +74,8 @@ const DEFAULT_CFG: FollowupConfig = {
   min_mcap_alert: null,
   min_bought_usd: null,
   max_bought_usd: null,
-  alert_on_deals: [2, 3],
-  max_deals: 3,
+  alert_on_deals: [2, 3, 4, 5],
+  max_deals: 5,
   buys_only: true,
   track_transfers: false,
   telegram_chat_id: '',
@@ -365,7 +365,7 @@ export default function FollowupPage({ tabActive = true }: { tabActive?: boolean
               min={1}
               max={20}
               onChange={(e) =>
-                setCfg({ ...cfg, max_deals: Number(e.target.value) || 3 })
+                setCfg({ ...cfg, max_deals: Number(e.target.value) || 5 })
               }
             />
           </label>
@@ -390,7 +390,7 @@ export default function FollowupPage({ tabActive = true }: { tabActive?: boolean
           </label>
         </div>
         <p className="muted tiny">
-          Алерт только на deal #2/#3 при mcap ≤ max (и ≥ min, если задан). Высокий
+          Алерт на deal #2–#5 при mcap ≤ max (и ≥ min, если задан). Высокий
           mcap — запись без уведомления. buys_only=on — только входящие с контракта
           (DEX). track_transfers учитывается при buys_only=off. В Telegram: /help
         </p>

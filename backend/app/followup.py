@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .blockscout import scan_address_token_transfers
+from .buy_gate import is_wallet_initiated_buy, method_is_non_buy
 from .config import settings
 from .constants import QUOTE_TOKENS
 from .followup_store import FollowupStore, followup_store
@@ -64,7 +65,7 @@ def should_alert_deal(
     """True only for configured deal indices that pass native filter set.
 
     Mirrors RayBot-style gates without external RayBot:
-    - deal index in alert_on_deals (default 2, 3)
+    - deal index in alert_on_deals (default 2…5)
     - mcap ≤ max_mcap_alert (high mcap → no alert)
     - optional mcap ≥ min_mcap_alert
     - optional bought_usd min/max when value is known
@@ -180,7 +181,7 @@ async def estimate_token_peak_mcap(
 def alert_kwargs_from_config(cfg: FollowupConfig) -> dict:
     return {
         "max_mcap_alert": cfg.max_mcap_alert,
-        "alert_on_deals": list(cfg.alert_on_deals or [2, 3]),
+        "alert_on_deals": list(cfg.alert_on_deals or [2, 3, 4, 5]),
         "min_mcap_alert": cfg.min_mcap_alert,
         "min_bought_usd": cfg.min_bought_usd,
         "max_bought_usd": cfg.max_bought_usd,
@@ -289,25 +290,22 @@ def estimate_bought_usd(item: dict[str, Any], price_usd: float | None) -> float 
     return amount * float(price_usd)
 
 
-def _is_buy_like_transfer(
+async def _is_buy_like_transfer(
     item: dict[str, Any],
     wallet: str,
     *,
     buys_only: bool,
     track_transfers: bool,
 ) -> bool:
-    """RayBot-style EVM gate: inbound to tracked wallet; optionally DEX-only."""
+    """Inbound to tracked wallet; with buys_only require wallet-initiated swap."""
     to_h = _addr_hash(item.get("to"))
     if to_h != wallet.lower():
         return False
-    frm = item.get("from")
-    from_contract = _is_contract(frm)
     if buys_only:
-        # DEX/router/pool sends tokens to wallet
-        return from_contract
-    if from_contract:
-        return True
-    # EOA → wallet transfer
+        return await is_wallet_initiated_buy(item, wallet)
+    frm = item.get("from")
+    if _is_contract(frm):
+        return not method_is_non_buy(item.get("method"))
     return bool(track_transfers)
 
 
@@ -489,7 +487,7 @@ class FollowupRunner:
                 logger.warning("RayBot sync failed: %s", exc)
                 self._append_log("raybot", f"RayBot sync ошибка: {exc}")
 
-        # Alert immediately if watch itself produced deal #2/#3 @ low mcap
+        # Alert immediately if watch itself produced deal #2+ @ low mcap
         chat = resolve_chat_id(cfg.telegram_chat_id)
         topic_id = resolve_topic_id(cfg.telegram_topic_id)
         if telegram_configured(chat):
@@ -832,7 +830,7 @@ class FollowupRunner:
         candidates: dict[str, tuple[str, str, dict[str, Any], int]] = {}
         pages = max(1, int(cfg.scan_max_pages or 3))
         # Existing wallets after upgrade: peek tip once, set watermark, don't invent
-        # deal #2/#3 from old transfer history.
+        # deal #2+ from old transfer history.
         bootstrap = last_seen <= 0 and deal_count >= 1
         if bootstrap:
             pages = 1
@@ -855,7 +853,7 @@ class FollowupRunner:
                 token, sym = _token_meta(item)
                 if not token or token in QUOTE_TOKENS or token in known:
                     continue
-                if not _is_buy_like_transfer(
+                if not await _is_buy_like_transfer(
                     item,
                     wallet,
                     buys_only=cfg.buys_only,

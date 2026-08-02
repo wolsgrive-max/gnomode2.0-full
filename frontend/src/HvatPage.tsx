@@ -541,7 +541,8 @@ export default function HvatPage({ tabActive = true }: { tabActive?: boolean }) 
           min_bought_usd: parseOpt((focusAddr ? globalAlert : alert).min_bought_usd),
           max_bought_usd: parseOpt((focusAddr ? globalAlert : alert).max_bought_usd),
           telegram_topic_id: (focusAddr ? globalAlert : alert).telegram_topic_id.trim() || '9245',
-          alert_on_deals: [2, 3],
+          alert_on_deals: [2, 3, 4, 5],
+          max_deals: 5,
           prune_enabled: (focusAddr ? globalAlert : alert).prune_enabled,
           prune_min_ath_mcap:
             parseOpt((focusAddr ? globalAlert : alert).prune_min_ath_mcap) ?? 50000,
@@ -675,7 +676,7 @@ export default function HvatPage({ tabActive = true }: { tabActive?: boolean }) 
       <header className="hvat-hero">
         <h1 className="hvat-title">Хвать</h1>
         <p className="lede">
-          Токены по фильтрам → кошельки с одной сделкой → алерты на #2/#3 на низкой mcap.
+          Токены по фильтрам → кошельки с одной сделкой → алерты на #2–#5 на низкой mcap.
         </p>
       </header>
 
@@ -710,7 +711,7 @@ export default function HvatPage({ tabActive = true }: { tabActive?: boolean }) 
           disabled={busy}
           onClick={() => void post('/api/followup/test-telegram', 'Пинг в топик алертов отправлен')}
         >
-          Тест TG #2/#3
+          Тест TG #2–#5
         </button>
         {flash ? <span className="muted">{flash}</span> : null}
       </div>
@@ -747,7 +748,7 @@ export default function HvatPage({ tabActive = true }: { tabActive?: boolean }) 
           </strong>
         </div>
         <div>
-          <div className="muted">Алерты #2/#3</div>
+          <div className="muted">Алерты #2–#5</div>
           <strong>{follow?.last_alerts_sent ?? 0}</strong>
         </div>
       </div>
@@ -756,7 +757,7 @@ export default function HvatPage({ tabActive = true }: { tabActive?: boolean }) 
         Период уникальных токенов: {wallet.tokens_unique_period} · порог 1-й сделки ≤{' '}
         {wallet.mcap_threshold || '—'} · интервал парса {intervalMin} мин
         <br />
-        Алерты #2/#3: mcap {alert.min_mcap_alert || '0'}…{alert.max_mcap_alert || '—'} · buy{' '}
+        Алерты #2–#5: mcap {alert.min_mcap_alert || '0'}…{alert.max_mcap_alert || '—'} · buy{' '}
         {alert.min_bought_usd || '—'}…{alert.max_bought_usd || '—'} · топик {alert.telegram_topic_id}
         <br />
         Парс: {watch?.last_message || '—'} · след. {fmtTs(watch?.next_run_ts)}
@@ -916,7 +917,7 @@ export default function HvatPage({ tabActive = true }: { tabActive?: boolean }) 
         </div>
 
         <div className="hvat-filter-card">
-          <h2 className="section-title">Алерты сделок #2 / #3</h2>
+          <h2 className="section-title">Алерты сделок #2 – #5</h2>
           <p className="muted hvat-card-note">
             {focusAddr
               ? `Фильтры для ${shortAddr(focusAddr)}${alertCustom ? ' (личные)' : ' (сейчас общие)'}.`
@@ -1003,7 +1004,7 @@ export default function HvatPage({ tabActive = true }: { tabActive?: boolean }) 
               />
             </label>
             <label className="check field">
-              <span>Автоудаление (#1/#2/#3 не до ATH)</span>
+              <span>Автоудаление (#1–#5 не до ATH)</span>
               <input
                 type="checkbox"
                 checked={alert.prune_enabled}
@@ -1035,8 +1036,8 @@ export default function HvatPage({ tabActive = true }: { tabActive?: boolean }) 
             </label>
           </div>
           <p className="muted hvat-card-note">
-            Если токен сделки #1, #2 или #3 не достиг ATH за срок — кошелёк снимается со слежки
-            (после 3-й сделки тоже, в т.ч. статус done). Сохрани общие фильтры или примени личные.
+            Если токен сделки #1–#5 не достиг ATH за срок — кошелёк снимается со слежки
+            (после последней сделки тоже, в т.ч. статус done). Сохрани общие фильтры или примени личные.
           </p>
         </div>
       </div>
@@ -1068,7 +1069,7 @@ export default function HvatPage({ tabActive = true }: { tabActive?: boolean }) 
                   <th>Статус</th>
                   <th>Сделок</th>
                   <th>1-я mcap</th>
-                  <th>Фильтры #2/#3</th>
+                  <th>Фильтры #2–#5</th>
                   <th>Последние deals</th>
                   <th></th>
                 </tr>
