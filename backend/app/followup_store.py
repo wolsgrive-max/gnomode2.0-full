@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from .config import settings
 from .models import (
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS deals (
     mcap_at_buy REAL,
     bought_usd REAL,
     tx_hash TEXT NOT NULL DEFAULT '',
+    block_number INTEGER NOT NULL DEFAULT 0,
     notified INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     ath_passed INTEGER NOT NULL DEFAULT 0,
@@ -96,6 +98,10 @@ class FollowupStore:
                 if "ath_passed" not in dcols:
                     conn.execute(
                         "ALTER TABLE deals ADD COLUMN ath_passed INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "block_number" not in dcols:
+                    conn.execute(
+                        "ALTER TABLE deals ADD COLUMN block_number INTEGER NOT NULL DEFAULT 0"
                     )
                 conn.commit()
             self._ensured = True
@@ -185,6 +191,35 @@ class FollowupStore:
 
     # --- wallets / deals ---
 
+    @staticmethod
+    def _renumber_deals(
+        conn: sqlite3.Connection,
+        wallet_l: str,
+        *,
+        max_deals: int,
+        now: float | None = None,
+    ) -> int:
+        """Assign deal_index by chain time (block, then created_at). Return count."""
+        rows = conn.execute(
+            "SELECT token FROM deals WHERE wallet=? "
+            "ORDER BY CASE WHEN block_number IS NULL OR block_number <= 0 "
+            "THEN 1 ELSE 0 END, block_number ASC, created_at ASC, token ASC",
+            (wallet_l,),
+        ).fetchall()
+        for i, row in enumerate(rows, 1):
+            conn.execute(
+                "UPDATE deals SET deal_index=? WHERE wallet=? AND token=?",
+                (i, wallet_l, row["token"]),
+            )
+        n = len(rows)
+        ts = time.time() if now is None else now
+        status = "done" if n >= max_deals else "watching"
+        conn.execute(
+            "UPDATE wallets SET deal_count=?, status=?, updated_at=? WHERE address=?",
+            (n, status, ts, wallet_l),
+        )
+        return n
+
     def ingest_buyers(
         self,
         buyers: list[BuyerRow],
@@ -216,14 +251,14 @@ class FollowupStore:
                         "SELECT deal_count, status FROM wallets WHERE address=?",
                         (wallet,),
                     ).fetchone()
+                    seed_block = int(b.first_block or 0)
                     if wrow is None:
-                        seed_block = int(b.first_block or 0)
                         conn.execute(
                             "INSERT INTO wallets ("
                             "address, status, deal_count, wallet_balance_eth, "
                             "tokens_traded_7d, raybot_synced, first_token, first_mcap, "
                             "discovered_at, updated_at, last_seen_block"
-                            ") VALUES (?, 'watching', 1, ?, ?, 0, ?, ?, ?, ?, ?)",
+                            ") VALUES (?, 'watching', 0, ?, ?, 0, ?, ?, ?, ?, ?)",
                             (
                                 wallet,
                                 b.wallet_balance_eth,
@@ -235,22 +270,18 @@ class FollowupStore:
                                 seed_block,
                             ),
                         )
-                        deal_index = 1
                     else:
                         if wrow["status"] == "done":
                             continue
-                        deal_index = int(wrow["deal_count"]) + 1
-                        if deal_index > max_deals:
+                        if int(wrow["deal_count"] or 0) >= max_deals:
                             continue
-                        seed_block = int(b.first_block or 0)
                         conn.execute(
-                            "UPDATE wallets SET deal_count=?, updated_at=?, "
+                            "UPDATE wallets SET updated_at=?, "
                             "wallet_balance_eth=COALESCE(?, wallet_balance_eth), "
                             "tokens_traded_7d=COALESCE(?, tokens_traded_7d), "
                             "last_seen_block=MAX(last_seen_block, ?) "
                             "WHERE address=?",
                             (
-                                deal_index,
                                 now,
                                 b.wallet_balance_eth,
                                 b.tokens_traded_7d,
@@ -261,24 +292,25 @@ class FollowupStore:
                     conn.execute(
                         "INSERT INTO deals ("
                         "wallet, token, token_symbol, deal_index, mcap_at_buy, "
-                        "bought_usd, tx_hash, notified, created_at"
-                        ") VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                        "bought_usd, tx_hash, block_number, notified, created_at"
+                        ") VALUES (?, ?, ?, 0, ?, ?, ?, ?, 0, ?)",
                         (
                             wallet,
                             token,
                             b.token_symbol or "",
-                            deal_index,
                             b.mcap_at_first_buy,
                             b.bought_usd,
                             b.first_tx or "",
+                            seed_block,
                             now,
                         ),
                     )
-                    if deal_index >= max_deals:
-                        conn.execute(
-                            "UPDATE wallets SET status='done', updated_at=? WHERE address=?",
-                            (now, wallet),
-                        )
+                    self._renumber_deals(conn, wallet, max_deals=max_deals, now=now)
+                    idx_row = conn.execute(
+                        "SELECT deal_index FROM deals WHERE wallet=? AND token=?",
+                        (wallet, token),
+                    ).fetchone()
+                    deal_index = int(idx_row["deal_index"]) if idx_row else 0
                     inserted.append(
                         FollowupDealRow(
                             wallet=wallet,
@@ -288,6 +320,7 @@ class FollowupStore:
                             mcap_at_buy=b.mcap_at_first_buy,
                             bought_usd=b.bought_usd,
                             tx_hash=b.first_tx or "",
+                            block_number=seed_block,
                             notified=False,
                             created_at=now,
                         )
@@ -304,13 +337,19 @@ class FollowupStore:
         mcap_at_buy: float | None,
         bought_usd: float | None = None,
         tx_hash: str = "",
+        block_number: int = 0,
         max_deals: int = 3,
     ) -> FollowupDealRow | None:
-        """Record a new distinct-token deal. Returns row if inserted, else None."""
+        """Record a new distinct-token deal. Returns row if inserted, else None.
+
+        ``deal_index`` is assigned by on-chain block order among this wallet's
+        deals — not by insert time — so late-seen earlier buys renumber correctly.
+        """
         self._ensure()
         wallet_l = wallet.lower()
         token_l = token.lower()
         now = time.time()
+        block = max(0, int(block_number or 0))
         with self._lock:
             with self._connect() as conn:
                 if conn.execute(
@@ -326,30 +365,33 @@ class FollowupStore:
                     return None
                 if wrow["status"] != "watching":
                     return None
-                deal_index = int(wrow["deal_count"]) + 1
-                if deal_index > max_deals:
+                if int(wrow["deal_count"] or 0) >= max_deals:
                     return None
                 conn.execute(
                     "INSERT INTO deals ("
                     "wallet, token, token_symbol, deal_index, mcap_at_buy, "
-                    "bought_usd, tx_hash, notified, created_at"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                    "bought_usd, tx_hash, block_number, notified, created_at"
+                    ") VALUES (?, ?, ?, 0, ?, ?, ?, ?, 0, ?)",
                     (
                         wallet_l,
                         token_l,
                         token_symbol,
-                        deal_index,
                         mcap_at_buy,
                         bought_usd,
                         tx_hash,
+                        block,
                         now,
                     ),
                 )
-                status = "done" if deal_index >= max_deals else "watching"
-                conn.execute(
-                    "UPDATE wallets SET deal_count=?, status=?, updated_at=? WHERE address=?",
-                    (deal_index, status, now, wallet_l),
-                )
+                self._renumber_deals(conn, wallet_l, max_deals=max_deals, now=now)
+                idx_row = conn.execute(
+                    "SELECT deal_index, notified FROM deals WHERE wallet=? AND token=?",
+                    (wallet_l, token_l),
+                ).fetchone()
+                if idx_row is None:
+                    conn.commit()
+                    return None
+                deal_index = int(idx_row["deal_index"])
                 conn.commit()
                 return FollowupDealRow(
                     wallet=wallet_l,
@@ -359,9 +401,76 @@ class FollowupStore:
                     mcap_at_buy=mcap_at_buy,
                     bought_usd=bought_usd,
                     tx_hash=tx_hash,
+                    block_number=block,
                     notified=False,
                     created_at=now,
                 )
+
+    def delete_deal(
+        self,
+        wallet: str,
+        token: str,
+        *,
+        max_deals: int = 5,
+    ) -> bool:
+        """Remove a deal (e.g. airdrop false positive) and renumber the rest."""
+        self._ensure()
+        wallet_l = wallet.lower()
+        token_l = token.lower()
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "DELETE FROM deals WHERE wallet=? AND token=?",
+                    (wallet_l, token_l),
+                )
+                if cur.rowcount <= 0:
+                    return False
+                self._renumber_deals(
+                    conn, wallet_l, max_deals=max_deals, now=time.time()
+                )
+                conn.commit()
+                return True
+
+    def set_deal_block(
+        self,
+        wallet: str,
+        token: str,
+        block_number: int,
+        *,
+        max_deals: int = 5,
+        renumber: bool = True,
+    ) -> bool:
+        """Update ``block_number`` for a deal; optionally renumber the wallet."""
+        self._ensure()
+        wallet_l = wallet.lower()
+        token_l = token.lower()
+        block = max(0, int(block_number or 0))
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "UPDATE deals SET block_number=? WHERE wallet=? AND token=?",
+                    (block, wallet_l, token_l),
+                )
+                if cur.rowcount <= 0:
+                    return False
+                if renumber:
+                    self._renumber_deals(
+                        conn, wallet_l, max_deals=max_deals, now=time.time()
+                    )
+                conn.commit()
+                return True
+
+    def renumber_wallet(self, wallet: str, *, max_deals: int = 5) -> int:
+        """Re-assign deal_index by block for one wallet. Returns deal count."""
+        self._ensure()
+        wallet_l = wallet.lower()
+        with self._lock:
+            with self._connect() as conn:
+                n = self._renumber_deals(
+                    conn, wallet_l, max_deals=max_deals, now=time.time()
+                )
+                conn.commit()
+                return n
 
     def mark_notified(self, wallet: str, token: str, kind: str = "deal") -> bool:
         self._ensure()
@@ -548,6 +657,179 @@ class FollowupStore:
             ).fetchall()
         return {r["token"] for r in rows}
 
+    def list_deals_for_wallet(self, wallet: str) -> list[dict[str, Any]]:
+        """Deal rows for one wallet ordered by deal_index."""
+        self._ensure()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT token, token_symbol, deal_index, block_number, "
+                "mcap_at_buy, tx_hash FROM deals WHERE wallet=? "
+                "ORDER BY deal_index",
+                (wallet.lower(),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def apply_gmgn_buy_order(
+        self,
+        wallet: str,
+        post_seed_buys: list[dict[str, Any]],
+        *,
+        max_deals: int = 5,
+    ) -> list[FollowupDealRow]:
+        """Upsert post-seed GMGN buys with explicit follow-up indices.
+
+        ``post_seed_buys`` is oldest→newest, excludes the seed token, and each
+        item has token, symbol?, tx_hash?, block_number?, mcap_at_buy?, and
+        bought_usd?.  The seed remains deal #1; these buys begin at deal #2.
+
+        Any existing deal for this wallet that is not the seed and not in the
+        capped GMGN prefix is deleted (stale Blockscout dust must not keep a
+        colliding ``deal_index``).
+
+        Returns only **newly inserted** deal rows (for Telegram alerts).
+        """
+        self._ensure()
+        wallet_l = wallet.lower()
+        limit = max(1, int(max_deals))
+        if limit <= 1:
+            return []
+        # Be defensive: the GMGN client already returns unique tokens, but this
+        # store boundary must never assign duplicate ranks if a caller regresses.
+        unique: list[dict[str, Any]] = []
+        seen_tokens: set[str] = set()
+        for raw in post_seed_buys:
+            token = str(raw.get("token") or "").strip().lower()
+            if not token or token in seen_tokens:
+                continue
+            seen_tokens.add(token)
+            unique.append(raw)
+            if len(unique) >= limit - 1:
+                break
+        capped = unique
+        if not capped:
+            return []
+        now = time.time()
+        inserted: list[FollowupDealRow] = []
+        with self._lock:
+            with self._connect() as conn:
+                wrow = conn.execute(
+                    "SELECT status FROM wallets WHERE address=?",
+                    (wallet_l,),
+                ).fetchone()
+                if wrow is None:
+                    return []
+                seed = conn.execute(
+                    "SELECT token FROM deals WHERE wallet=? AND deal_index=1",
+                    (wallet_l,),
+                ).fetchone()
+                if seed is None:
+                    return []
+                seed_token = str(seed["token"]).lower()
+                # Seed + GMGN post-seed prefix are the only rows allowed to keep
+                # a deal_index. Stale Blockscout dust/airdrops (e.g. CASHCAT)
+                # previously stayed at an old rank and collided with GMGN #2.
+                keep_tokens: set[str] = {seed_token}
+                rank = 2
+                for raw in capped:
+                    token = str(raw.get("token") or "").lower()
+                    if not token or token == seed_token:
+                        continue
+                    i = rank
+                    rank += 1
+                    keep_tokens.add(token)
+                    sym = str(raw.get("symbol") or raw.get("token_symbol") or "")
+                    tx = str(raw.get("tx_hash") or "")
+                    block = max(0, int(raw.get("block_number") or 0))
+                    mcap = raw.get("mcap_at_buy")
+                    bought = raw.get("bought_usd")
+                    existing = conn.execute(
+                        "SELECT deal_index, tx_hash, mcap_at_buy, bought_usd FROM deals "
+                        "WHERE wallet=? AND token=?",
+                        (wallet_l, token),
+                    ).fetchone()
+                    if existing:
+                        conn.execute(
+                            "UPDATE deals SET deal_index=?, "
+                            "token_symbol=CASE WHEN ?!='' THEN ? ELSE token_symbol END, "
+                            "tx_hash=CASE WHEN ?!='' THEN ? ELSE tx_hash END, "
+                            "block_number=CASE WHEN ?>0 THEN ? ELSE block_number END, "
+                            "mcap_at_buy=CASE WHEN mcap_at_buy IS NULL AND ? IS NOT NULL "
+                            "THEN ? ELSE mcap_at_buy END, "
+                            "bought_usd=CASE WHEN bought_usd IS NULL AND ? IS NOT NULL "
+                            "THEN ? ELSE bought_usd END "
+                            "WHERE wallet=? AND token=?",
+                            (
+                                i,
+                                sym,
+                                sym,
+                                tx,
+                                tx,
+                                block,
+                                block,
+                                mcap,
+                                mcap,
+                                bought,
+                                bought,
+                                wallet_l,
+                                token,
+                            ),
+                        )
+                        continue
+                    conn.execute(
+                        "INSERT INTO deals ("
+                        "wallet, token, token_symbol, deal_index, mcap_at_buy, "
+                        "bought_usd, tx_hash, block_number, notified, created_at"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                        (
+                            wallet_l,
+                            token,
+                            sym,
+                            i,
+                            mcap,
+                            bought,
+                            tx,
+                            block,
+                            now,
+                        ),
+                    )
+                    inserted.append(
+                        FollowupDealRow(
+                            wallet=wallet_l,
+                            token=token,
+                            token_symbol=sym,
+                            deal_index=i,
+                            mcap_at_buy=float(mcap) if mcap is not None else None,
+                            bought_usd=float(bought) if bought is not None else None,
+                            tx_hash=tx,
+                            block_number=block,
+                            notified=False,
+                            created_at=now,
+                        )
+                    )
+                # Drop Blockscout-only / pre-GMGN ghosts so deal_index stays unique
+                # and matches GMGN post-seed chronology (not discovery time).
+                orphans = conn.execute(
+                    "SELECT token FROM deals WHERE wallet=?",
+                    (wallet_l,),
+                ).fetchall()
+                for row in orphans:
+                    tok = str(row["token"]).lower()
+                    if tok not in keep_tokens:
+                        conn.execute(
+                            "DELETE FROM deals WHERE wallet=? AND token=?",
+                            (wallet_l, tok),
+                        )
+                # GMGN's post-seed order is authoritative for this sync.
+                max_idx = rank - 1
+                status = "done" if max_idx >= limit else "watching"
+                conn.execute(
+                    "UPDATE wallets SET deal_count=?, status=?, updated_at=? "
+                    "WHERE address=?",
+                    (max_idx, status, now, wallet_l),
+                )
+                conn.commit()
+        return inserted
+
     def counts(self) -> tuple[int, int]:
         self._ensure()
         with self._connect() as conn:
@@ -616,6 +898,9 @@ class FollowupStore:
                                 mcap_at_buy=d["mcap_at_buy"],
                                 bought_usd=d["bought_usd"],
                                 tx_hash=d["tx_hash"] or "",
+                                block_number=int(d["block_number"] or 0)
+                                if "block_number" in d.keys()
+                                else 0,
                                 notified=bool(d["notified"]),
                                 created_at=float(d["created_at"]),
                             )

@@ -22,6 +22,14 @@ class Settings(BaseSettings):
 
     rpc_url: str = "https://rpc.mainnet.chain.robinhood.com"
     blockscout_api_key: str = ""
+    # GMGN OpenAPI (https://openapi.gmgn.ai) — portfolio activity / verify deals.
+    # Empty → public docs key (rate-limited). Create your own at https://gmgn.ai/ai
+    # Prefer a pool for follow-up RPS: GMGN_API_KEYS=key1,key2,key3 and/or
+    # GMGN_API_KEY / GMGN_API_KEY_2 / GMGN_API_KEY_3 (merged + deduped).
+    gmgn_api_key: str = ""
+    gmgn_api_key_2: str = ""
+    gmgn_api_key_3: str = ""
+    gmgn_api_keys: str = ""
     mcap_threshold: float = 20_000.0
     # Larger chunks = fewer round-trips (filtered getLogs stay small)
     log_chunk_size: int = 100_000

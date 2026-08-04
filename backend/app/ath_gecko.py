@@ -24,7 +24,7 @@ _CACHE_TTL_S = 20 * 60.0
 _MAX_PAGES = 3
 _CACHE: dict[str, tuple[float, float]] = {}  # token -> (ts, ath_mcap)
 _POOL_CACHE: dict[str, tuple[float, str]] = {}  # token -> (ts, pool)
-_sem = asyncio.Semaphore(2)
+_sem = asyncio.Semaphore(1)
 
 
 @dataclass(frozen=True)
@@ -171,14 +171,26 @@ async def _fetch_ohlcv_pages(pool: str, *, max_pages: int = _MAX_PAGES) -> list[
         }
         if before is not None:
             params["before_timestamp"] = before
-        delay = 0.4
+        delay = 2.0
         data = None
-        for _attempt in range(4):
+        for _attempt in range(5):
             try:
                 resp = await client.get(url, params=params, timeout=20.0)
                 if resp.status_code in (429, 502, 503):
-                    await asyncio.sleep(delay)
-                    delay = min(delay * 2, 4.0)
+                    ra = resp.headers.get("Retry-After")
+                    try:
+                        ra_s = float(ra) if ra else 0.0
+                    except (TypeError, ValueError):
+                        ra_s = 0.0
+                    # Never trust a tiny Retry-After — stampede if we sleep 0–200ms.
+                    sleep_for = max(delay, min(ra_s, 90.0))
+                    logger.warning(
+                        "Gecko OHLCV HTTP %s; backing off %.1fs",
+                        resp.status_code,
+                        sleep_for,
+                    )
+                    await asyncio.sleep(sleep_for)
+                    delay = min(delay * 2, 60.0)
                     continue
                 if resp.status_code != 200:
                     logger.debug("Gecko OHLCV %s: %s", resp.status_code, resp.text[:120])
@@ -188,7 +200,7 @@ async def _fetch_ohlcv_pages(pool: str, *, max_pages: int = _MAX_PAGES) -> list[
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Gecko OHLCV error: %s", exc)
                 await asyncio.sleep(delay)
-                delay = min(delay * 2, 4.0)
+                delay = min(delay * 2, 60.0)
         if data is None:
             break
         ohlcv = (
@@ -205,7 +217,7 @@ async def _fetch_ohlcv_pages(pool: str, *, max_pages: int = _MAX_PAGES) -> list[
             break
         if len(ohlcv) < 1000:
             break
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(1.0)
     return out
 
 

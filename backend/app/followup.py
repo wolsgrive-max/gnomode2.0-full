@@ -13,6 +13,7 @@ from .buy_gate import is_wallet_initiated_buy, method_is_non_buy
 from .config import settings
 from .constants import QUOTE_TOKENS
 from .followup_store import FollowupStore, followup_store
+from .gmgn_portfolio import GmgnBuy, UniqueBuysResult, fetch_unique_buys
 from .models import (
     BuyerRow,
     FollowupConfig,
@@ -423,9 +424,9 @@ class FollowupRunner:
             cfg = self._store.load_config()
             if not cfg.enabled:
                 continue
-            # interval_sec = target period between cycle *starts*. If a cycle
-            # already took longer, start the next one immediately.
-            period = max(5, int(cfg.interval_sec or 5))
+            # interval_sec = target period between cycle *starts*. 0 = ASAP
+            # after finish. If a cycle already took longer, start immediately.
+            period = max(0, int(cfg.interval_sec if cfg.interval_sec is not None else 0))
             sleep_for = max(0.0, period - float(self._last_run_duration_sec or 0))
             self._next_run_ts = time.time() + sleep_for
             self._wake.clear()
@@ -550,12 +551,41 @@ class FollowupRunner:
         self._last_message = f"Проверка {len(wallets)} кош…"
         self._append_log("scan", self._last_message, percent=5)
 
+        # Prefer real Blockscout scans over empty GMGN cycles while cooling.
+        gmgn_fallback_cycle = False
+        try:
+            from .gmgn_portfolio import (
+                gmgn_api_configured,
+                gmgn_circuit_open,
+                wait_for_gmgn_capacity,
+            )
+
+            if gmgn_api_configured():
+                ready = await wait_for_gmgn_capacity(timeout=12.0)
+                if not ready or gmgn_circuit_open():
+                    gmgn_fallback_cycle = True
+                    self._last_message = (
+                        "gmgn_empty_due_to_429, fallback_blockscout"
+                    )
+                    self._append_log("scan", self._last_message, percent=5)
+                    logger.warning(
+                        "Follow-up: GMGN circuit open — Blockscout fallback cycle"
+                    )
+        except Exception:  # noqa: BLE001
+            pass
+
         from .chain import RpcClient
 
         rpc = RpcClient()
-        sem = asyncio.Semaphore(max(1, int(cfg.scan_concurrency or 6)))
+        conc = max(1, int(cfg.scan_concurrency or 6))
+        if gmgn_fallback_cycle:
+            conc = min(conc, 3)
+        sem = asyncio.Semaphore(conc)
         done_count = 0
         skipped_alerts = 0
+        gmgn_ok_wallets = 0
+        gmgn_fallback_wallets = 0
+        blockscout_wallets = 0
         progress_lock = asyncio.Lock()
 
         async def _alert_deals(
@@ -614,23 +644,37 @@ class FollowupRunner:
                     self._last_error = str(exc)
 
         async def _scan_one(wallet: str) -> tuple[str, list]:
-            nonlocal done_count
+            nonlocal done_count, gmgn_ok_wallets, gmgn_fallback_wallets, blockscout_wallets
             async with sem:
                 if self._stop_requested:
                     return wallet, []
                 try:
-                    deals = await self._scan_wallet(wallet, cfg, rpc=rpc)
+                    deals, source = await self._scan_wallet(
+                        wallet, cfg, rpc=rpc
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Follow-up scan %s: %s", wallet[:10], exc)
-                    deals = []
+                    deals, source = [], "error"
             async with progress_lock:
                 done_count += 1
+                if source == "gmgn":
+                    gmgn_ok_wallets += 1
+                elif source == "blockscout_fallback":
+                    gmgn_fallback_wallets += 1
+                    blockscout_wallets += 1
+                elif source == "blockscout":
+                    blockscout_wallets += 1
                 if done_count % 5 == 0 or done_count == len(wallets):
                     pct = 5 + int(90 * done_count / max(len(wallets), 1))
                     self._last_message = (
                         f"Проверено {done_count}/{len(wallets)}, "
                         f"новых сделок {self._last_new_deals}, "
                         f"алертов {self._last_alerts_sent}"
+                        + (
+                            f" · BS fallback {gmgn_fallback_wallets}"
+                            if gmgn_fallback_wallets
+                            else ""
+                        )
                     )
                     self._append_log("scan", self._last_message, percent=pct)
             return wallet, deals
@@ -666,12 +710,44 @@ class FollowupRunner:
             )
 
         if not self._stop_requested:
-            self._last_message = (
-                f"Готово — {len(wallets)} кош., "
-                f"{self._last_new_deals} сделок, "
-                f"{self._last_alerts_sent} алертов"
-            )
-            self._append_log("done", self._last_message, percent=100)
+            path_note = ""
+            if gmgn_fallback_wallets or gmgn_fallback_cycle:
+                path_note = (
+                    f" · gmgn_empty_due_to_429, fallback_blockscout="
+                    f"{gmgn_fallback_wallets}/{len(wallets)}"
+                )
+            elif blockscout_wallets and not gmgn_ok_wallets:
+                path_note = f" · blockscout={blockscout_wallets}"
+            elif gmgn_ok_wallets:
+                path_note = (
+                    f" · gmgn_ok={gmgn_ok_wallets}"
+                    + (
+                        f", blockscout={blockscout_wallets}"
+                        if blockscout_wallets
+                        else ""
+                    )
+                )
+            if (
+                gmgn_fallback_cycle
+                and gmgn_fallback_wallets == 0
+                and gmgn_ok_wallets == 0
+                and blockscout_wallets == 0
+            ):
+                self._last_message = (
+                    "GMGN 429 — нет скана (ни GMGN, ни Blockscout)"
+                    f"{path_note}"
+                )
+                self._append_log("error", self._last_message, percent=100)
+                logger.error(
+                    "Follow-up cycle produced no scan work under GMGN 429"
+                )
+            else:
+                self._last_message = (
+                    f"Готово — {len(wallets)} кош., "
+                    f"{self._last_new_deals} сделок, "
+                    f"{self._last_alerts_sent} алертов{path_note}"
+                )
+                self._append_log("done", self._last_message, percent=100)
 
         # Prune after alerts so honeypot/TG path is not blocked by ATH fetches.
         if not self._stop_requested:
@@ -820,11 +896,174 @@ class FollowupRunner:
         cfg: FollowupConfig,
         *,
         rpc: Any | None = None,
-    ) -> list:
+    ) -> tuple[list, str]:
         last_seen, deal_count, status = self._store.get_wallet_scan_meta(wallet)
         if status != "watching" or deal_count >= cfg.max_deals:
-            return []
+            return [], "skip"
 
+        # GMGN provides the authoritative sequence *after the watched seed*.
+        # Do not turn a wallet's full lifetime history into follow-up deals:
+        # deal #1 is the token that caused watch ingestion.
+        # Docs key is shared/rate-limited — only use OpenAPI in the scan loop
+        # when a paid key is set; otherwise paced Blockscout (accuracy > speed).
+        # On circuit / all-keys 429: empty GMGN is NOT "no new buys" — fall
+        # through to Blockscout for real scan work (prefer 30–60s accurate
+        # cycles over fake ~15s empty ones).
+        gmgn_buys: list[GmgnBuy] = []
+        gmgn_result: UniqueBuysResult | None = None
+        gmgn_attempted = False
+        try:
+            from .gmgn_portfolio import gmgn_api_configured
+
+            if gmgn_api_configured():
+                gmgn_attempted = True
+                gmgn_result = await fetch_unique_buys(wallet, max_pages=1)
+                gmgn_buys = list(gmgn_result.buys)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("GMGN unique buys %s: %s", wallet[:10], exc)
+            gmgn_buys = []
+            gmgn_attempted = True
+            gmgn_result = UniqueBuysResult(
+                buys=[], ok=False, rate_limited=False
+            )
+
+        seed_deal = next(
+            (
+                deal
+                for deal in self._store.list_deals_for_wallet(wallet)
+                if int(deal.get("deal_index") or 0) == 1
+            ),
+            None,
+        )
+        seed_token = str((seed_deal or {}).get("token") or "").lower()
+        seed_buy = next(
+            (
+                buy
+                for buy in gmgn_buys
+                if seed_token
+                and buy.token.lower() == seed_token
+                and buy.timestamp > 0
+            ),
+            None,
+        )
+
+        use_gmgn = False
+        # Without a timestamp that anchors deal #1, GMGN lifetime history
+        # cannot be safely distinguished from purchases before we watched it.
+        if (
+            gmgn_result is not None
+            and gmgn_result.ok
+            and not gmgn_result.rate_limited
+            and seed_buy is not None
+        ):
+            gmgn_buys = [
+                buy
+                for buy in gmgn_buys
+                if buy.token
+                and buy.token.lower() not in QUOTE_TOKENS
+                and buy.token.lower() != seed_token
+                and buy.timestamp > seed_buy.timestamp
+            ][: max(0, int(cfg.max_deals) - 1)]
+            # Seed-anchored GMGN answer is authoritative even when there are
+            # zero new post-seed buys — do NOT fall through to Blockscout.
+            if not gmgn_buys:
+                return [], "gmgn"
+            use_gmgn = True
+        elif gmgn_attempted and (
+            gmgn_result is None
+            or gmgn_result.rate_limited
+            or not gmgn_result.ok
+            or seed_buy is None
+        ):
+            # CRITICAL: empty/429 must NOT look like "no new buys".
+            if gmgn_result is not None and gmgn_result.rate_limited:
+                reason = "gmgn_empty_due_to_429"
+            elif gmgn_result is not None and gmgn_result.ok and seed_buy is None:
+                reason = "gmgn_seed_miss"
+            else:
+                reason = "gmgn_fetch_failed"
+            logger.warning(
+                "%s, fallback_blockscout wallet=%s",
+                reason,
+                wallet[:10],
+            )
+            gmgn_buys = []
+        else:
+            gmgn_buys = []
+
+        if use_gmgn and gmgn_buys:
+            existing_by_token = {
+                str(deal["token"]).lower(): deal
+                for deal in self._store.list_deals_for_wallet(wallet)
+            }
+
+            async def _gmgn_deal_data(
+                buy: GmgnBuy,
+            ) -> dict[str, Any]:
+                token = buy.token.lower()
+                existing = existing_by_token.get(token)
+                mcap: float | None = (
+                    existing.get("mcap_at_buy") if existing else None
+                )
+                bought_usd: float | None = (
+                    existing.get("bought_usd") if existing else buy.cost_usd
+                )
+                if mcap is None:
+                    if buy.tx_hash:
+                        try:
+                            from .replay import estimate_entry_at_tx
+
+                            entry = await estimate_entry_at_tx(
+                                token, buy.tx_hash, rpc=rpc
+                            )
+                            mcap = entry.mcap
+                            if bought_usd is None:
+                                bought_usd = entry.bought_usd
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("GMGN mcap_at_tx failed: %s", exc)
+                    if mcap is None:
+                        mcap, _price = await estimate_token_quote(token)
+                return {
+                    "token": token,
+                    "symbol": buy.symbol,
+                    "tx_hash": buy.tx_hash,
+                    "bought_usd": bought_usd,
+                    "mcap_at_buy": mcap,
+                    # GMGN activity does not expose Robinhood block numbers.
+                    "block_number": 0,
+                }
+
+            gmgn_deals = await asyncio.gather(
+                *[_gmgn_deal_data(buy) for buy in gmgn_buys]
+            )
+            inserted = self._store.apply_gmgn_buy_order(
+                wallet,
+                gmgn_deals,
+                max_deals=cfg.max_deals,
+            )
+
+            async def _resolve_honeypot(deal: Any) -> str | None:
+                try:
+                    from .security import honeypot_reason_for_token
+
+                    return await asyncio.wait_for(
+                        honeypot_reason_for_token(deal.token),
+                        timeout=8.0,
+                    )
+                except Exception:  # noqa: BLE001
+                    return None
+
+            hp_reasons = await asyncio.gather(
+                *[_resolve_honeypot(deal) for deal in inserted]
+            )
+            return list(zip(inserted, hp_reasons)), "gmgn"
+
+        # GMGN unavailable / rate-limited / seed miss → Blockscout incremental scan.
+        source = (
+            "blockscout_fallback"
+            if gmgn_attempted
+            else "blockscout"
+        )
         known = self._store.known_tokens(wallet)
         # Newest-first pages: overwrite so the oldest post-watermark buy per token wins.
         candidates: dict[str, tuple[str, str, dict[str, Any], int]] = {}
@@ -863,21 +1102,27 @@ class FollowupRunner:
                 tx = str(item.get("transaction_hash") or item.get("tx_hash") or "")
                 candidates[token] = (sym, tx, item, block)
 
-        # Only advance watermark after a full catch-up (hit last_seen or no more pages).
-        # Partial page windows must retry — otherwise sells bury earlier unique-token buys.
         if bootstrap:
+            # Existing wallet after upgrade: tip watermark only — do not invent
+            # deal #2+ from old transfer history.
             self._store.advance_last_seen_block(wallet, max(1, max_block_seen))
-        elif caught_up and max_block_seen > last_seen:
-            self._store.advance_last_seen_block(wallet, max_block_seen)
+            return [], source
 
         if not candidates:
-            return []
+            if caught_up and max_block_seen > last_seen:
+                self._store.advance_last_seen_block(wallet, max_block_seen)
+            return [], source
 
         ordered = sorted(candidates.items(), key=lambda kv: kv[1][3] or 0)
         remaining = cfg.max_deals - deal_count
         out: list[tuple[Any, str | None]] = []
-        for token, (sym, tx, item, _block) in ordered:
-            if self._stop_requested or remaining <= 0:
+        recorded_blocks: list[int] = []
+        stopped_early = False
+        for i, (token, (sym, tx, item, block)) in enumerate(ordered):
+            if self._stop_requested:
+                break
+            if remaining <= 0:
+                stopped_early = True
                 break
             if token in self._store.known_tokens(wallet):
                 continue
@@ -915,7 +1160,6 @@ class FollowupRunner:
                 except Exception:  # noqa: BLE001
                     return None
 
-            # Honeypot in parallel with mcap — still finished before TG send.
             (mcap, bought_usd), hp_reason = await asyncio.gather(
                 _resolve_mcap(),
                 _resolve_honeypot(),
@@ -927,12 +1171,27 @@ class FollowupRunner:
                 mcap_at_buy=mcap,
                 bought_usd=bought_usd,
                 tx_hash=tx,
+                block_number=block,
                 max_deals=cfg.max_deals,
             )
             if deal:
                 out.append((deal, hp_reason))
                 remaining -= 1
-        return out
+                if block > 0:
+                    recorded_blocks.append(block)
+                _, new_count, new_status = self._store.get_wallet_scan_meta(wallet)
+                if new_status != "watching" or new_count >= cfg.max_deals:
+                    if i < len(ordered) - 1:
+                        stopped_early = True
+                    break
+
+        # Watermark AFTER recording. Leftover candidates → last recorded block only.
+        if caught_up:
+            if stopped_early and recorded_blocks:
+                self._store.advance_last_seen_block(wallet, max(recorded_blocks))
+            elif not stopped_early and max_block_seen > last_seen:
+                self._store.advance_last_seen_block(wallet, max_block_seen)
+        return out, source
 
 
 followup_runner = FollowupRunner()

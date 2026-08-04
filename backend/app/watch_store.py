@@ -55,7 +55,8 @@ class WatchStore:
         self._lock = threading.Lock()
         self._seen: set[str] | None = None
         self._hold: dict[str, dict[str, Any]] | None = None
-        self._parsed: set[str] | None = None
+        # token -> unix parsed_at (0.0 = legacy / unknown → eligible for young requeue)
+        self._parsed: dict[str, float] | None = None
         self._last_success_ts: float | None | object = _UNSET
 
     def load_config(self) -> WatchConfig:
@@ -167,11 +168,11 @@ class WatchStore:
 
     # ---------------------------------------------------------------- hold / ATH
 
-    def _ensure_hold_loaded(self) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    def _ensure_hold_loaded(self) -> tuple[dict[str, dict[str, Any]], dict[str, float]]:
         if self._hold is not None and self._parsed is not None:
             return self._hold, self._parsed
         hold: dict[str, dict[str, Any]] = {}
-        parsed: set[str] = set()
+        parsed: dict[str, float] = {}
         if self._hold_path.is_file():
             try:
                 raw = json.loads(self._hold_path.read_text(encoding="utf-8"))
@@ -187,9 +188,24 @@ class WatchStore:
                                 "ath_mcap": float(v.get("ath_mcap") or 0.0),
                                 "symbol": str(v.get("symbol") or ""),
                             }
+                    raw_at = raw.get("parsed_at")
+                    if isinstance(raw_at, dict):
+                        for k, v in raw_at.items():
+                            if not k:
+                                continue
+                            try:
+                                parsed[str(k).lower()] = float(v or 0.0)
+                            except (TypeError, ValueError):
+                                parsed[str(k).lower()] = 0.0
                     raw_parsed = raw.get("parsed")
                     if isinstance(raw_parsed, list):
-                        parsed = {str(x).lower() for x in raw_parsed if x}
+                        # Legacy list: unknown timestamp → 0 so young tokens
+                        # become immediately eligible for requeue.
+                        for x in raw_parsed:
+                            if not x:
+                                continue
+                            addr = str(x).lower()
+                            parsed.setdefault(addr, 0.0)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to load watch hold %s: %r", self._hold_path, exc)
         self._hold = hold
@@ -206,13 +222,14 @@ class WatchStore:
                 reverse=True,
             )
             self._hold = dict(items[:_HOLD_MAX])
-        parsed_list = list(self._parsed)
-        if len(parsed_list) > _PARSED_MAX:
-            parsed_list = parsed_list[-_PARSED_MAX:]
-            self._parsed = set(parsed_list)
+        if len(self._parsed) > _PARSED_MAX:
+            newest = sorted(self._parsed.items(), key=lambda kv: kv[1])[-_PARSED_MAX:]
+            self._parsed = dict(newest)
+        parsed_list = list(self._parsed.keys())
         payload = {
             "hold": self._hold,
             "parsed": parsed_list,
+            "parsed_at": self._parsed,
         }
         self._hold_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._hold_path.with_suffix(self._hold_path.suffix + ".tmp")
@@ -227,7 +244,12 @@ class WatchStore:
     def load_parsed_tokens(self) -> set[str]:
         with self._lock:
             _, parsed = self._ensure_hold_loaded()
-            return set(parsed)
+            return set(parsed.keys())
+
+    def load_parsed_at(self) -> dict[str, float]:
+        with self._lock:
+            _, parsed = self._ensure_hold_loaded()
+            return dict(parsed)
 
     def hold_count(self) -> int:
         with self._lock:
@@ -312,16 +334,33 @@ class WatchStore:
             if dirty:
                 self._persist_hold()
 
-    def mark_token_parsed(self, token: str) -> None:
+    def mark_token_parsed(self, token: str, *, at: float | None = None) -> None:
         key = token.strip().lower()
         if not key:
             return
+        ts = time.time() if at is None else float(at)
         with self._lock:
             hold, parsed = self._ensure_hold_loaded()
-            parsed.add(key)
+            parsed[key] = ts
             if key in hold:
                 del hold[key]
             self._persist_hold()
+
+    def unparse_tokens(self, tokens: list[str] | set[str]) -> int:
+        """Remove tokens from the parsed set so they can be parsed again."""
+        keys = {str(t).strip().lower() for t in tokens if t}
+        if not keys:
+            return 0
+        with self._lock:
+            _, parsed = self._ensure_hold_loaded()
+            n = 0
+            for key in keys:
+                if key in parsed:
+                    del parsed[key]
+                    n += 1
+            if n:
+                self._persist_hold()
+            return n
 
     def is_token_parsed(self, token: str) -> bool:
         with self._lock:
@@ -332,7 +371,7 @@ class WatchStore:
         """Clear ATH hold queue and parsed-token set (does not touch wallet seen)."""
         with self._lock:
             self._hold = {}
-            self._parsed = set()
+            self._parsed = {}
             self._persist_hold()
 
 

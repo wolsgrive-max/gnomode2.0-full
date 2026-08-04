@@ -185,3 +185,35 @@ def test_airdrop_method_blacklist_broader() -> None:
     assert method_is_non_buy("claimRewards") is True
     assert method_is_non_buy("distributeToken") is True
     assert method_is_non_buy("exactInputSingle") is False
+    assert method_is_non_buy("launchToken") is False
+
+
+@pytest.mark.asyncio
+async def test_launch_token_counts_toward_unique() -> None:
+    """Pons launchToken (GMGN «Покупка») is a wallet-initiated buy for unique."""
+    from app.buy_gate import method_is_launch_buy
+
+    assert method_is_launch_buy("launchToken") is True
+    items = [
+        {
+            "timestamp": "2026-08-03T14:37:07.000000Z",
+            "token": _tok("0x64ced9204e91ecd246f523abe8dfd7d28cbc888f", "PCC"),
+            "to": {"hash": WALLET},
+            "from": {"hash": "0xcd29a753", "is_contract": True},
+            "method": "launchToken",
+            "transaction_hash": "0xtx_launch",
+        },
+    ]
+    resp = SimpleNamespace(
+        status_code=200, json=lambda: {"items": items, "next_page_params": None}
+    )
+
+    async def fake_sender(tx: str) -> str | None:
+        return WALLET
+
+    with (
+        patch("app.wallet_metrics._bs_get", new=AsyncMock(return_value=resp)),
+        patch("app.buy_gate.transaction_sender", new=fake_sender),
+    ):
+        result = await _tokens_traded_7d_one(WALLET, CUTOFF, too_many=1)
+        assert result == (1, True)

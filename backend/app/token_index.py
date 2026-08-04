@@ -45,10 +45,9 @@ _ENRICH_BATCH = 30
 # Politeness: the index shares the RPC endpoint + DexScreener with the wallet
 # parser, so it runs on its own small connection pool and low concurrency and
 # never re-enriches the whole set in one burst.
-_ENRICH_CONCURRENCY = 3
-# Cold first-wave: slightly higher DS concurrency so watch/Хвать can start
-# before all ~18k 24h tokens are enriched.
-_COLD_ENRICH_CONCURRENCY = 6
+_ENRICH_CONCURRENCY = 2
+# Cold first-wave: keep low — DexScreener + Gecko share public rate limits.
+_COLD_ENRICH_CONCURRENCY = 2
 _INDEX_RPC_CONCURRENCY = 2
 _REFRESH_INTERVAL_S = 120
 _ENRICH_TTL_S = 15 * 60  # metrics considered fresh for 15 min
@@ -63,12 +62,28 @@ _COLD_READY_NEW = 1_200
 # stale-refresh so the parser gets the RPC/HTTP budget.
 _BUSY_SLICE = 0
 # Hot-set: frequent DexScreener ATH samples for liquid indexed tokens.
-_HOT_ENRICH_INTERVAL_S = 75
-_HOT_ENRICH_CAP = 350
+_HOT_ENRICH_INTERVAL_S = 120
+_HOT_ENRICH_CAP = 120
 _HOT_MIN_LIQ_USD = 4_000.0
 # Gecko OHLCV peaks (rate-limited); run after DS enrich on new/hot tokens.
-_GECKO_BATCH_LIMIT = 40
+# Keep small (Gecko 429s), but young never-probed must win the queue —
+# otherwise a $500k wick dumps to $2k DS spot before we ever OHLCV-probe.
+_GECKO_BATCH_LIMIT = 16
 _GECKO_RETRY_S = 20 * 60.0
+# Young tokens still inside the watch max-age window: retry failed/zero ATH
+# probes quickly so a brief pump is not permanently missed after a dump.
+_GECKO_YOUNG_RETRY_S = 3 * 60.0
+_GECKO_YOUNG_AGE_H = 24.0
+
+
+def _entry_is_young(entry: "TokenEntry", now: float | None = None) -> bool:
+    """True while the pool is still inside the watch-style age window."""
+    ts = time.time() if now is None else now
+    if entry.screened is not None and entry.screened.pair_age_hours is not None:
+        return float(entry.screened.pair_age_hours) <= _GECKO_YOUNG_AGE_H
+    if entry.first_seen > 0:
+        return (ts - entry.first_seen) <= _GECKO_YOUNG_AGE_H * 3600.0
+    return False
 
 
 def _topic_addr(topic: Any) -> str:
@@ -527,12 +542,10 @@ class TokenIndex:
                 return
             await self.scan_new_pools(full=cold, on_progress=on_progress)
             self._prune()
-            # Collect keys that still need a first Gecko peak (new / never probed).
-            gecko_candidates = [
-                k
-                for k, e in self._tokens.items()
-                if e.gecko_ath_at <= 0.0
-            ]
+            # Never-probed + young-under-age (force-probe / young retry).
+            # Without the young path, a dumped short pump falls out of the hot
+            # set (liq < $4k) and never re-enters Gecko after the first miss.
+            gecko_candidates = self._gecko_refresh_candidates()
             if cold:
                 # Unblock watch/Хвать ASAP: newest slice first, then finish
                 # the rest in a background tail so ensure_ready can return.
@@ -683,6 +696,15 @@ class TokenIndex:
                 break
         return out
 
+    def _gecko_refresh_candidates(self) -> list[str]:
+        """Never-probed tokens plus young ones still under the age cap."""
+        now = time.time()
+        out: list[str] = []
+        for key, entry in self._tokens.items():
+            if entry.gecko_ath_at <= 0.0 or _entry_is_young(entry, now):
+                out.append(key)
+        return out
+
     async def _apply_gecko_peaks(
         self, addresses: list[str], *, limit: int = _GECKO_BATCH_LIMIT
     ) -> int:
@@ -690,19 +712,44 @@ class TokenIndex:
         from .ath_gecko import fetch_token_ath_mcap
 
         now = time.time()
-        ranked: list[tuple[float, str]] = []
+        # Sort: young never-probed first (newest pools), then young retries,
+        # then old never-probed, then old retries. Without this, thousands of
+        # never-probed share the same score and a short-lived ATH pump can sit
+        # behind the Gecko queue forever while ath_mcap stays at DS spot.
+        ranked: list[tuple[int, float, str]] = []
         for raw in addresses:
             key = raw.strip().lower()
             entry = self._tokens.get(key)
             if entry is None:
                 continue
-            # Prefer never-probed, then oldest probe.
             age = now - entry.gecko_ath_at if entry.gecko_ath_at > 0 else 1e12
-            if entry.gecko_ath_at > 0 and age < _GECKO_RETRY_S:
+            young = _entry_is_young(entry, now)
+            retry_after = _GECKO_YOUNG_RETRY_S if young else _GECKO_RETRY_S
+            if entry.gecko_ath_at > 0 and age < retry_after:
                 continue
-            ranked.append((-age, key))
+            never = entry.gecko_ath_at <= 0.0
+            if young and never:
+                tier = 0
+            elif young:
+                tier = 1
+            elif never:
+                tier = 2
+            else:
+                tier = 3
+            # Newest pools / longest-overdue probes first within a tier.
+            secondary = (
+                -float(entry.created_block or 0) if never else -age
+            )
+            ranked.append((tier, secondary, key))
         ranked.sort()
-        keys = [k for _, k in ranked[: max(0, limit)]]
+        # Young fills the whole batch first; only spill leftover slots to older
+        # tokens. A deep young queue must not lose slots to stale never-probed.
+        lim = max(0, limit)
+        young_keys = [k for t, _, k in ranked if t <= 1]
+        other_keys = [k for t, _, k in ranked if t >= 2]
+        keys = young_keys[:lim]
+        if len(keys) < lim:
+            keys.extend(other_keys[: lim - len(keys)])
         if not keys:
             return 0
 
@@ -711,6 +758,7 @@ class TokenIndex:
             if entry is None:
                 return
             pool_hint = entry.pool_address or entry.pool_id
+            young = _entry_is_young(entry, now)
             try:
                 result = await fetch_token_ath_mcap(
                     entry.address,
@@ -718,10 +766,18 @@ class TokenIndex:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Gecko ATH failed for %s: %s", key, exc)
+                # Do not stamp probe time on hard failure for young tokens —
+                # allow a quick retry while age≤24h.
+                if not young:
+                    entry.gecko_ath_at = time.time()
+                return
+            if result.ath_mcap <= 0:
+                # Zero/miss: for young tokens leave gecko_ath_at unset (or stale)
+                # so the next cycle can catch a short-lived pump via minute candles.
+                if not young:
+                    entry.gecko_ath_at = time.time()
                 return
             entry.gecko_ath_at = time.time()
-            if result.ath_mcap <= 0:
-                return
             prev = entry.ath_mcap
             if (
                 prev >= 1_000_000_000.0
@@ -734,8 +790,14 @@ class TokenIndex:
             if entry.screened is not None:
                 entry.screened = self._apply_ath(entry, entry.screened)
 
-        await asyncio.gather(*(one(k) for k in keys))
-        logger.info("Gecko ATH probed %d tokens", len(keys))
+        for key in keys:
+            await one(key)
+            await asyncio.sleep(1.25)
+        logger.info(
+            "Gecko ATH probed %d tokens (young_first=%d)",
+            len(keys),
+            sum(1 for k in keys if (e := self._tokens.get(k)) and _entry_is_young(e)),
+        )
         return len(keys)
 
     async def refresh_hot(self) -> int:

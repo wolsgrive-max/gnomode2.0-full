@@ -1,8 +1,15 @@
-"""Blockscout API helpers (metadata + transfer fallback)."""
+"""Blockscout API helpers (metadata + transfer fallback).
+
+All GETs share a process-wide pace + concurrency cap so follow-up scans,
+wallet metrics, and buy-gate lookups do not stampede the public explorer
+into 429 storms. Prefer accuracy (retry + Retry-After) over speed.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Any, AsyncIterator
 
 from .chain import http_client
@@ -14,6 +21,16 @@ logger = logging.getLogger(__name__)
 # When Pro returns 401/402 (bad key / out of credits), flip to public explorer
 # for the rest of the process lifetime.
 _pro_disabled: bool = False
+
+# Global Blockscout pacing (shared limiter). Keep conservative — follow-up
+# accuracy/speed comes from paid GMGN; Blockscout is fallback + watch metrics.
+# ~2–3 req/s with concurrency 2 avoided transfer 429 storms in production.
+_BS_CONCURRENCY = 2
+_BS_MIN_INTERVAL = 0.40  # seconds between request *starts*
+_BS_MAX_ATTEMPTS = 8
+_bs_sem = asyncio.Semaphore(_BS_CONCURRENCY)
+_bs_pace_lock = asyncio.Lock()
+_bs_next_ok = 0.0
 
 
 def _public_base() -> str:
@@ -64,27 +81,83 @@ def blockscout_auth_params() -> dict[str, str]:
     return {}
 
 
+async def _pace_blockscout() -> None:
+    """Wait until the shared Blockscout token-bucket allows another request."""
+    global _bs_next_ok
+    async with _bs_pace_lock:
+        now = time.time()
+        wait = _bs_next_ok - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _bs_next_ok = time.time() + _BS_MIN_INTERVAL
+
+
+def _retry_after_seconds(resp: Any, fallback: float, *, cap: float = 60.0) -> float:
+    ra = getattr(getattr(resp, "headers", None), "get", lambda _k: None)("Retry-After")
+    if ra is None:
+        return fallback
+    try:
+        # Prefer the larger of Retry-After and our backoff — tiny RA values
+        # (0 / 0.2s) would otherwise stampede right back into 429.
+        return max(fallback, min(float(ra), cap))
+    except (TypeError, ValueError):
+        return fallback
+
+
 async def _get_json(
     path: str, *, params: dict[str, Any] | None = None
 ) -> tuple[int, Any] | None:
-    """GET ``path`` under current base; on Pro 401/402 flip to public and retry once."""
+    """Paced GET under current base; retries 429/5xx; Pro 401/402 → public."""
     client = http_client()
     params = dict(params or {})
-    for _ in range(2):
+    delay = 0.75
+    # Extra attempts when Pro flips mid-loop (don't burn the retry budget).
+    attempts = 0
+    max_attempts = _BS_MAX_ATTEMPTS + 2
+    while attempts < max_attempts:
+        attempts += 1
         url = f"{_base_url()}{path}"
         req_params = {**blockscout_auth_params(), **params}
-        try:
-            resp = await client.get(url, params=req_params, headers=_headers())
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Blockscout GET %s failed: %s", path, exc)
-            return None
-        if resp.status_code in (401, 402) and _use_pro():
+        resp = None
+        async with _bs_sem:
+            await _pace_blockscout()
+            try:
+                resp = await client.get(url, params=req_params, headers=_headers())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Blockscout GET %s error attempt %s: %s", path, attempts, exc
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 1.7, 45.0)
+                continue
+
+        if resp.status_code in (401, 402, 403) and _use_pro():
             disable_blockscout_pro(f"HTTP {resp.status_code}")
             continue
+
+        if resp.status_code in (429, 502, 503):
+            sleep_for = _retry_after_seconds(resp, delay, cap=90.0)
+            logger.warning(
+                "Blockscout %s → HTTP %s; backing off %.1fs (attempt %s)",
+                path,
+                resp.status_code,
+                sleep_for,
+                attempts,
+            )
+            # Push the shared pace forward so other callers don't stampede.
+            global _bs_next_ok
+            async with _bs_pace_lock:
+                _bs_next_ok = max(_bs_next_ok, time.time() + sleep_for)
+            await asyncio.sleep(sleep_for)
+            delay = min(delay * 1.8, 45.0)
+            continue
+
         try:
             return resp.status_code, resp.json()
         except Exception:  # noqa: BLE001
             return resp.status_code, None
+
+    logger.warning("Blockscout GET %s exhausted retries", path)
     return None
 
 

@@ -22,7 +22,12 @@ from .replay import parse_token
 from .screener import screen_tokens
 from .telegram import resolve_chat_id, resolve_topic_id, send_buyers, telegram_configured
 from .token_index import token_index
-from .watch_qualify import ath_gate_enabled, classify_for_parse, should_mark_parsed
+from .watch_qualify import (
+    REPARSE_YOUNG_COOLDOWN_SEC,
+    ath_gate_enabled,
+    classify_for_parse,
+    should_mark_parsed,
+)
 from .watch_store import WatchStore, catchup_lookback_hours, watch_store
 
 logger = logging.getLogger(__name__)
@@ -492,15 +497,35 @@ class WatchRunner:
         gate_on = ath_gate_enabled(min_ath)
         now = time.time()
         hold_snapshot = self._store.load_hold() if gate_on else {}
-        parsed_tokens = self._store.load_parsed_tokens() if gate_on else set()
+        parsed_at = self._store.load_parsed_at() if gate_on else {}
+        max_pair_age = cfg.screen.max_pair_age_hours
+        if gate_on and min_ath:
+            # Brief pumps can dump before DexScreener writes a lasting ATH into
+            # the index. Probe Gecko/DS peaks for young under-threshold tokens
+            # so dump-after-pump still qualifies while age≤max_pair_age.
+            screened, hold_snapshot = await self._probe_young_ath_peaks(
+                screened,
+                hold=hold_snapshot,
+                min_ath=float(min_ath),
+                max_pair_age_hours=max_pair_age,
+            )
         decision = classify_for_parse(
             screened,
             min_ath_mcap=min_ath,
             hold=hold_snapshot,
-            parsed=parsed_tokens,
+            parsed=parsed_at,
             index_addresses=token_index.known_addresses() if gate_on else None,
             now=now,
+            max_pair_age_hours=max_pair_age,
         )
+        if gate_on and decision.requeued_young:
+            n_un = self._store.unparse_tokens(decision.requeued_young)
+            self._append_log(
+                "hold",
+                f"Повторный парс: {n_un} молодых токенов сняты с parsed "
+                f"(age≤{max_pair_age:g}h — это не «старые», cooldown истёк)",
+                percent=21,
+            )
         if gate_on:
             self._store.apply_qualify_updates(
                 ath_updates=decision.ath_updates,
@@ -511,11 +536,20 @@ class WatchRunner:
             )
             self._last_tokens_held = len(decision.held)
             self._last_tokens_qualified = len(decision.candidates)
+            age_note = (
+                f", max_age={max_pair_age:g}h" if max_pair_age is not None else ""
+            )
             self._append_log(
                 "hold",
                 f"ATH≥{min_ath:,.0f}: hold={len(decision.held)} "
                 f"(ждут порог), qualify={len(decision.candidates)} "
-                f"(к парсу), parsed={len(parsed_tokens)}"
+                f"(к парсу), skip_parsed={decision.skipped_parsed} "
+                f"(не age), parsed_set={len(parsed_at)}{age_note}"
+                + (
+                    f", requeue_young={len(decision.requeued_young)}"
+                    if decision.requeued_young
+                    else ""
+                )
                 + (f", expired={len(decision.expired)}" if decision.expired else ""),
                 percent=22,
             )
@@ -529,13 +563,21 @@ class WatchRunner:
                 percent=22,
             )
 
-        tokens = decision.candidates[: cfg.max_tokens_per_cycle]
+        # Never-parsed / hold-promoted first; young requeues only fill leftover
+        # slots so filter-wipe retries cannot starve brand-new tokens.
+        requeued = {a.lower() for a in decision.requeued_young}
+        fresh = [t for t in decision.candidates if t.lower() not in requeued]
+        retry = [t for t in decision.candidates if t.lower() in requeued]
+        limit = max(1, int(cfg.max_tokens_per_cycle))
+        retry_budget = min(len(retry), max(1, limit // 4)) if retry else 0
+        tokens = (fresh + retry[:retry_budget])[:limit]
         if len(decision.candidates) > len(tokens):
             self._append_log(
                 "hold",
-                f"Лимит цикла {cfg.max_tokens_per_cycle}: "
-                f"парсим {len(tokens)} из {len(decision.candidates)} qualify "
-                f"(остальные — следующий цикл)",
+                f"Лимит цикла {limit}: парсим {len(tokens)} из "
+                f"{len(decision.candidates)} qualify "
+                f"(fresh={len(fresh)}, requeue_used={min(retry_budget, len(retry))}/"
+                f"{len(retry)}; остальные — следующий цикл)",
                 percent=23,
             )
         if not tokens:
@@ -547,10 +589,11 @@ class WatchRunner:
             if self._last_tokens_screened == 0:
                 self._last_message = "Нет токенов по фильтрам скринера"
             elif gate_on and min_ath:
+                skipped = decision.skipped_parsed
                 self._last_message = (
-                    f"Нет токенов для парса — {self._last_tokens_held} в hold "
-                    f"ждут ATH≥{min_ath:,.0f} "
-                    f"(скринер {self._last_tokens_screened})"
+                    f"Нет токенов для парса — hold={self._last_tokens_held} "
+                    f"(ATH<{min_ath:,.0f}), skip_parsed={skipped} "
+                    f"(не age; скринер {self._last_tokens_screened})"
                 )
             else:
                 self._last_message = "Нет токенов для парса"
@@ -642,13 +685,15 @@ class WatchRunner:
                 buyers_after_filters=len(buyers),
             ):
                 self._store.mark_token_parsed(token)
-            elif gate_on and before_filters > 0 and not buyers:
-                self._append_log(
-                    "hold",
-                    f"{token[:10]}… не в parsed — {before_filters} early → 0 после "
-                    "фильтров (повтор позже)",
-                    token=token,
-                )
+                # Soft lock: young tokens requeue after cooldown (not every cycle).
+                if before_filters > 0 and not buyers:
+                    self._append_log(
+                        "hold",
+                        f"{token[:10]}… parsed (cooldown) — {before_filters} early "
+                        "→ 0 после фильтров; повтор через "
+                        f"{int(REPARSE_YOUNG_COOLDOWN_SEC // 60)}м пока age ок",
+                        token=token,
+                    )
             found_total += len(buyers)
             self._last_tokens_parsed = parsed
             self._last_buyers_found = found_total
@@ -758,6 +803,135 @@ class WatchRunner:
         if tg_failed and sent_total == 0:
             return False
         return not interrupted
+
+    async def _probe_young_ath_peaks(
+        self,
+        screened: list,
+        *,
+        hold: dict[str, dict],
+        min_ath: float,
+        max_pair_age_hours: float | None,
+        probe_cap: int = 24,
+    ) -> tuple[list, dict[str, dict]]:
+        """Bump ATH for young tokens still below the gate using Gecko/DS peaks.
+
+        Persists peaks into ``hold`` so a post-pump dump does not erase qualify.
+        """
+        from .followup import estimate_token_peak_mcap
+        from .models import ScreenedToken
+
+        max_age = (
+            float(max_pair_age_hours)
+            if max_pair_age_hours is not None and max_pair_age_hours > 0
+            else 24.0
+        )
+        hold_out = {k: dict(v) for k, v in hold.items()}
+        # addr -> (current_peak, symbol, pair_age, screen_idx | None)
+        need: list[tuple[str, float, str, float | None, int | None]] = []
+        seen: set[str] = set()
+
+        for i, row in enumerate(screened):
+            if not isinstance(row, ScreenedToken):
+                continue
+            addr = row.address.lower()
+            peak = max(float(row.ath_mcap or 0.0), float(row.market_cap or 0.0))
+            hold_peak = float(hold_out.get(addr, {}).get("ath_mcap") or 0.0)
+            peak = max(peak, hold_peak)
+            age = row.pair_age_hours
+            if age is not None and float(age) > max_age:
+                continue
+            if peak >= min_ath:
+                continue
+            need.append((addr, peak, row.symbol or "", age, i))
+            seen.add(addr)
+
+        for addr, ent in hold_out.items():
+            if addr in seen:
+                continue
+            peak = float(ent.get("ath_mcap") or 0.0)
+            if peak >= min_ath:
+                continue
+            # Hold-only: treat as young enough to probe while still on the queue.
+            need.append((addr, peak, str(ent.get("symbol") or ""), None, None))
+
+        if not need:
+            return screened, hold_out
+
+        # Prefer lowest known peak (most likely to miss a real pump).
+        need.sort(key=lambda t: t[1])
+        need = need[: max(1, probe_cap)]
+        self._append_log(
+            "hold",
+            f"ATH-probe: {len(need)} молодых ток. ниже ${min_ath:,.0f}…",
+            percent=18,
+        )
+
+        updates: dict[str, tuple[float, str]] = {}
+        row_peaks: dict[int, float] = {}
+        sem = asyncio.Semaphore(3)
+
+        async def one(
+            addr: str, prev_peak: float, symbol: str, _age: float | None, idx: int | None
+        ) -> tuple[str, float, str, int | None] | None:
+            async with sem:
+                try:
+                    est = await estimate_token_peak_mcap(addr, min_needed=min_ath)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("young ATH probe %s: %s", addr[:10], exc)
+                    return None
+                if est is None or est.peak <= 0:
+                    return None
+                new_peak = max(prev_peak, float(est.peak))
+                if new_peak <= prev_peak:
+                    return None
+                return addr, new_peak, symbol, idx
+
+        results = await asyncio.gather(
+            *[one(a, p, s, age, i) for a, p, s, age, i in need]
+        )
+        for item in results:
+            if not item:
+                continue
+            addr, new_peak, symbol, idx = item
+            updates[addr] = (new_peak, symbol)
+            if idx is not None:
+                row_peaks[idx] = new_peak
+
+        for idx, new_peak in row_peaks.items():
+            if 0 <= idx < len(screened):
+                row = screened[idx]
+                if isinstance(row, ScreenedToken) and new_peak > float(
+                    row.ath_mcap or 0.0
+                ):
+                    screened[idx] = row.model_copy(update={"ath_mcap": new_peak})
+
+        if updates:
+            now = time.time()
+            for addr, (peak, sym) in updates.items():
+                ent = hold_out.get(addr) or {
+                    "first_seen": now,
+                    "ath_mcap": 0.0,
+                    "symbol": sym,
+                }
+                ent["ath_mcap"] = max(float(ent.get("ath_mcap") or 0.0), peak)
+                if sym and not ent.get("symbol"):
+                    ent["symbol"] = sym
+                hold_out[addr] = ent
+            # Persist immediately so a dump mid-cycle cannot wipe the peak.
+            self._store.apply_qualify_updates(
+                ath_updates=updates,
+                held=list(hold_out.keys()),
+                expired=[],
+                candidates=[],
+                now=now,
+            )
+            crossed = sum(1 for _a, (pk, _) in updates.items() if pk >= min_ath)
+            self._append_log(
+                "hold",
+                f"ATH-probe: обновлено {len(updates)}, ≥порога: {crossed}",
+                percent=19,
+            )
+        return screened, hold_out
 
     async def _catchup_refresh_hold(
         self,

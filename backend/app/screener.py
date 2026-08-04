@@ -87,8 +87,8 @@ async def _fetch_dex_pairs(
     client: httpx.AsyncClient, addresses: list[str]
 ) -> list[dict[str, Any]]:
     url = f"{DEXSCREENER_API}/tokens/v1/robinhood/{','.join(addresses)}"
-    delay = 0.2
-    for attempt in range(4):
+    delay = 1.0
+    for attempt in range(5):
         try:
             resp = await client.get(url, timeout=_DS_TIMEOUT)
             if resp.status_code == 200:
@@ -100,15 +100,27 @@ async def _fetch_dex_pairs(
                     return pairs if isinstance(pairs, list) else []
                 return []
             if resp.status_code in (429, 502, 503):
-                await asyncio.sleep(delay)
-                delay = min(delay * 2.5, 3.0)
+                ra = resp.headers.get("Retry-After")
+                try:
+                    ra_s = float(ra) if ra else 0.0
+                except (TypeError, ValueError):
+                    ra_s = 0.0
+                sleep_for = max(delay, min(ra_s, 60.0))
+                logger.warning(
+                    "DexScreener HTTP %s; backing off %.1fs (try %s)",
+                    resp.status_code,
+                    sleep_for,
+                    attempt + 1,
+                )
+                await asyncio.sleep(sleep_for)
+                delay = min(delay * 2, 30.0)
                 continue
             logger.warning("DexScreener tokens/v1 %s: %s", resp.status_code, resp.text[:200])
             return []
         except Exception as exc:  # noqa: BLE001
             logger.warning("DexScreener enrich error (try %s): %r", attempt + 1, exc)
             await asyncio.sleep(delay)
-            delay = min(delay * 2.5, 3.0)
+            delay = min(delay * 2, 30.0)
     return []
 
 

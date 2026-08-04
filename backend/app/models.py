@@ -249,7 +249,8 @@ class WatchWalletFilters(BaseModel):
 class WatchConfig(BaseModel):
     enabled: bool = False
     interval_sec: int = Field(default=900, ge=60, le=86400)
-    max_tokens_per_cycle: int = Field(default=20, ge=1, le=2000)
+    # Keep modest — qualify hits Blockscout/RPC; prefer thorough over fast.
+    max_tokens_per_cycle: int = Field(default=15, ge=1, le=2000)
     telegram_chat_id: str = ""
     # Forum topic id (Telegram message_thread_id). Empty → no topic / General.
     telegram_topic_id: str = ""
@@ -293,8 +294,9 @@ class FollowupConfig(BaseModel):
     """Watchlist of early buyers → alert on later new-token buys @ low mcap."""
 
     enabled: bool = False
-    # Target seconds between follow-up cycle starts (alerts for deals #2…#5).
-    interval_sec: int = Field(default=5, ge=5, le=86400)
+    # Target seconds between follow-up cycle *starts*. Prefer 5–15s so we
+    # do not stampede GMGN into RATE_LIMIT_BANNED; 0 = ASAP after finish.
+    interval_sec: int = Field(default=10, ge=0, le=86400)
     # Alert only when buy mcap is at or below this (USD). High mcap → record, no alert.
     max_mcap_alert: float = Field(default=20_000.0, ge=0)
     # Optional lower bound (USD). None = no floor.
@@ -318,9 +320,10 @@ class FollowupConfig(BaseModel):
     raybot_enabled: bool = False
     # When True, ingest early buyers from autoparse into the follow-up table.
     ingest_from_watch: bool = True
-    # Parallel wallet scans per cycle (Blockscout + RPC).
-    scan_concurrency: int = Field(default=16, ge=1, le=32)
-    # Max Blockscout pages per wallet (newest-first). With watermark usually 1–2.
+    # Parallel wallet scans per cycle. Keep low — shared GMGN ceiling +
+    # Blockscout ~2–3 rps; high concurrency re-triggers IP bans.
+    scan_concurrency: int = Field(default=3, ge=1, le=32)
+    # Max Blockscout pages per wallet (newest-first). GMGN path ignores this.
     scan_max_pages: int = Field(default=3, ge=1, le=20)
     # Drop wallet if discovery token never reached this ATH mcap (USD) in time.
     prune_enabled: bool = False
@@ -337,6 +340,7 @@ class FollowupDealRow(BaseModel):
     mcap_at_buy: float | None = None
     bought_usd: float | None = None
     tx_hash: str = ""
+    block_number: int = 0
     notified: bool = False
     created_at: float = 0.0
 

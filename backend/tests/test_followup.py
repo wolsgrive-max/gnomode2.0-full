@@ -11,6 +11,18 @@ from app.followup_store import FollowupStore
 from app.models import BuyerRow, FollowupConfig
 
 
+@pytest.fixture(autouse=True)
+def _disable_gmgn_for_legacy_scan_tests(monkeypatch):
+    """Blockscout scan tests explicitly exercise the GMGN-empty fallback."""
+    from app.gmgn_portfolio import UniqueBuysResult
+
+    async def empty_gmgn_buys(_wallet: str, **_kwargs):
+        return UniqueBuysResult(buys=[], ok=True, rate_limited=False)
+
+    monkeypatch.setattr("app.followup.fetch_unique_buys", empty_gmgn_buys)
+    monkeypatch.setattr("app.gmgn_portfolio.gmgn_api_configured", lambda: False)
+
+
 def test_should_alert_deal_low_mcap_only():
     assert should_alert_deal(2, 10_000, max_mcap_alert=15_000, alert_on_deals=[2, 3])
     assert should_alert_deal(3, 15_000, max_mcap_alert=15_000, alert_on_deals=[2, 3])
@@ -887,9 +899,10 @@ async def test_scan_wallet_records_buy_before_watermark_advance(tmp_path, monkey
     monkeypatch.setattr("app.buy_gate.transaction_sender", fake_sender)
 
     runner = FollowupRunner(store=store)
-    deals = await runner._scan_wallet(
+    deals, source = await runner._scan_wallet(
         wallet.lower(), FollowupConfig(buys_only=True, scan_max_pages=3)
     )
+    assert source == "blockscout"
     assert len(deals) == 1
     deal, hp = deals[0]
     assert deal.deal_index == 2
@@ -937,9 +950,465 @@ async def test_scan_wallet_does_not_advance_watermark_when_not_caught_up(
     monkeypatch.setattr("app.followup.scan_address_token_transfers", fake_scan)
 
     runner = FollowupRunner(store=store)
-    deals = await runner._scan_wallet(
+    deals, source = await runner._scan_wallet(
         wallet.lower(), FollowupConfig(buys_only=True, scan_max_pages=1)
     )
+    assert source == "blockscout"
     assert deals == []
     last_seen, _, _ = store.get_wallet_scan_meta(wallet.lower())
     assert last_seen == 1000  # must NOT jump to tip
+
+
+@pytest.mark.asyncio
+async def test_scan_wallet_uses_only_post_seed_gmgn_unique_buys(tmp_path, monkeypatch):
+    """Lifetime GMGN buys before the seed must never consume follow-up ranks."""
+    from app.followup import FollowupRunner
+    from app.gmgn_portfolio import GmgnBuy, UniqueBuysResult
+
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    wallet = "0xAAA0000000000000000000000000000000000001"
+    seed = "0xBBB0000000000000000000000000000000000001"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token=seed,
+                token_symbol="SEED",
+                bought_tokens=1.0,
+                bought_usd=100.0,
+                mcap_at_first_buy=8_000.0,
+                buys_count=1,
+                first_tx="0xseed",
+            )
+        ],
+        max_deals=3,
+    )
+    ancient = GmgnBuy("0xaaa", "OLD", "", 10)
+    seed_buy = GmgnBuy(seed.lower(), "SEED", "0xseed", 100)
+    second = GmgnBuy("0xccc", "SECOND", "", 110, cost_usd=20.0)
+    third = GmgnBuy("0xddd", "THIRD", "", 120, cost_usd=30.0)
+
+    async def gmgn_buys(_wallet: str, **_kwargs):
+        return UniqueBuysResult(
+            buys=[ancient, seed_buy, second, third],
+            ok=True,
+            rate_limited=False,
+        )
+
+    async def fake_quote(_token: str):
+        return 9_000.0, 0.01
+
+    async def fake_hp(_token: str):
+        return None
+
+    async def no_blockscout(*_args, **_kwargs):
+        raise AssertionError("GMGN post-seed sync should not use Blockscout")
+
+    monkeypatch.setattr("app.followup.fetch_unique_buys", gmgn_buys)
+    monkeypatch.setattr(
+        "app.gmgn_portfolio.gmgn_api_configured", lambda: True
+    )
+    monkeypatch.setattr("app.followup.estimate_token_quote", fake_quote)
+    monkeypatch.setattr("app.followup.scan_address_token_transfers", no_blockscout)
+    monkeypatch.setattr("app.security.honeypot_reason_for_token", fake_hp)
+
+    deals, source = await FollowupRunner(store=store)._scan_wallet(
+        wallet, FollowupConfig(max_deals=3)
+    )
+
+    assert source == "gmgn"
+    assert [(deal.token, deal.deal_index) for deal, _hp in deals] == [
+        ("0xccc", 2),
+        ("0xddd", 3),
+    ]
+    row = store.list_wallets()[0]
+    assert [(deal.token, deal.deal_index) for deal in row.deals] == [
+        (seed.lower(), 1),
+        ("0xccc", 2),
+        ("0xddd", 3),
+    ]
+    assert row.deal_count == 3
+    assert row.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_scan_wallet_gmgn_seed_only_skips_blockscout(tmp_path, monkeypatch):
+    """Paid GMGN found the seed but no new buys → no Blockscout flood."""
+    from app.followup import FollowupRunner
+    from app.gmgn_portfolio import GmgnBuy, UniqueBuysResult
+
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    wallet = "0xAAA0000000000000000000000000000000000002"
+    seed = "0xBBB0000000000000000000000000000000000002"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token=seed,
+                token_symbol="SEED",
+                bought_tokens=1.0,
+                bought_usd=100.0,
+                mcap_at_first_buy=8_000.0,
+                buys_count=1,
+                first_tx="0xseed",
+            )
+        ],
+        max_deals=3,
+    )
+
+    async def gmgn_buys(_wallet: str, **_kwargs):
+        return UniqueBuysResult(
+            buys=[GmgnBuy(seed.lower(), "SEED", "0xseed", 100)],
+            ok=True,
+            rate_limited=False,
+        )
+
+    async def no_blockscout(*_args, **_kwargs):
+        raise AssertionError("seed-only GMGN must not fall back to Blockscout")
+
+    monkeypatch.setattr("app.followup.fetch_unique_buys", gmgn_buys)
+    monkeypatch.setattr("app.gmgn_portfolio.gmgn_api_configured", lambda: True)
+    monkeypatch.setattr("app.followup.scan_address_token_transfers", no_blockscout)
+
+    deals, source = await FollowupRunner(store=store)._scan_wallet(
+        wallet, FollowupConfig(max_deals=3)
+    )
+    assert source == "gmgn"
+    assert deals == []
+    row = store.list_wallets()[0]
+    assert row.deal_count == 1
+    assert row.status == "watching"
+
+
+@pytest.mark.asyncio
+async def test_scan_wallet_gmgn_429_falls_back_to_blockscout(tmp_path, monkeypatch):
+    """Circuit/429 empty must not look like 'no new buys' — use Blockscout."""
+    from app.followup import FollowupRunner
+    from app.gmgn_portfolio import UniqueBuysResult
+
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    wallet = "0xAAA0000000000000000000000000000000000003"
+    seed = "0xBBB0000000000000000000000000000000000003"
+    buy_token = "0xccc0000000000000000000000000000000000003"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token=seed,
+                token_symbol="SEED",
+                bought_tokens=1.0,
+                bought_usd=100.0,
+                mcap_at_first_buy=8_000.0,
+                buys_count=1,
+                first_block=1000,
+                first_tx="0xseed",
+            )
+        ],
+        max_deals=3,
+    )
+    store.advance_last_seen_block(wallet, 1000)
+
+    async def rate_limited(_wallet: str, **_kwargs):
+        return UniqueBuysResult(buys=[], ok=False, rate_limited=True)
+
+    async def fake_scan(addr, *, max_pages=8, after_block=0, direction="to"):
+        return (
+            [
+                {
+                    "block_number": 1100,
+                    "to": {"hash": wallet.lower()},
+                    "from": {"hash": "0xdex", "is_contract": True},
+                    "token": {"address_hash": buy_token, "symbol": "NEW"},
+                    "transaction_hash": "0xbuy2",
+                }
+            ],
+            1100,
+            True,
+        )
+
+    async def fake_quote(_token: str):
+        return 9_000.0, 0.01
+
+    async def fake_hp(_token: str):
+        return None
+
+    async def fake_sender(tx: str) -> str | None:
+        return wallet.lower()
+
+    monkeypatch.setattr("app.followup.fetch_unique_buys", rate_limited)
+    monkeypatch.setattr("app.gmgn_portfolio.gmgn_api_configured", lambda: True)
+    monkeypatch.setattr("app.followup.scan_address_token_transfers", fake_scan)
+    monkeypatch.setattr("app.followup.estimate_token_quote", fake_quote)
+    monkeypatch.setattr("app.security.honeypot_reason_for_token", fake_hp)
+    monkeypatch.setattr("app.buy_gate.transaction_sender", fake_sender)
+
+    deals, source = await FollowupRunner(store=store)._scan_wallet(
+        wallet, FollowupConfig(buys_only=True, max_deals=3, scan_max_pages=2)
+    )
+    assert source == "blockscout_fallback"
+    assert len(deals) == 1
+    assert deals[0][0].token == buy_token
+    assert deals[0][0].deal_index == 2
+
+
+def test_apply_gmgn_buy_order_purges_stale_blockscout_duplicate_index(tmp_path):
+    """Blockscout dust at #2 must not collide with GMGN post-seed chronology."""
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    wallet = "0x989856685116f622d3ab906e7fe9d88c6e71b29d"
+    seed = "0x6e69f04e1db0bec227d08352cc2de1f48f22d1e3"
+    stale = "0x39040bb70e53ad07d26437e237c3b8f871fdf7a5"
+    pipe = "0x2a12328001fc8bdda45405b2ecb18a8cf4dda584"
+    feel = "0x5e57ad68ddd713d855ba7736bd85b6f1ff915515"
+    shih = "0x5f62e48fd77ff9de6f089f5bf4f342756c7d0019"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token=seed,
+                token_symbol="DREAM",
+                bought_tokens=1.0,
+                bought_usd=0.5,
+                mcap_at_first_buy=17_810.0,
+                buys_count=1,
+                first_tx="0xseed",
+            )
+        ],
+        max_deals=5,
+    )
+    # Simulate pre-GMGN Blockscout dust that stole deal #2.
+    assert store.record_deal(
+        wallet=wallet,
+        token=stale,
+        token_symbol="CASHCAT",
+        mcap_at_buy=560_486.0,
+        bought_usd=0.01,
+        tx_hash="0xstale",
+        block_number=0,
+        max_deals=5,
+    )
+    inserted = store.apply_gmgn_buy_order(
+        wallet,
+        [
+            {"token": pipe, "symbol": "PIPESHIF", "tx_hash": "0xpipe", "bought_usd": 1.97},
+            {"token": feel, "symbol": "FEEL", "tx_hash": "0xfeell", "bought_usd": 1.98},
+            {"token": shih, "symbol": "SHIH", "tx_hash": "0xshih", "bought_usd": 1.98},
+        ],
+        max_deals=5,
+    )
+    assert [(d.token_symbol, d.deal_index) for d in inserted] == [
+        ("PIPESHIF", 2),
+        ("FEEL", 3),
+        ("SHIH", 4),
+    ]
+    rows = store.list_deals_for_wallet(wallet)
+    assert [(r["token_symbol"], r["deal_index"]) for r in rows] == [
+        ("DREAM", 1),
+        ("PIPESHIF", 2),
+        ("FEEL", 3),
+        ("SHIH", 4),
+    ]
+    assert stale not in {r["token"] for r in rows}
+    indices = [int(r["deal_index"]) for r in rows]
+    assert len(indices) == len(set(indices))
+    w = next(x for x in store.list_wallets() if x.address == wallet.lower())
+    assert w.deal_count == 4
+    assert w.status == "watching"
+
+
+def test_record_deal_renumbers_by_block_not_insert_order(tmp_path):
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    wallet = "0xAAA0000000000000000000000000000000000001"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token="0xBBB0000000000000000000000000000000000001",
+                token_symbol="T1",
+                bought_tokens=1.0,
+                bought_usd=100.0,
+                mcap_at_first_buy=8_000.0,
+                buys_count=1,
+                first_block=1000,
+                first_tx="0xtx1",
+            )
+        ],
+        max_deals=5,
+        max_mcap_alert=50_000,
+    )
+    # Insert later token first (higher block), then earlier token (lower block).
+    d_late = store.record_deal(
+        wallet=wallet,
+        token="0xCCC0000000000000000000000000000000000003",
+        token_symbol="LATE",
+        mcap_at_buy=5_000.0,
+        tx_hash="0xlate",
+        block_number=3000,
+        max_deals=5,
+    )
+    d_early = store.record_deal(
+        wallet=wallet,
+        token="0xDDD0000000000000000000000000000000000002",
+        token_symbol="EARLY",
+        mcap_at_buy=4_000.0,
+        tx_hash="0xearly",
+        block_number=2000,
+        max_deals=5,
+    )
+    assert d_late is not None and d_early is not None
+    assert d_early.deal_index == 2
+    rows = store.list_wallets()
+    w = next(x for x in rows if x.address == wallet.lower())
+    by_sym = {d.token_symbol: d.deal_index for d in w.deals}
+    assert by_sym == {"T1": 1, "EARLY": 2, "LATE": 3}
+
+
+def test_delete_airdrop_deal_renumbers(tmp_path):
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    wallet = "0xAAA0000000000000000000000000000000000001"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token="0xBBB0000000000000000000000000000000000001",
+                token_symbol="T1",
+                bought_tokens=1.0,
+                bought_usd=100.0,
+                mcap_at_first_buy=8_000.0,
+                buys_count=1,
+                first_block=1000,
+                first_tx="0xtx1",
+            )
+        ],
+        max_deals=5,
+        max_mcap_alert=50_000,
+    )
+    store.record_deal(
+        wallet=wallet,
+        token="0xair0000000000000000000000000000000000002",
+        token_symbol="AIR",
+        mcap_at_buy=99_000.0,
+        block_number=1500,
+        max_deals=5,
+    )
+    store.record_deal(
+        wallet=wallet,
+        token="0xreal000000000000000000000000000000000003",
+        token_symbol="REAL",
+        mcap_at_buy=5_000.0,
+        block_number=2000,
+        max_deals=5,
+    )
+    assert store.delete_deal(wallet, "0xair0000000000000000000000000000000000002", max_deals=5)
+    w = next(x for x in store.list_wallets() if x.address == wallet.lower())
+    assert [(d.token_symbol, d.deal_index) for d in sorted(w.deals, key=lambda d: d.deal_index)] == [
+        ("T1", 1),
+        ("REAL", 2),
+    ]
+    assert w.deal_count == 2
+    assert w.status == "watching"
+
+
+@pytest.mark.asyncio
+async def test_scan_watermark_stops_at_last_recorded_when_max_deals(
+    tmp_path, monkeypatch
+):
+    """Leftover candidates must not be skipped by jumping watermark to tip."""
+    from app.followup import FollowupRunner
+    from app.models import BuyerRow, FollowupConfig
+
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    wallet = "0xAAA0000000000000000000000000000000000001"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token="0xBBB0000000000000000000000000000000000001",
+                token_symbol="T1",
+                bought_tokens=1.0,
+                bought_usd=100.0,
+                mcap_at_first_buy=8_000.0,
+                buys_count=1,
+                first_block=1000,
+                first_tx="0xtx1",
+            )
+        ],
+        max_deals=2,  # only one slot left
+        max_mcap_alert=50_000,
+    )
+    store.advance_last_seen_block(wallet, 1000)
+
+    async def fake_scan(addr, *, max_pages=8, after_block=0, direction="to"):
+        return (
+            [
+                {
+                    "block_number": 1100,
+                    "to": {"hash": wallet.lower()},
+                    "from": {"hash": "0xdex", "is_contract": True},
+                    "token": {
+                        "address_hash": "0xccc0000000000000000000000000000000000002",
+                        "symbol": "A",
+                    },
+                    "transaction_hash": "0xa",
+                },
+                {
+                    "block_number": 1200,
+                    "to": {"hash": wallet.lower()},
+                    "from": {"hash": "0xdex", "is_contract": True},
+                    "token": {
+                        "address_hash": "0xddd0000000000000000000000000000000000003",
+                        "symbol": "B",
+                    },
+                    "transaction_hash": "0xb",
+                },
+            ],
+            1500,  # tip beyond both buys
+            True,
+        )
+
+    async def fake_quote(_token: str):
+        return 5_000.0, 0.01
+
+    async def fake_hp(_token: str):
+        return None
+
+    async def fake_sender(tx: str) -> str | None:
+        return wallet.lower()
+
+    monkeypatch.setattr("app.followup.scan_address_token_transfers", fake_scan)
+    monkeypatch.setattr("app.followup.estimate_token_quote", fake_quote)
+    monkeypatch.setattr("app.security.honeypot_reason_for_token", fake_hp)
+    monkeypatch.setattr("app.buy_gate.transaction_sender", fake_sender)
+
+    runner = FollowupRunner(store=store)
+    deals, source = await runner._scan_wallet(
+        wallet.lower(),
+        FollowupConfig(buys_only=True, max_deals=2, scan_max_pages=3),
+    )
+    assert source == "blockscout"
+    assert len(deals) == 1
+    assert deals[0][0].deal_index == 2
+    last_seen, count, status = store.get_wallet_scan_meta(wallet.lower())
+    assert count == 2 and status == "done"
+    # Must NOT jump to tip 1500 — leftover buy @1200 would be lost forever.
+    assert last_seen == 1100

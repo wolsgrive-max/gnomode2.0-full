@@ -309,6 +309,19 @@ async def get_followup_wallets(
     )
 
 
+@app.get("/api/followup/verify/{address}")
+async def verify_followup_wallet_vs_gmgn(address: str):
+    """Compare follow-up deals to GMGN's unique order after the seed buy."""
+    from .gmgn_portfolio import compare_followup_to_gmgn
+
+    addr = address.strip().lower()
+    deals = followup_store.list_deals_for_wallet(addr)
+    try:
+        return await compare_followup_to_gmgn(addr, deals)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"GMGN verify failed: {exc}") from exc
+
+
 @app.put("/api/followup/wallets/filters")
 async def put_followup_wallet_filters(payload: FollowupWalletFiltersUpdate):
     """Apply (or clear) per-wallet #2/#3 alert filters to one or many wallets."""

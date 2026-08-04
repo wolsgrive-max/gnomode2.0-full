@@ -86,14 +86,32 @@ def test_hold_upsert_promote_and_mark_parsed(tmp_path):
     assert store.hold_count() == 1
     assert store.load_hold()["0xabc"]["ath_mcap"] == 55_000.0
 
-    store.mark_token_parsed("0xAbC")
+    store.mark_token_parsed("0xAbC", at=123.0)
     assert store.is_token_parsed("0xabc") is True
     assert store.hold_count() == 0
     assert store.parsed_token_count() == 1
+    assert store.load_parsed_at()["0xabc"] == 123.0
 
     store2 = _store(tmp_path)
     assert store2.is_token_parsed("0xabc") is True
+    assert store2.load_parsed_at()["0xabc"] == 123.0
     assert store2.hold_count() == 0
+
+    assert store2.unparse_tokens(["0xAbC"]) == 1
+    assert store2.is_token_parsed("0xabc") is False
+
+
+def test_legacy_parsed_list_loads_with_zero_ts(tmp_path):
+    import json
+
+    hold_path = tmp_path / "hold.json"
+    hold_path.write_text(
+        json.dumps({"hold": {}, "parsed": ["0xLegacyToken"]}),
+        encoding="utf-8",
+    )
+    store = _store(tmp_path)
+    assert store.is_token_parsed("0xlegacytoken")
+    assert store.load_parsed_at()["0xlegacytoken"] == 0.0
 
 
 def test_hold_expired_removed(tmp_path):

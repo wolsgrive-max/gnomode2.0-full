@@ -12,6 +12,11 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from .blockscout import fetch_token_info, iter_token_transfers
+from .buy_gate import (
+    method_is_creator_launch,
+    method_is_launch_buy,
+    transaction_sender,
+)
 from .chain import RpcClient, decode_int256, decode_uint256, topic_address
 from .config import settings
 from .constants import (
@@ -731,6 +736,36 @@ async def parse_token(
             on_progress=prog,
         )
 
+    # Launch-pad first bags (Pons ``launchToken``, …) never appear as Uniswap
+    # Swap events — GMGN still labels them «Покупка». Merge under the same
+    # mcap gate. Creator pad ``launch`` (create + firstBuy) is excluded — GMGN
+    # does not treat those as buys.
+    try:
+        await prog("launch", "Scanning launch-pad acquisitions…", 0.82)
+        launch_buyers = await _discover_launch_buyers(
+            rpc,
+            token=token,
+            pool=pool,
+            decimals=decimals,
+            supply_tokens=supply_tokens,
+            eth_usd=eth_usd,
+            mcap_threshold=mcap_threshold,
+            start_block=start_block,
+            end_block=latest,
+            on_progress=prog,
+        )
+        if launch_buyers:
+            before = len(buyers)
+            buyers = _merge_buyer_rows(buyers, launch_buyers)
+            await prog(
+                "launch",
+                f"Launch buyers +{len(buyers) - before} "
+                f"(total early {len(buyers)}; launch raw {len(launch_buyers)})",
+                0.84,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Launch-buyer scan failed for %s: %s", token[:10], exc)
+
     for b in buyers:
         b.token_symbol = result.symbol
 
@@ -956,6 +991,16 @@ async def _replay_v2(
 
     # Optional early stop note
     _ = early_stop_block
+    if aggs:
+        skip = await _creator_launch_tx_hashes(
+            rpc, [a.first_tx for a in aggs.values() if a.first_tx]
+        )
+        if skip:
+            aggs = {
+                k: v
+                for k, v in aggs.items()
+                if (v.first_tx or "").lower() not in skip
+            }
     return _aggs_to_rows(aggs, token, "")
 
 
@@ -963,6 +1008,35 @@ async def _gather_three(a, b, c):
     import asyncio
 
     return await asyncio.gather(a, b, c)
+
+
+async def _creator_launch_tx_hashes(
+    rpc: RpcClient, tx_hashes: list[str]
+) -> set[str]:
+    """Return hashes whose outer call is pad ``launch`` (create, not a buy)."""
+    out: set[str] = set()
+    uniq = [h for h in dict.fromkeys(str(x).lower() for x in tx_hashes if x)]
+    if not uniq:
+        return out
+    calls = [("eth_getTransactionByHash", [h]) for h in uniq]
+    try:
+        raws = await rpc._jsonrpc_batch(calls)
+    except Exception:  # noqa: BLE001
+        return out
+    for h, raw in zip(uniq, raws, strict=False):
+        if not isinstance(raw, dict):
+            continue
+        inp = raw.get("input") or "0x"
+        if isinstance(inp, (bytes, bytearray)):
+            sel = "0x" + bytes(inp[:4]).hex()
+        else:
+            s = str(inp).lower()
+            if not s.startswith("0x"):
+                s = "0x" + s
+            sel = s[:10] if len(s) >= 10 else s
+        if method_is_creator_launch(sel):
+            out.add(h)
+    return out
 
 
 async def _resolve_buyers_batch(
@@ -1086,6 +1160,12 @@ async def _resolve_buyers_batch(
             for h, frm in parsed:
                 if code_cache.get(frm.lower(), False) and not is_excluded(frm, pool_or_manager):
                     results[h] = (frm, 0)
+
+    # Creator pad ``launch`` embeds a Swap for firstBuy — exclude (not GMGN buy).
+    if results:
+        skip = await _creator_launch_tx_hashes(rpc, list(results.keys()))
+        for txh in skip:
+            results.pop(txh, None)
 
     return results
 
@@ -1502,6 +1582,373 @@ async def _gather_two(a, b):
     import asyncio
 
     return await asyncio.gather(a, b)
+
+
+def _transfer_addr(node: object) -> str:
+    if isinstance(node, dict):
+        return str(node.get("hash") or node.get("address_hash") or "")
+    return str(node or "")
+
+
+def _log_amount_raw(data: object) -> int:
+    """Decode ERC-20 Transfer ``data`` (HexBytes / hex str / int) to wei amount."""
+    if data is None:
+        return 0
+    if isinstance(data, int):
+        return data
+    if isinstance(data, (bytes, bytearray)):
+        return int.from_bytes(data, "big")
+    s = str(data).strip()
+    if not s:
+        return 0
+    if s.startswith(("0x", "0X")):
+        return int(s, 16) if len(s) > 2 else 0
+    try:
+        return int(s, 16)
+    except ValueError:
+        return int(s)
+
+
+def _log_tx_hash(raw: object) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, (bytes, bytearray)):
+        return "0x" + raw.hex()
+    s = str(raw).strip()
+    if s.startswith("0x"):
+        return s
+    # HexBytes str sometimes omits 0x
+    if len(s) == 64:
+        return "0x" + s
+    return s
+
+
+def _merge_buyer_rows(
+    primary: list[BuyerRow], extra: list[BuyerRow]
+) -> list[BuyerRow]:
+    """Merge early-buyer lists; keep the earlier first-buy (lower block)."""
+    by_wallet: dict[str, BuyerRow] = {b.wallet.lower(): b for b in primary}
+    for row in extra:
+        key = row.wallet.lower()
+        prev = by_wallet.get(key)
+        if prev is None:
+            by_wallet[key] = row
+            continue
+        # Prefer the chronologically first acquisition as deal#1 entry.
+        if row.first_block and (
+            not prev.first_block or row.first_block < prev.first_block
+        ):
+            merged = row.model_copy(
+                update={
+                    "bought_tokens": round(prev.bought_tokens + row.bought_tokens, 6),
+                    "bought_usd": round(prev.bought_usd + row.bought_usd, 4),
+                    "buys_count": prev.buys_count + row.buys_count,
+                }
+            )
+            by_wallet[key] = merged
+        else:
+            by_wallet[key] = prev.model_copy(
+                update={
+                    "bought_tokens": round(prev.bought_tokens + row.bought_tokens, 6),
+                    "bought_usd": round(prev.bought_usd + row.bought_usd, 4),
+                    "buys_count": prev.buys_count + row.buys_count,
+                }
+            )
+    rows = list(by_wallet.values())
+    rows.sort(key=lambda r: (r.mcap_at_first_buy, -r.bought_usd))
+    return rows
+
+
+async def _tx_native_value_wei(
+    tx_hash: str, *, rpc: RpcClient | None = None
+) -> int | None:
+    """Native ETH value of the outer tx (wei). Prefer RPC, else Blockscout."""
+    key = str(tx_hash or "").strip().lower()
+    if not key.startswith("0x"):
+        return None
+    if rpc is not None:
+        try:
+            tx = await rpc._call(lambda: rpc.w3.eth.get_transaction(key))
+            return int(tx.get("value") or 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("tx value rpc %s: %s", key[:12], exc)
+    from .blockscout import _get_json
+
+    got = await _get_json(f"/transactions/{key}")
+    if not got or got[0] != 200 or not isinstance(got[1], dict):
+        return None
+    try:
+        return int(got[1].get("value") or 0)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _discover_launch_buyers(
+    rpc: RpcClient,
+    *,
+    token: str,
+    pool: PoolInfo,
+    decimals: int,
+    supply_tokens: float,
+    eth_usd: float,
+    mcap_threshold: float,
+    on_progress: ProgressCb,
+    start_block: int | None = None,
+    end_block: int | None = None,
+) -> list[BuyerRow]:
+    """Collect launch-pad first acquisitions under the early-buyer mcap gate.
+
+    Pons ``launchToken`` credits the launcher from the pad contract (not the
+    Uniswap pool), so Swap replay never sees them. Prefer on-chain Transfer
+    logs around pool birth (Blockscout token-transfer pagination often 500s
+    before reaching the genesis launch row, and methods arrive as hex).
+    """
+    pool_addr = pool.address
+    candidates: list[tuple[str, str, int, int]] = []  # wallet, tx, amount_raw, block
+    seen_wallet: set[str] = set()
+
+    def _add(wallet: str, tx: str, amount_raw: int, block: int) -> None:
+        key = wallet.lower()
+        if key in seen_wallet or amount_raw <= 0:
+            return
+        if is_excluded(wallet, pool_addr):
+            return
+        seen_wallet.add(key)
+        candidates.append((wallet, tx, amount_raw, block))
+
+    # --- 1) RPC Transfer logs near pool creation (covers launch before swap) ---
+    tip = end_block
+    if tip is None:
+        try:
+            tip = await rpc.block_number()
+        except Exception:  # noqa: BLE001
+            tip = None
+    base = start_block
+    if base is None:
+        try:
+            base = await estimate_start_block(rpc, pool)
+        except Exception:  # noqa: BLE001
+            base = None
+    if tip and base:
+        # Launch is almost always within a few thousand blocks of pool birth —
+        # keep the window tight so get_logs stays cheap.
+        from_b = max(1, int(base) - 12_000)
+        to_b = min(int(tip), int(base) + 3_000)
+        await on_progress(
+            "launch",
+            f"Launch RPC logs {from_b}→{to_b}…",
+            0.825,
+        )
+        try:
+            logs = await rpc.get_logs_chunked(
+                address=token,
+                topics=[TRANSFER_TOPIC],
+                from_block=from_b,
+                to_block=to_b,
+                chunk_size=max(settings.log_chunk_size, 5_000),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Launch RPC logs failed: %s", exc)
+            logs = []
+        # Chronological: launch bags are among the first transfers.
+        logs = sorted(
+            logs,
+            key=lambda lg: (
+                int(lg.get("blockNumber") or 0),
+                int(lg.get("logIndex") or 0),
+            ),
+        )
+        # Cap inspection — genesis launch is early; avoid get_transaction on
+        # every later swap when pick_best_pool pointed at the pad.
+        for lg in logs[:400]:
+            try:
+                topics = lg.get("topics") or []
+                if len(topics) < 3:
+                    continue
+                to_addr = topic_address(topics[2])
+                if not to_addr or is_excluded(to_addr, pool_addr):
+                    continue
+                data = lg.get("data") or "0x"
+                amount_raw = _log_amount_raw(data)
+                if amount_raw <= 0:
+                    continue
+                # Skip tiny dust; launch bags are a real share of supply.
+                if supply_tokens > 0:
+                    frac = (amount_raw / (10**decimals)) / supply_tokens
+                    if frac < 0.001:
+                        continue
+                tx = _log_tx_hash(
+                    lg.get("transactionHash") or lg.get("transaction_hash")
+                )
+                block = int(lg.get("blockNumber") or 0)
+                if not tx:
+                    continue
+                # Do NOT skip from==pool: pick_best_pool sometimes returns the
+                # Pons pad address as the "pool". _tx_is_launch_buy filters swaps.
+                if not await _tx_is_launch_buy(
+                    tx, expected_wallet=to_addr, rpc=rpc
+                ):
+                    continue
+                _add(to_addr, tx, amount_raw, block)
+                if len(candidates) >= 40:
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+    # --- 2) Blockscout supplement only when RPC found nothing ---
+    if not candidates:
+        await on_progress("launch", "Launch Blockscout supplement…", 0.83)
+        transfers: list[dict[str, Any]] = []
+        async for item in iter_token_transfers(token):
+            transfers.append(item)
+            if len(transfers) >= 4000:
+                break
+        transfers.reverse()
+        for item in transfers:
+            method = item.get("method")
+            if not method_is_launch_buy(method):
+                continue
+            to_addr = _transfer_addr(item.get("to"))
+            if not to_addr:
+                continue
+            total = item.get("total") or {}
+            value = total.get("value") if isinstance(total, dict) else item.get("value")
+            try:
+                amount_raw = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+            tx = str(item.get("transaction_hash") or item.get("tx_hash") or "")
+            try:
+                block = int(item.get("block_number") or 0)
+            except (TypeError, ValueError):
+                block = 0
+            if not tx:
+                continue
+            sender = await transaction_sender(tx)
+            if sender and sender != to_addr.lower():
+                continue
+            # Bare ``launch`` create — not a market buy (GMGN has no buy).
+            if method_is_creator_launch(method):
+                continue
+            _add(to_addr, tx, amount_raw, block)
+            if len(candidates) >= 40:
+                break
+
+    if not candidates:
+        await on_progress("launch", "No launch-pad buyers found", 0.84)
+        return []
+
+    await on_progress(
+        "launch",
+        f"Launch candidates: {len(candidates)}",
+        0.84,
+    )
+
+    aggs: dict[str, WalletAgg] = {}
+    eth = eth_usd if eth_usd > 0 else 2000.0
+    for to_addr, tx, amount_raw, block in candidates:
+        amount_tokens = amount_raw / (10**decimals) if decimals >= 0 else 0.0
+        wei = await _tx_native_value_wei(tx, rpc=rpc)
+        paid_eth = (wei / 1e18) if wei and wei > 0 else 0.0
+        amount_usd = paid_eth * eth if paid_eth >= 0.01 else 0.0
+
+        buy_mcap: float | None = None
+        # Prefer FDV from paid ETH first — estimate_mcap_at_tx hits Blockscout
+        # and often 500s on launch txs before the pool has real reserves.
+        if amount_tokens > 0 and supply_tokens > 0 and amount_usd > 0:
+            frac = amount_tokens / supply_tokens
+            if frac > 0:
+                buy_mcap = amount_usd / frac
+        if buy_mcap is None or buy_mcap <= 0:
+            if tx:
+                try:
+                    buy_mcap = await estimate_mcap_at_tx(token, tx, rpc=rpc)
+                except Exception:  # noqa: BLE001
+                    buy_mcap = None
+        if buy_mcap is None or buy_mcap <= 0:
+            continue
+        if buy_mcap >= mcap_threshold:
+            continue
+        bought_usd = amount_usd
+        if bought_usd <= 0 and supply_tokens > 0:
+            bought_usd = buy_mcap * (amount_tokens / supply_tokens)
+        _record_buy(
+            aggs,
+            wallet=to_addr,
+            amount_tokens=amount_tokens,
+            amount_usd=bought_usd,
+            mcap=buy_mcap,
+            tx=tx,
+            block=block,
+        )
+
+    return _aggs_to_rows(aggs, token, "")
+
+
+async def _tx_is_launch_buy(
+    tx_hash: str,
+    *,
+    expected_wallet: str,
+    rpc: RpcClient | None = None,
+) -> bool:
+    """True when outer tx is a wallet-initiated launch-pad buy."""
+    key = str(tx_hash or "").strip().lower()
+    wallet_l = expected_wallet.lower()
+    if not key.startswith("0x"):
+        return False
+
+    # Prefer RPC — avoids Blockscout 500s and is correct even when the "pool"
+    # address is actually a launch pad.
+    if rpc is not None:
+        try:
+            tx = await rpc._call(lambda: rpc.w3.eth.get_transaction(key))
+            sender = str(tx.get("from") or "").lower()
+            if sender and sender != wallet_l:
+                return False
+            raw = tx.get("input") or b""
+            if isinstance(raw, (bytes, bytearray)):
+                hex_in = "0x" + raw.hex()
+            else:
+                hex_in = str(raw).lower()
+                if not hex_in.startswith("0x"):
+                    hex_in = "0x" + hex_in
+            if len(hex_in) >= 10 and method_is_launch_buy(hex_in[:10]):
+                return True
+            return False
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("launch tx rpc lookup %s: %s", key[:12], exc)
+
+    from .blockscout import _get_json
+
+    got = await _get_json(f"/transactions/{key}")
+    if not got or got[0] != 200 or not isinstance(got[1], dict):
+        sender = await transaction_sender(key)
+        return sender == wallet_l
+    data = got[1]
+    sender = ""
+    frm = data.get("from")
+    if isinstance(frm, dict):
+        sender = str(frm.get("hash") or "").lower()
+    else:
+        sender = str(frm or "").lower()
+    if sender and sender != wallet_l:
+        return False
+    method = data.get("method")
+    if method_is_launch_buy(method):
+        return True
+    raw = str(data.get("raw_input") or data.get("input") or "").lower()
+    if raw.startswith("0x") and len(raw) >= 10 and method_is_launch_buy(raw[:10]):
+        return True
+    decoded = data.get("decoded_input") or {}
+    if isinstance(decoded, dict):
+        if method_is_launch_buy(
+            decoded.get("method_call") or decoded.get("method_id")
+        ):
+            return True
+        mid = str(decoded.get("method_id") or "")
+        if mid and method_is_launch_buy(mid if mid.startswith("0x") else f"0x{mid}"):
+            return True
+    return False
 
 
 async def _fallback_blockscout(

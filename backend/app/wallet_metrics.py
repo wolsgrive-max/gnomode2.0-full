@@ -25,9 +25,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
-from .blockscout import blockscout_api_base, blockscout_headers
+from .blockscout import _get_json, blockscout_api_base
 from .buy_gate import is_wallet_initiated_buy
-from .chain import RpcClient, checksum, http_client, topic_address
+from .chain import RpcClient, checksum, topic_address
 from .config import settings
 from .constants import BLOCKS_PER_SECOND, QUOTE_TOKENS, TRANSFER_TOPIC
 from .models import BuyerRow, ParseRequest
@@ -36,8 +36,6 @@ logger = logging.getLogger(__name__)
 
 ProgressCb = Callable[[str, str, float], Awaitable[None]]
 
-_BLOCKSCOUT_CONCURRENCY = 4
-_BS_MIN_INTERVAL = 0.12  # ~8 req/s shared across the process
 _MAX_TRANSFER_PAGES = 12
 _BALANCE_CHUNK_PARALLEL = 2
 _MAX_METRIC_ATTEMPTS = 8
@@ -54,10 +52,6 @@ _hold_cache: dict[tuple[str, str], tuple[int, int | None, float]] = {}
 
 _CACHE_MAX = 50_000
 _CACHE_PRUNE_AGE = 3600.0
-
-_bs_sem = asyncio.Semaphore(_BLOCKSCOUT_CONCURRENCY)
-_bs_pace_lock = asyncio.Lock()
-_bs_next_ok = 0.0
 
 
 def _prune_cache(cache: dict, now: float) -> None:
@@ -323,60 +317,34 @@ def _parse_ts(raw: object) -> datetime | None:
         return None
 
 
-async def _bs_get(url: str, params: dict[str, object]):
-    """Paced Blockscout GET with 429/5xx retries; Pro 402 → public fallback."""
-    from .blockscout import (
-        blockscout_auth_params,
-        blockscout_headers,
-        disable_blockscout_pro,
-        _public_base,
-        _use_pro,
-    )
+class _BsResp:
+    """Minimal response stand-in for callers that expect ``.status_code`` / ``.json()``."""
 
-    global _bs_next_ok
-    resp = None
-    delay = 0.5
-    # Merge Pro apikey query when applicable.
-    req_params: dict[str, object] = {**blockscout_auth_params(), **params}
-    for attempt in range(_MAX_METRIC_ATTEMPTS):
-        async with _bs_sem:
-            async with _bs_pace_lock:
-                now = time.time()
-                wait = _bs_next_ok - now
-                if wait > 0:
-                    await asyncio.sleep(wait)
-                _bs_next_ok = time.time() + _BS_MIN_INTERVAL
-            try:
-                resp = await http_client().get(
-                    url, params=req_params, headers=blockscout_headers()
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Blockscout GET error attempt %s: %s", attempt + 1, exc)
-                await asyncio.sleep(delay)
-                delay = min(delay * 1.6, 12.0)
-                continue
-        if resp.status_code in (401, 402, 403) and _use_pro():
-            disable_blockscout_pro(f"HTTP {resp.status_code}")
-            # Rewrite Pro URL → public explorer and retry without burning attempts.
-            if "api.blockscout.com" in url:
-                # …/4663/api/v2/... → robinhoodchain.blockscout.com/api/v2/...
-                marker = "/api/v2"
-                idx = url.find(marker)
-                if idx >= 0:
-                    url = _public_base() + url[idx + len(marker) :]
-            req_params = dict(params)  # drop apikey
-            continue
-        if resp.status_code in (429, 502, 503):
-            ra = resp.headers.get("Retry-After")
-            try:
-                sleep_for = min(float(ra), 20.0) if ra else delay
-            except ValueError:
-                sleep_for = delay
-            await asyncio.sleep(sleep_for)
-            delay = min(delay * 1.6, 12.0)
-            continue
-        break
-    return resp
+    __slots__ = ("status_code", "_data")
+
+    def __init__(self, status_code: int, data: object) -> None:
+        self.status_code = status_code
+        self._data = data
+
+    def json(self) -> object:
+        return self._data
+
+
+async def _bs_get(url: str, params: dict[str, object]):
+    """Blockscout GET via shared process-wide pace (see ``blockscout._get_json``)."""
+    base = blockscout_api_base()
+    if url.startswith(base):
+        path = url[len(base) :]
+    else:
+        marker = "/api/v2"
+        idx = url.find(marker)
+        path = url[idx + len(marker) :] if idx >= 0 else url
+    if not path.startswith("/"):
+        path = f"/{path}"
+    got = await _get_json(path, params=dict(params))
+    if got is None:
+        return None
+    return _BsResp(got[0], got[1])
 
 
 def _addr_hash(node: object) -> str:

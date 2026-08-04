@@ -34,6 +34,34 @@ _NON_BUY_METHODS = frozenset(
     }
 )
 
+# Launch-pad first acquisition (Pons ``launchToken``, etc.). GMGN labels these
+# as «Покупка»; product intent is the same as an early DEX buy @ low mcap.
+# Do NOT include bare ``launch`` — that is token create + creator firstBuy
+# (selector 0x75154d70); GMGN does not list it as a buy (Хвать false positive).
+_LAUNCH_BUY_METHODS = frozenset(
+    {
+        "launchtoken",
+        "createlaunch",
+        "createandlaunch",
+        "launchandbuy",
+        "buylaunch",
+    }
+)
+# 4-byte selectors seen on Robinhood launch pads (Blockscout often returns hex).
+_LAUNCH_BUY_SELECTORS = frozenset(
+    {
+        "0x686399cb",  # Pons launchToken((…),uint256,uint256,bytes32)
+    }
+)
+# Creator pad ``launch(params, configId, firstBuyIn, …)`` — create, not a buy.
+_CREATOR_LAUNCH_METHODS = frozenset({"launch"})
+_CREATOR_LAUNCH_SELECTORS = frozenset(
+    {
+        "0x75154d70",  # GUH-style launch((…),uint256,uint256,uint256,bytes32)
+        "0xbf388406",  # MemeLaunchV2 launch((string,string,…)); MemeCreatorInitialBuyV2
+    }
+)
+
 _SWAP_LIKE_METHODS = frozenset(
     {
         "execute",
@@ -46,6 +74,7 @@ _SWAP_LIKE_METHODS = frozenset(
         "swapexacttokensfortokens",
         "swapexactethfortokens",
         "swaptokensforexacttokens",
+        *_LAUNCH_BUY_METHODS,
     }
 )
 
@@ -69,14 +98,71 @@ def _is_contract(node: object) -> bool:
     return isinstance(node, dict) and bool(node.get("is_contract"))
 
 
+def _method_norm(method: object) -> str:
+    return str(method or "").strip().lower()
+
+
+def _selector4(method: str) -> str | None:
+    m = method.strip().lower()
+    if m.startswith("0x") and len(m) >= 10:
+        return m[:10]
+    if len(m) == 8 and all(c in "0123456789abcdef" for c in m):
+        return f"0x{m}"
+    return None
+
+
+def method_is_creator_launch(method: object) -> bool:
+    """True for token-create ``launch`` (creator bag / embedded firstBuy).
+
+    Example: GUH ``0xbead62e9…`` — wallet is TokenLaunched.creator; GMGN has
+    no buy activity for that wallet.
+    """
+    m = _method_norm(method)
+    if not m:
+        return False
+    if m in _CREATOR_LAUNCH_METHODS or m in _CREATOR_LAUNCH_SELECTORS:
+        return True
+    sel = _selector4(m)
+    return sel is not None and sel in _CREATOR_LAUNCH_SELECTORS
+
+
 def method_is_non_buy(method: object) -> bool:
     """True for disperse/airdrop/plain transfer — not a DEX swap."""
-    m = str(method or "").strip().lower()
+    m = _method_norm(method)
     if not m:
+        return False
+    # Creator create+launch is not a market buy (and not GMGN «Покупка»).
+    if method_is_creator_launch(m):
+        return True
+    # Launch buys must never be treated as airdrops / mint noise.
+    if method_is_launch_buy(m):
         return False
     if m.startswith("disperse") or m.startswith("airdrop") or m.startswith("distribute"):
         return True
     return m in {x.lower() for x in _NON_BUY_METHODS}
+
+
+def method_is_launch_buy(method: object) -> bool:
+    """True for launch-pad first acquisition (e.g. Pons ``launchToken``)."""
+    m = _method_norm(method)
+    if not m:
+        return False
+    # Bare ``launch`` / creator selector — create, not a sniper buy.
+    if method_is_creator_launch(m):
+        return False
+    if m in _LAUNCH_BUY_METHODS or m in _LAUNCH_BUY_SELECTORS:
+        return True
+    sel = _selector4(m)
+    if sel is not None and sel in _LAUNCH_BUY_SELECTORS:
+        return True
+    # ``launchToken``, ``launchAndBuy``, … — not bare ``launch`` / ``launcher``.
+    if m.startswith("launch") and m != "launch" and "claim" not in m:
+        # Avoid ``launcher`` / ``launchpad`` noise: require buy-ish suffix or
+        # a known compound already listed above.
+        if m in _LAUNCH_BUY_METHODS:
+            return True
+        return "token" in m or "buy" in m or m.startswith("launchand")
+    return False
 
 
 def _method_looks_like_swap(method: object) -> bool:
@@ -85,6 +171,8 @@ def _method_looks_like_swap(method: object) -> bool:
         return False
     if m.startswith("0x"):
         return True  # selector — often router/pool swap
+    if method_is_launch_buy(m):
+        return True
     if m in _SWAP_LIKE_METHODS:
         return True
     return any(k in m for k in ("swap", "exactinput", "exactoutput", "execute"))
@@ -212,7 +300,13 @@ async def is_wallet_initiated_buy(item: dict[str, Any], wallet: str) -> bool:
         # in the same tx (smart-wallet / router-on-behalf patterns).
         spent = await wallet_sent_quote_in_tx(wallet_l, tx)
         return spent is True
-    # Blockscout could not resolve sender: optimistic keep when it looks like a pool swap.
+    # Blockscout could not resolve sender: optimistic keep when it looks like a
+    # pool swap or a launch-pad allocation (GMGN «Покупка»).
+    if method_is_launch_buy(item.get("method")):
+        logger.debug(
+            "buy-gate: sender unknown, accepting launch-buy transfer %s", tx[:14]
+        )
+        return True
     if _from_looks_like_pool(item.get("from")) and _method_looks_like_swap(
         item.get("method")
     ):
