@@ -15,9 +15,11 @@ def test_watch_config_defaults():
     assert cfg.max_tokens_per_cycle == 15
     assert cfg.screen.exclude_honeypots is True
     assert cfg.screen.min_liq == 500.0
-    assert cfg.screen.min_ath_mcap == 50_000.0
+    assert cfg.screen.min_ath_mcap == 40_000.0
     assert cfg.screen.max_pair_age_hours == 24.0
-    assert cfg.screen.max_results == 200
+    assert cfg.screen.max_results == 10_000
+    assert cfg.screen.sort_by.value == "liquidity"
+    assert cfg.screen.sort_order.value == "desc"
 
 
 def test_watch_config_interval_bounds():

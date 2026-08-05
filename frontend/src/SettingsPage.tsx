@@ -87,14 +87,14 @@ const DEFAULT_SCREEN: ScreenFiltersForm = {
   max_liq: '',
   min_mcap: '',
   max_mcap: '',
-  min_ath_mcap: '50000',
+  min_ath_mcap: '40000',
   min_traders: '',
   max_traders: '',
   min_pair_age_hours: '',
   max_pair_age_hours: '24',
   sort_by: 'liquidity',
   sort_order: 'desc',
-  max_results: '200',
+  max_results: '10000',
   exclude_honeypots: true,
 }
 
@@ -162,14 +162,14 @@ export default function SettingsPage() {
         max_liq: numToStr(cfg.screen.max_liq),
         min_mcap: numToStr(cfg.screen.min_mcap),
         max_mcap: numToStr(cfg.screen.max_mcap),
-        min_ath_mcap: numToStr(cfg.screen.min_ath_mcap) || '50000',
+        min_ath_mcap: numToStr(cfg.screen.min_ath_mcap) || '40000',
         min_traders: numToStr(cfg.screen.min_traders),
         max_traders: numToStr(cfg.screen.max_traders),
         min_pair_age_hours: numToStr(cfg.screen.min_pair_age_hours),
         max_pair_age_hours: numToStr(cfg.screen.max_pair_age_hours),
         sort_by: cfg.screen.sort_by,
         sort_order: cfg.screen.sort_order,
-        max_results: String(cfg.screen.max_results || 200),
+        max_results: String(cfg.screen.max_results || 10000),
         exclude_honeypots: cfg.screen.exclude_honeypots,
       })
       setWallet({
@@ -243,7 +243,7 @@ export default function SettingsPage() {
     setMsg('')
     setError('')
     try {
-      const maxResults = Math.min(2000, Math.max(1, Number(screen.max_results) || 200))
+      const maxResults = Math.min(10000, Math.max(1, Number(screen.max_results) || 10000))
       const payload: WatchConfig = {
         ...baseWatch,
         screen: {
@@ -464,7 +464,7 @@ export default function SettingsPage() {
             <input
               type="number"
               min={1}
-              max={2000}
+              max={10000}
               value={screen.max_results}
               onChange={(e) => setScreenField('max_results', e.target.value)}
             />

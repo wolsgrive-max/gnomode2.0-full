@@ -173,7 +173,7 @@ class ScreenRequest(BaseModel):
     exclude_honeypots: bool = True
     sort_by: ScreenSortBy = ScreenSortBy.liquidity
     sort_order: ScreenSortOrder = ScreenSortOrder.desc
-    max_results: int = Field(default=500, ge=1, le=2000)
+    max_results: int = Field(default=500, ge=1, le=10_000)
 
 
 class ScreenedToken(BaseModel):
@@ -217,14 +217,14 @@ class IndexStatus(BaseModel):
 
 
 class WatchScreenFilters(BaseModel):
-    # Defaults mirror live Хвать «фильтры токенов» (min liq / ATH / age / results).
+    # Defaults = Хвать «фильтры токенов» (screenshot): ATH 40k, age≤24h, max_results 10k.
     min_liq: float | None = 500.0
     max_liq: float | None = None
     min_mcap: float | None = None
     max_mcap: float | None = None
     # Autoparse wallet extraction only after tracked ATH ≥ this (USD).
     # None or 0 disables the gate (parse every screened token each cycle).
-    min_ath_mcap: float | None = 50_000.0
+    min_ath_mcap: float | None = 40_000.0
     min_traders: float | None = None
     max_traders: float | None = None
     min_pair_age_hours: float | None = None
@@ -232,7 +232,7 @@ class WatchScreenFilters(BaseModel):
     exclude_honeypots: bool = True
     sort_by: ScreenSortBy = ScreenSortBy.liquidity
     sort_order: ScreenSortOrder = ScreenSortOrder.desc
-    max_results: int = Field(default=200, ge=1, le=2000)
+    max_results: int = Field(default=10_000, ge=1, le=10_000)
 
 
 class WatchWalletFilters(BaseModel):

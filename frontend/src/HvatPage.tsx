@@ -201,14 +201,14 @@ const DEFAULT_SCREEN: ScreenForm = {
   max_liq: '',
   min_mcap: '',
   max_mcap: '',
-  min_ath_mcap: '50000',
+  min_ath_mcap: '40000',
   min_traders: '',
   max_traders: '',
   min_pair_age_hours: '',
   max_pair_age_hours: '24',
   sort_by: 'liquidity',
   sort_order: 'desc',
-  max_results: '200',
+  max_results: '10000',
   exclude_honeypots: true,
 }
 
@@ -283,14 +283,14 @@ function cfgToScreen(cfg: WatchConfig): ScreenForm {
     max_liq: numToStr(cfg.screen.max_liq),
     min_mcap: numToStr(cfg.screen.min_mcap),
     max_mcap: numToStr(cfg.screen.max_mcap),
-    min_ath_mcap: numToStr(cfg.screen.min_ath_mcap) || '50000',
+    min_ath_mcap: numToStr(cfg.screen.min_ath_mcap) || '40000',
     min_traders: numToStr(cfg.screen.min_traders),
     max_traders: numToStr(cfg.screen.max_traders),
     min_pair_age_hours: numToStr(cfg.screen.min_pair_age_hours),
     max_pair_age_hours: numToStr(cfg.screen.max_pair_age_hours),
     sort_by: cfg.screen.sort_by || 'liquidity',
     sort_order: cfg.screen.sort_order || 'desc',
-    max_results: String(cfg.screen.max_results || 200),
+    max_results: String(cfg.screen.max_results || 10000),
     exclude_honeypots: cfg.screen.exclude_honeypots !== false,
   }
 }
@@ -520,7 +520,7 @@ export default function HvatPage({ tabActive = true }: { tabActive?: boolean }) 
           max_pair_age_hours: parseOpt(screen.max_pair_age_hours),
           sort_by: screen.sort_by,
           sort_order: screen.sort_order,
-          max_results: parseOpt(screen.max_results) ?? 200,
+          max_results: parseOpt(screen.max_results) ?? 10000,
           exclude_honeypots: screen.exclude_honeypots,
         },
         wallet: {
@@ -826,7 +826,7 @@ export default function HvatPage({ tabActive = true }: { tabActive?: boolean }) 
             </label>
             <label className="field">
               <span>Макс. результатов</span>
-              <input type="number" min={1} max={2000} value={screen.max_results} onChange={(e) => setScreenField('max_results', e.target.value)} />
+              <input type="number" min={1} max={10000} value={screen.max_results} onChange={(e) => setScreenField('max_results', e.target.value)} />
             </label>
             <label className="field">
               <span>Токенов за цикл</span>
