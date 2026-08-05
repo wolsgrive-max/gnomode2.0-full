@@ -92,6 +92,23 @@ def should_alert_deal(
     return True
 
 
+def order_deals_for_alerts(
+    new_deals: list[tuple[Any, str | None]],
+) -> list[tuple[Any, str | None]]:
+    """Sort newly recorded deals by ascending deal_index before Telegram.
+
+    Cross-cycle late discoveries of a *lower* index after a higher one was
+    already notified still alert (do not suppress real buys) — this only
+    fixes within-batch / post-sync ordering going forward.
+    """
+    return sorted(
+        new_deals,
+        key=lambda pair: (
+            int(getattr(pair[0], "deal_index", 0) or 0),
+            str(getattr(pair[0], "token", "") or ""),
+        ),
+    )
+
 def prune_settings_for_wallet(
     cfg: FollowupConfig,
     wallet_filters: WalletAlertFilters | None = None,
@@ -495,7 +512,10 @@ class FollowupRunner:
             filters_map = self._store.get_alert_filters_map(
                 sorted({d.wallet for d in inserted})
             )
-            for deal in inserted:
+            for deal in sorted(
+                inserted,
+                key=lambda d: (int(d.deal_index or 0), str(d.token or "")),
+            ):
                 gate = alert_kwargs_for_wallet(cfg, filters_map.get(deal.wallet))
                 if not should_alert_deal(
                     deal.deal_index,
@@ -579,7 +599,9 @@ class FollowupRunner:
         rpc = RpcClient()
         conc = max(1, int(cfg.scan_concurrency or 6))
         if gmgn_fallback_cycle:
-            conc = min(conc, 3)
+            # Blockscout-only: no GMGN 429 risk — allow a bit more parallelism
+            # than the old hard cap of 3 (250 wallets × ~4s was 20–35 min cycles).
+            conc = min(max(conc, 1), 8)
         sem = asyncio.Semaphore(conc)
         done_count = 0
         skipped_alerts = 0
@@ -593,13 +615,15 @@ class FollowupRunner:
         ) -> None:
             """Send TG as soon as this wallet's scan finishes (don't wait for all).
 
+            Alerts go out in ascending deal_index. A late-discovered lower index
+            after a higher index was already notified still alerts (no suppress).
             Honeypot is already resolved during scan (or checked here before send).
             """
             nonlocal skipped_alerts
             if not new_deals or self._stop_requested:
                 return
             gate = alert_kwargs_for_wallet(cfg, filters_map.get(wallet))
-            for deal, hp_reason in new_deals:
+            for deal, hp_reason in order_deals_for_alerts(new_deals):
                 if self._stop_requested:
                     return
                 async with progress_lock:
@@ -650,7 +674,10 @@ class FollowupRunner:
                     return wallet, []
                 try:
                     deals, source = await self._scan_wallet(
-                        wallet, cfg, rpc=rpc
+                        wallet,
+                        cfg,
+                        rpc=rpc,
+                        skip_gmgn=gmgn_fallback_cycle,
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Follow-up scan %s: %s", wallet[:10], exc)
@@ -896,6 +923,7 @@ class FollowupRunner:
         cfg: FollowupConfig,
         *,
         rpc: Any | None = None,
+        skip_gmgn: bool = False,
     ) -> tuple[list, str]:
         last_seen, deal_count, status = self._store.get_wallet_scan_meta(wallet)
         if status != "watching" or deal_count >= cfg.max_deals:
@@ -915,10 +943,17 @@ class FollowupRunner:
         try:
             from .gmgn_portfolio import gmgn_api_configured
 
-            if gmgn_api_configured():
+            # Whole-cycle circuit open → skip per-wallet GMGN pokes (faster
+            # Blockscout pass, less log noise; does not re-open the circuit).
+            if gmgn_api_configured() and not skip_gmgn:
                 gmgn_attempted = True
                 gmgn_result = await fetch_unique_buys(wallet, max_pages=1)
                 gmgn_buys = list(gmgn_result.buys)
+            elif gmgn_api_configured() and skip_gmgn:
+                gmgn_attempted = True
+                gmgn_result = UniqueBuysResult(
+                    buys=[], ok=False, rate_limited=True
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("GMGN unique buys %s: %s", wallet[:10], exc)
             gmgn_buys = []
@@ -1008,29 +1043,37 @@ class FollowupRunner:
                 bought_usd: float | None = (
                     existing.get("bought_usd") if existing else buy.cost_usd
                 )
-                if mcap is None:
-                    if buy.tx_hash:
-                        try:
-                            from .replay import estimate_entry_at_tx
+                # Persist real block so later Blockscout renumber does not push
+                # GMGN rows (block=0) after newer on-chain buys.
+                block_number = int(
+                    (existing or {}).get("block_number") or 0
+                )
+                if buy.tx_hash and (mcap is None or block_number <= 0):
+                    try:
+                        from .replay import estimate_entry_at_tx
 
-                            entry = await estimate_entry_at_tx(
-                                token, buy.tx_hash, rpc=rpc
-                            )
+                        entry = await estimate_entry_at_tx(
+                            token, buy.tx_hash, rpc=rpc
+                        )
+                        if mcap is None:
                             mcap = entry.mcap
-                            if bought_usd is None:
-                                bought_usd = entry.bought_usd
-                        except Exception as exc:  # noqa: BLE001
-                            logger.debug("GMGN mcap_at_tx failed: %s", exc)
+                        if bought_usd is None:
+                            bought_usd = entry.bought_usd
+                        if entry.block > 0:
+                            block_number = int(entry.block)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("GMGN mcap_at_tx failed: %s", exc)
                     if mcap is None:
                         mcap, _price = await estimate_token_quote(token)
+                elif mcap is None:
+                    mcap, _price = await estimate_token_quote(token)
                 return {
                     "token": token,
                     "symbol": buy.symbol,
                     "tx_hash": buy.tx_hash,
                     "bought_usd": bought_usd,
                     "mcap_at_buy": mcap,
-                    # GMGN activity does not expose Robinhood block numbers.
-                    "block_number": 0,
+                    "block_number": block_number,
                 }
 
             gmgn_deals = await asyncio.gather(
@@ -1056,7 +1099,9 @@ class FollowupRunner:
             hp_reasons = await asyncio.gather(
                 *[_resolve_honeypot(deal) for deal in inserted]
             )
-            return list(zip(inserted, hp_reasons)), "gmgn"
+            # Ascending deal_index before the cycle alerter (belt + suspenders).
+            paired = list(zip(inserted, hp_reasons))
+            return order_deals_for_alerts(paired), "gmgn"
 
         # GMGN unavailable / rate-limited / seed miss → Blockscout incremental scan.
         source = (

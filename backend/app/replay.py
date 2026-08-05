@@ -94,6 +94,7 @@ class WalletAgg:
 
 
 _ETH_CACHE: dict[str, float] = {"price": 0.0, "ts": 0.0}
+_QUOTE_USD_CACHE: dict[str, dict[str, float]] = {}
 
 
 async def _eth_usd_price() -> float:
@@ -157,12 +158,65 @@ async def _eth_usd_price() -> float:
 
 
 def quote_to_usd(quote_addr: str, eth_usd: float) -> float:
+    """Return a quote's static USD multiplier.
+
+    Stablecoins and native/WETH can be resolved synchronously. Other routing
+    quotes (currently SPCX) require their own market price and intentionally
+    return zero here rather than being mispriced as ETH.
+    """
     meta = QUOTE_TOKENS.get(quote_addr.lower())
     if not meta:
         return 0.0
     if meta["is_stable"]:
         return 1.0
-    return eth_usd
+    if quote_addr.lower() in (WETH.lower(), ZERO.lower()):
+        return eth_usd
+    return 0.0
+
+
+async def _quote_usd_price(quote_addr: str, eth_usd: float) -> float:
+    """USD value of one quote unit, cached for 60 seconds."""
+    static = quote_to_usd(quote_addr, eth_usd)
+    if static > 0:
+        return static
+
+    key = quote_addr.lower()
+    meta = QUOTE_TOKENS.get(key)
+    if not meta or meta.get("usd_price_source") != "dexscreener":
+        return 0.0
+
+    now = time.time()
+    cached = _QUOTE_USD_CACHE.get(key)
+    if cached and cached["price"] > 0 and now - cached["ts"] < 60:
+        return cached["price"]
+
+    try:
+        from .chain import http_client
+
+        resp = await http_client().get(
+            f"{DEXSCREENER_API}/latest/dex/tokens/{quote_addr}"
+        )
+        if resp.status_code != 200:
+            return cached["price"] if cached else 0.0
+        pairs = resp.json().get("pairs") or []
+        candidates: list[tuple[float, float]] = []
+        for pair in pairs:
+            if str(pair.get("chainId") or "").lower() not in ("robinhood", "4663"):
+                continue
+            base = str((pair.get("baseToken") or {}).get("address") or "").lower()
+            if base != key:
+                continue
+            price = float(pair.get("priceUsd") or 0.0)
+            liquidity = float((pair.get("liquidity") or {}).get("usd") or 0.0)
+            if price > 0:
+                candidates.append((liquidity, price))
+        if candidates:
+            _, price = max(candidates)
+            _QUOTE_USD_CACHE[key] = {"price": price, "ts": now}
+            return price
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("%s/USD lookup failed: %s", meta.get("symbol", key), exc)
+    return cached["price"] if cached else 0.0
 
 
 def v2_price_token_in_quote(
@@ -360,6 +414,7 @@ def _log_block(log: dict[str, Any]) -> int:
 class EntryAtTx:
     mcap: float | None = None
     bought_usd: float | None = None
+    block: int = 0
 
 
 _ENTRY_AT_TX_CACHE: dict[str, tuple[float, EntryAtTx]] = {}
@@ -406,26 +461,28 @@ async def estimate_entry_at_tx(
         receipt = receipts.get(txh)
         if not receipt:
             return _cache(empty)
+        block = _rpc_int(receipt.get("blockNumber"), 0)
         logs = receipt.get("logs") or []
         if not logs:
-            return _cache(empty)
+            return _cache(EntryAtTx(block=block) if block > 0 else empty)
 
         pool = await pick_best_pool(rpc, token)
         if not pool:
-            return _cache(empty)
+            return _cache(EntryAtTx(block=block) if block > 0 else empty)
         meta = await rpc.token_meta(token)
         decimals = int(meta.get("decimals") or 18)
         supply_raw = int(meta.get("total_supply_raw") or 0)
         supply_tokens = supply_raw / (10**decimals) if decimals >= 0 else 0.0
         if supply_tokens <= 0:
-            return _cache(empty)
+            return _cache(EntryAtTx(block=block) if block > 0 else empty)
         eth_usd = await _eth_usd_price()
-        quote_usd = quote_to_usd(pool.quote, eth_usd)
+        quote_usd = await _quote_usd_price(pool.quote, eth_usd)
         if quote_usd <= 0:
-            quote_usd = float(eth_usd or 0)
-        if quote_usd <= 0:
-            quote_usd = 2000.0
-            logger.warning("estimate_entry_at_tx: ETH/USD missing, fallback $%s", quote_usd)
+            logger.warning(
+                "estimate_entry_at_tx: %s/USD unavailable",
+                pool.quote_symbol or pool.quote,
+            )
+            return _cache(EntryAtTx(block=block) if block > 0 else empty)
         quote_decimals = QUOTE_TOKENS.get(pool.quote.lower(), {}).get("decimals", 18)
         token_is_token0 = pool.token0.lower() == token.lower()
         pool_l = pool.address.lower()
@@ -571,6 +628,7 @@ async def estimate_entry_at_tx(
         result = EntryAtTx(
             mcap=best_mcap if best_mcap and best_mcap > 0 else None,
             bought_usd=best_bought if best_bought and best_bought > 0 else None,
+            block=block,
         )
         return _cache(result)
     except Exception as exc:  # noqa: BLE001
@@ -665,13 +723,18 @@ async def parse_token(
         return result
     result.pool = pool
 
-    quote_usd = quote_to_usd(pool.quote, eth_usd)
+    quote_usd = await _quote_usd_price(pool.quote, eth_usd)
     if quote_usd <= 0:
         if pool.quote.lower() in (WETH.lower(), ZERO.lower()):
             quote_usd = eth_usd if eth_usd > 0 else 2000.0
             logger.warning("Using ETH price $%s", quote_usd)
-        else:
+        elif pool.quote.lower() == USDG.lower():
             quote_usd = 1.0
+        else:
+            result.error = (
+                f"{pool.quote_symbol or pool.quote} USD price unavailable"
+            )
+            return result
 
     quote_decimals = QUOTE_TOKENS.get(pool.quote.lower(), {}).get("decimals", 18)
     if pool.quote.lower() == ZERO.lower():
@@ -765,6 +828,8 @@ async def parse_token(
     # Swap events — GMGN still labels them «Покупка». Merge under the same
     # mcap gate. Creator pad ``launch`` (create + firstBuy) is excluded — GMGN
     # does not treat those as buys.
+    # When Uniswap already yielded early buyers, skip the slow Blockscout
+    # launch supplement (RPC genesis window still runs).
     try:
         await prog("launch", "Scanning launch-pad acquisitions…", 0.82)
         launch_buyers = await _discover_launch_buyers(
@@ -778,6 +843,7 @@ async def parse_token(
             start_block=start_block,
             end_block=latest,
             on_progress=prog,
+            skip_blockscout=bool(buyers),
         )
         if launch_buyers:
             before = len(buyers)
@@ -1732,6 +1798,7 @@ async def _discover_launch_buyers(
     on_progress: ProgressCb,
     start_block: int | None = None,
     end_block: int | None = None,
+    skip_blockscout: bool = False,
 ) -> list[BuyerRow]:
     """Collect launch-pad first acquisitions under the early-buyer mcap gate.
 
@@ -1797,7 +1864,9 @@ async def _discover_launch_buyers(
         )
         # Cap inspection — genesis launch is early; avoid get_transaction on
         # every later swap when pick_best_pool pointed at the pad.
-        for lg in logs[:400]:
+        inspect_cap = 120
+        pre: list[tuple[str, str, int, int]] = []
+        for lg in logs[:inspect_cap]:
             try:
                 topics = lg.get("topics") or []
                 if len(topics) < 3:
@@ -1820,25 +1889,42 @@ async def _discover_launch_buyers(
                 block = int(lg.get("blockNumber") or 0)
                 if not tx:
                     continue
-                # Do NOT skip from==pool: pick_best_pool sometimes returns the
-                # Pons pad address as the "pool". _tx_is_launch_buy filters swaps.
-                if not await _tx_is_launch_buy(
-                    tx, expected_wallet=to_addr, rpc=rpc
-                ):
-                    continue
-                _add(to_addr, tx, amount_raw, block)
-                if len(candidates) >= 40:
-                    break
+                pre.append((to_addr, tx, amount_raw, block))
             except Exception:  # noqa: BLE001
                 continue
 
+        async def _check_one(
+            to_addr: str, tx: str, amount_raw: int, block: int
+        ) -> tuple[str, str, int, int] | None:
+            # Do NOT skip from==pool: pick_best_pool sometimes returns the
+            # Pons pad address as the "pool". _tx_is_launch_buy filters swaps.
+            if not await _tx_is_launch_buy(tx, expected_wallet=to_addr, rpc=rpc):
+                return None
+            return to_addr, tx, amount_raw, block
+
+        sem = asyncio.Semaphore(6)
+
+        async def _gated(
+            row: tuple[str, str, int, int],
+        ) -> tuple[str, str, int, int] | None:
+            async with sem:
+                return await _check_one(*row)
+
+        checked = await asyncio.gather(*[_gated(row) for row in pre])
+        for hit in checked:
+            if hit is None:
+                continue
+            _add(*hit)
+            if len(candidates) >= 40:
+                break
+
     # --- 2) Blockscout supplement only when RPC found nothing ---
-    if not candidates:
+    if not candidates and not skip_blockscout:
         await on_progress("launch", "Launch Blockscout supplement…", 0.83)
         transfers: list[dict[str, Any]] = []
         async for item in iter_token_transfers(token):
             transfers.append(item)
-            if len(transfers) >= 4000:
+            if len(transfers) >= 800:
                 break
         transfers.reverse()
         for item in transfers:
@@ -1870,6 +1956,12 @@ async def _discover_launch_buyers(
             _add(to_addr, tx, amount_raw, block)
             if len(candidates) >= 40:
                 break
+    elif not candidates and skip_blockscout:
+        await on_progress(
+            "launch",
+            "Launch BS skipped (Uniswap early buyers already found)",
+            0.83,
+        )
 
     if not candidates:
         await on_progress("launch", "No launch-pad buyers found", 0.84)

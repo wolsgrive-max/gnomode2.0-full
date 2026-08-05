@@ -1412,3 +1412,177 @@ async def test_scan_watermark_stops_at_last_recorded_when_max_deals(
     assert count == 2 and status == "done"
     # Must NOT jump to tip 1500 — leftover buy @1200 would be lost forever.
     assert last_seen == 1100
+
+
+def test_order_deals_for_alerts_ascending_deal_index():
+    """Telegram must fire #3 before #4 even if discovery list was reversed."""
+    from app.followup import order_deals_for_alerts
+    from app.models import FollowupDealRow
+
+    d4 = FollowupDealRow(
+        wallet="0xaaa",
+        token="0xlll",
+        token_symbol="LILUNI",
+        deal_index=4,
+        mcap_at_buy=15_000.0,
+        bought_usd=100.0,
+        tx_hash="0xl",
+        block_number=100,
+        notified=False,
+        created_at=1.0,
+    )
+    d3 = FollowupDealRow(
+        wallet="0xaaa",
+        token="0xppp",
+        token_symbol="PONSI",
+        deal_index=3,
+        mcap_at_buy=17_000.0,
+        bought_usd=68.0,
+        tx_hash="0xp",
+        block_number=200,
+        notified=False,
+        created_at=2.0,
+    )
+    ordered = order_deals_for_alerts([(d4, None), (d3, "hp")])
+    assert [d.deal_index for d, _ in ordered] == [3, 4]
+    assert ordered[0][1] == "hp"
+
+
+def test_gmgn_block_keeps_earlier_buy_before_later_blockscout(tmp_path):
+    """LILUNI@block N must stay before PONSI@N+1 — not get pushed by block=0."""
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    wallet = "0xfef6f13e1d0647df6460202a7a2e5a787fe65b5d"
+    seed = "0x7a4340740305e361d1583b67a9dbd4227d7fc3d3"
+    alcor = "0xe0455d8815f627f782e698c2ffa662c0ef07994d"
+    liluni = "0xf152df5fec2f074294f6b791d63ea68ae0f76805"
+    ponsi = "0x72c75f85d86706d63884eb9d4b0e0945b6dd58f6"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token=seed,
+                token_symbol="IGNOTUS",
+                bought_tokens=1.0,
+                bought_usd=100.0,
+                mcap_at_first_buy=12_000.0,
+                buys_count=1,
+                first_block=26_334_310,
+                first_tx="0xseed",
+            )
+        ],
+        max_deals=5,
+    )
+    # GMGN sync with real blocks (the bug was writing block_number=0).
+    inserted = store.apply_gmgn_buy_order(
+        wallet,
+        [
+            {
+                "token": alcor,
+                "symbol": "ALCOR",
+                "tx_hash": "0xalcor",
+                "block_number": 28_607_589,
+                "mcap_at_buy": 10_000.0,
+                "bought_usd": 50.0,
+            },
+            {
+                "token": liluni,
+                "symbol": "LILUNI",
+                "tx_hash": "0xliluni",
+                "block_number": 28_678_912,
+                "mcap_at_buy": 15_529.0,
+                "bought_usd": 100.0,
+            },
+        ],
+        max_deals=5,
+    )
+    assert [(d.token_symbol, d.deal_index) for d in inserted] == [
+        ("ALCOR", 2),
+        ("LILUNI", 3),
+    ]
+    # Later Blockscout discovers PONSI (bought after LILUNI on-chain).
+    ponsi_deal = store.record_deal(
+        wallet=wallet,
+        token=ponsi,
+        token_symbol="PONSI",
+        mcap_at_buy=17_980.0,
+        bought_usd=68.0,
+        tx_hash="0xponsi",
+        block_number=28_693_205,
+        max_deals=5,
+    )
+    assert ponsi_deal is not None
+    assert ponsi_deal.deal_index == 4
+    rows = store.list_deals_for_wallet(wallet)
+    assert [(r["token_symbol"], r["deal_index"]) for r in rows] == [
+        ("IGNOTUS", 1),
+        ("ALCOR", 2),
+        ("LILUNI", 3),
+        ("PONSI", 4),
+    ]
+
+
+def test_zero_block_gmgn_row_gets_pushed_by_renumber(tmp_path):
+    """Regression document: block=0 GMGN rows sort after real blocks → #3 after #4."""
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    wallet = "0xfef6f13e1d0647df6460202a7a2e5a787fe65b5d"
+    seed = "0x7a4340740305e361d1583b67a9dbd4227d7fc3d3"
+    alcor = "0xe0455d8815f627f782e698c2ffa662c0ef07994d"
+    liluni = "0xf152df5fec2f074294f6b791d63ea68ae0f76805"
+    ponsi = "0x72c75f85d86706d63884eb9d4b0e0945b6dd58f6"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token=seed,
+                token_symbol="IGNOTUS",
+                bought_tokens=1.0,
+                bought_usd=100.0,
+                mcap_at_first_buy=12_000.0,
+                buys_count=1,
+                first_block=26_334_310,
+                first_tx="0xseed",
+            )
+        ],
+        max_deals=5,
+    )
+    store.apply_gmgn_buy_order(
+        wallet,
+        [
+            {
+                "token": alcor,
+                "symbol": "ALCOR",
+                "tx_hash": "0xalcor",
+                "block_number": 28_607_589,
+                "mcap_at_buy": 10_000.0,
+            },
+            {
+                "token": liluni,
+                "symbol": "LILUNI",
+                "tx_hash": "0xliluni",
+                "block_number": 0,  # the defect
+                "mcap_at_buy": 15_529.0,
+            },
+        ],
+        max_deals=5,
+    )
+    ponsi_deal = store.record_deal(
+        wallet=wallet,
+        token=ponsi,
+        token_symbol="PONSI",
+        mcap_at_buy=17_980.0,
+        tx_hash="0xponsi",
+        block_number=28_693_205,
+        max_deals=5,
+    )
+    assert ponsi_deal is not None
+    # Without a real LILUNI block, PONSI steals a lower index — the Walter bug.
+    by_sym = {
+        r["token_symbol"]: r["deal_index"] for r in store.list_deals_for_wallet(wallet)
+    }
+    assert by_sym["PONSI"] < by_sym["LILUNI"]
