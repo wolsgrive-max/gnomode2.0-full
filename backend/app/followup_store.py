@@ -103,6 +103,19 @@ class FollowupStore:
                     conn.execute(
                         "ALTER TABLE deals ADD COLUMN block_number INTEGER NOT NULL DEFAULT 0"
                     )
+                # Priority scheduler + zero-balance skip (durable across restarts).
+                if "last_scanned_at" not in cols:
+                    conn.execute(
+                        "ALTER TABLE wallets ADD COLUMN last_scanned_at REAL"
+                    )
+                if "last_balance_check_at" not in cols:
+                    conn.execute(
+                        "ALTER TABLE wallets ADD COLUMN last_balance_check_at REAL"
+                    )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_wallets_scan "
+                    "ON wallets(status, last_scanned_at)"
+                )
                 conn.commit()
             self._ensured = True
 
@@ -622,6 +635,95 @@ class FollowupStore:
                 "SELECT address FROM wallets WHERE status='watching' ORDER BY discovered_at"
             ).fetchall()
         return [r["address"] for r in rows]
+
+    def list_watching_schedule_rows(self) -> list[dict[str, Any]]:
+        """Watching wallets with scan/balance/activity fields for the scheduler."""
+        self._ensure()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT w.address, w.status, w.deal_count, w.discovered_at,
+                       w.last_scanned_at, w.last_balance_check_at, w.wallet_balance_eth,
+                       COALESCE(
+                           (SELECT MAX(d.created_at) FROM deals d WHERE d.wallet = w.address),
+                           w.discovered_at
+                       ) AS last_activity_at
+                FROM wallets w
+                WHERE w.status = 'watching'
+                ORDER BY w.discovered_at
+                """
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "address": str(r["address"]),
+                    "status": str(r["status"] or "watching"),
+                    "deal_count": int(r["deal_count"] or 0),
+                    "discovered_at": float(r["discovered_at"] or 0),
+                    "last_activity_at": float(r["last_activity_at"] or 0),
+                    "last_scanned_at": (
+                        float(r["last_scanned_at"])
+                        if r["last_scanned_at"] is not None
+                        else None
+                    ),
+                    "last_balance_check_at": (
+                        float(r["last_balance_check_at"])
+                        if r["last_balance_check_at"] is not None
+                        else None
+                    ),
+                    "wallet_balance_eth": (
+                        float(r["wallet_balance_eth"])
+                        if r["wallet_balance_eth"] is not None
+                        else None
+                    ),
+                }
+            )
+        return out
+
+    def mark_scanned(
+        self,
+        addresses: list[str],
+        *,
+        scanned_at: float | None = None,
+    ) -> None:
+        """Persist last_scanned_at for scheduler revisit timing."""
+        addrs = sorted({a.strip().lower() for a in addresses if a and a.strip()})
+        if not addrs:
+            return
+        self._ensure()
+        ts = float(scanned_at if scanned_at is not None else time.time())
+        with self._lock:
+            with self._connect() as conn:
+                for addr in addrs:
+                    conn.execute(
+                        "UPDATE wallets SET last_scanned_at=?, updated_at=? WHERE address=?",
+                        (ts, ts, addr),
+                    )
+                conn.commit()
+
+    def update_wallet_balances(
+        self,
+        balances: dict[str, float | None],
+        *,
+        checked_at: float | None = None,
+    ) -> None:
+        """Write refreshed native balances. ``None`` values are left unchanged."""
+        if not balances:
+            return
+        self._ensure()
+        ts = float(checked_at if checked_at is not None else time.time())
+        with self._lock:
+            with self._connect() as conn:
+                for addr, bal in balances.items():
+                    if bal is None:
+                        continue
+                    conn.execute(
+                        "UPDATE wallets SET wallet_balance_eth=?, "
+                        "last_balance_check_at=?, updated_at=? WHERE address=?",
+                        (float(bal), ts, ts, addr.lower()),
+                    )
+                conn.commit()
 
     def get_wallet_scan_meta(self, wallet: str) -> tuple[int, int, str]:
         """Return (last_seen_block, deal_count, status)."""

@@ -12,6 +12,11 @@ from .blockscout import scan_address_token_transfers
 from .buy_gate import is_wallet_initiated_buy, method_is_non_buy
 from .config import settings
 from .constants import QUOTE_TOKENS
+from .followup_schedule import (
+    WalletScheduleRow,
+    schedule_config_from_followup,
+    select_due_batch,
+)
 from .followup_store import FollowupStore, followup_store
 from .gmgn_portfolio import GmgnBuy, UniqueBuysResult, fetch_unique_buys
 from .models import (
@@ -29,10 +34,15 @@ from .telegram import (
     send_followup_deal,
     telegram_configured,
 )
+from .wallet_metrics import batch_wallet_balances
 
 logger = logging.getLogger(__name__)
 
 _LOG_MAX = 300
+# Cap Blockscout-fallback concurrency (GMGN circuit open) — do not stampede BS.
+_BS_FALLBACK_CONCURRENCY = 8
+# Hot-path GMGN concurrency stays moderate even if config is higher.
+_HOT_GMGN_CONCURRENCY = 4
 
 
 def _addr_hash(node: object) -> str:
@@ -344,6 +354,13 @@ class FollowupRunner:
         self._last_checked = 0
         self._last_new_deals = 0
         self._last_alerts_sent = 0
+        self._last_due_count = 0
+        self._last_hot_checked = 0
+        self._last_warm_checked = 0
+        self._last_zero_rechecked = 0
+        self._last_skipped_zero_balance = 0
+        self._last_hot_revisit_sec: float | None = None
+        self._last_prune_ts: float = 0.0
         self._log: list[JobLogEntry] = []
 
     def _append_log(self, stage: str, message: str, *, percent: float = 0.0) -> None:
@@ -386,6 +403,12 @@ class FollowupRunner:
             last_new_deals=self._last_new_deals,
             last_alerts_sent=self._last_alerts_sent,
             stop_requested=self._stop_requested,
+            last_due_count=self._last_due_count,
+            last_hot_checked=self._last_hot_checked,
+            last_warm_checked=self._last_warm_checked,
+            last_zero_rechecked=self._last_zero_rechecked,
+            last_skipped_zero_balance=self._last_skipped_zero_balance,
+            last_hot_revisit_sec=self._last_hot_revisit_sec,
             log=list(self._log),
         )
 
@@ -395,6 +418,12 @@ class FollowupRunner:
         self._last_checked = 0
         self._last_new_deals = 0
         self._last_alerts_sent = 0
+        self._last_due_count = 0
+        self._last_hot_checked = 0
+        self._last_warm_checked = 0
+        self._last_zero_rechecked = 0
+        self._last_skipped_zero_balance = 0
+        self._last_hot_revisit_sec = None
         self._log.clear()
         return self.status()
 
@@ -421,13 +450,14 @@ class FollowupRunner:
                     pass
                 continue
 
+            force_cycle = self._force_run
             self._force_run = False
             self._stop_requested = False
             started = time.time()
             self._running = True
             self._next_run_ts = None
             try:
-                await self.run_cycle(cfg)
+                await self.run_cycle(cfg, force_all_due=force_cycle)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Follow-up cycle failed")
                 self._last_error = str(exc)
@@ -463,9 +493,17 @@ class FollowupRunner:
                     if not cfg.enabled and not self._force_run:
                         break
 
-    async def run_cycle(self, cfg: FollowupConfig | None = None) -> None:
+    async def run_cycle(
+        self,
+        cfg: FollowupConfig | None = None,
+        *,
+        force_all_due: bool = False,
+    ) -> None:
         async with self._lock:
-            await self._cycle_body(cfg or self._store.load_config())
+            await self._cycle_body(
+                cfg or self._store.load_config(),
+                force_all_due=force_all_due,
+            )
 
     async def ingest_from_watch(
         self,
@@ -546,16 +584,51 @@ class FollowupRunner:
                     logger.warning("Follow-up alert failed: %s", exc)
         return len(inserted)
 
-    async def _cycle_body(self, cfg: FollowupConfig) -> None:
-        wallets = self._store.list_watching()
-        self._last_checked = len(wallets)
+    async def _cycle_body(
+        self,
+        cfg: FollowupConfig,
+        *,
+        force_all_due: bool = False,
+    ) -> None:
+        now = time.time()
+        sched_cfg = schedule_config_from_followup(cfg)
+        schedule_rows_raw = self._store.list_watching_schedule_rows()
+        schedule_rows = [
+            WalletScheduleRow(
+                address=r["address"],
+                status=r["status"],
+                deal_count=int(r["deal_count"]),
+                discovered_at=float(r["discovered_at"]),
+                last_activity_at=float(r["last_activity_at"]),
+                last_scanned_at=r["last_scanned_at"],
+                last_balance_check_at=r["last_balance_check_at"],
+                wallet_balance_eth=r["wallet_balance_eth"],
+            )
+            for r in schedule_rows_raw
+        ]
+        watching_n = len(schedule_rows)
+        due = select_due_batch(
+            schedule_rows,
+            now=now,
+            max_deals=int(cfg.max_deals or 5),
+            cfg=sched_cfg,
+            force_all_due=force_all_due,
+        )
+        self._last_due_count = len(due)
+        self._last_checked = 0
         self._last_new_deals = 0
         self._last_alerts_sent = 0
+        self._last_hot_checked = 0
+        self._last_warm_checked = 0
+        self._last_zero_rechecked = 0
+        self._last_skipped_zero_balance = 0
+        self._last_hot_revisit_sec = None
         self._last_error = None
-        if not wallets:
+
+        if watching_n == 0:
             self._last_message = "Нет кошельков в статусе watching"
             self._append_log("idle", self._last_message)
-            pruned = await self._prune_stale_wallets(cfg)
+            pruned = await self._maybe_prune(cfg, force=force_all_due)
             if pruned:
                 self._append_log(
                     "prune",
@@ -563,13 +636,103 @@ class FollowupRunner:
                 )
             return
 
+        if not due:
+            self._last_message = (
+                f"Нет due кош. (watching={watching_n}, "
+                f"hot≤{sched_cfg.hot_revisit_sec:.0f}s / "
+                f"warm≤{sched_cfg.warm_revisit_sec:.0f}s)"
+            )
+            self._append_log("idle", self._last_message)
+            pruned = await self._maybe_prune(cfg, force=force_all_due)
+            if pruned:
+                self._append_log(
+                    "prune",
+                    f"Удалено {pruned} кош. (токен #1/#2/#3 не дошёл до ATH за срок)",
+                )
+            return
+
+        row_by_addr = {r.address: r for r in schedule_rows}
+        wallets = [d.address for d in due]
+        tier_by_addr = {d.address: d.tier for d in due}
         chat = resolve_chat_id(cfg.telegram_chat_id)
         topic_id = resolve_topic_id(cfg.telegram_topic_id)
         tg_ok = telegram_configured(chat)
         filters_map = self._store.get_alert_filters_map(wallets)
 
-        self._last_message = f"Проверка {len(wallets)} кош…"
+        hot_n = sum(1 for d in due if d.tier == "hot")
+        warm_n = sum(1 for d in due if d.tier == "warm")
+        zero_n = sum(1 for d in due if d.tier == "zero")
+        self._last_message = (
+            f"Due {len(due)}/{watching_n} "
+            f"(hot={hot_n} warm={warm_n} zero={zero_n})…"
+        )
         self._append_log("scan", self._last_message, percent=5)
+
+        from .chain import RpcClient
+
+        rpc = RpcClient()
+
+        # Refresh balances for due wallets that need it (batched multicall + TTL cache).
+        refresh_addrs = [
+            d.address
+            for d in due
+            if d.needs_balance_refresh or d.tier == "zero"
+        ]
+        balance_map: dict[str, float | None] = {
+            addr: row_by_addr[addr].wallet_balance_eth
+            for addr in wallets
+            if addr in row_by_addr
+        }
+        if refresh_addrs and not self._stop_requested:
+            try:
+                fetched = await batch_wallet_balances(rpc, refresh_addrs)
+                self._store.update_wallet_balances(fetched, checked_at=time.time())
+                for addr, bal in fetched.items():
+                    balance_map[addr] = bal
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Follow-up balance refresh failed: %s", exc)
+                # Fail-open: leave prior values; None stays None → deal scan proceeds.
+
+        # Confirmed zero ETH → skip network-heavy deal scan; keep watching.
+        scan_wallets: list[str] = []
+        skipped_zero: list[str] = []
+        for addr in wallets:
+            bal = balance_map.get(addr)
+            if bal is not None and float(bal) == 0.0:
+                skipped_zero.append(addr)
+            else:
+                # None (unknown/error) or >0 → scan (fail-open on None).
+                scan_wallets.append(addr)
+
+        self._last_skipped_zero_balance = len(skipped_zero)
+        if skipped_zero:
+            self._store.mark_scanned(skipped_zero)
+            self._last_zero_rechecked = sum(
+                1 for a in skipped_zero if tier_by_addr.get(a) == "zero"
+            )
+            self._append_log(
+                "skip",
+                f"skipped_zero_balance={len(skipped_zero)} "
+                f"(остаются watching, recheck ~"
+                f"{sched_cfg.zero_balance_recheck_sec:.0f}s)",
+                percent=8,
+            )
+
+        if not scan_wallets:
+            self._last_checked = len(skipped_zero)
+            self._last_message = (
+                f"Готово — due={len(due)}, "
+                f"skipped_zero_balance={len(skipped_zero)}, сделок 0"
+            )
+            self._append_log("done", self._last_message, percent=100)
+            if not self._stop_requested:
+                pruned = await self._maybe_prune(cfg, force=force_all_due)
+                if pruned:
+                    self._append_log(
+                        "prune",
+                        f"Удалено {pruned} кош. (токен #1/#2/#3 не дошёл до ATH за срок)",
+                    )
+            return
 
         # Prefer real Blockscout scans over empty GMGN cycles while cooling.
         gmgn_fallback_cycle = False
@@ -587,21 +750,20 @@ class FollowupRunner:
                     self._last_message = (
                         "gmgn_empty_due_to_429, fallback_blockscout"
                     )
-                    self._append_log("scan", self._last_message, percent=5)
+                    self._append_log("scan", self._last_message, percent=10)
                     logger.warning(
                         "Follow-up: GMGN circuit open — Blockscout fallback cycle"
                     )
         except Exception:  # noqa: BLE001
             pass
 
-        from .chain import RpcClient
-
-        rpc = RpcClient()
-        conc = max(1, int(cfg.scan_concurrency or 6))
+        conc = max(1, int(cfg.scan_concurrency or 3))
         if gmgn_fallback_cycle:
-            # Blockscout-only: no GMGN 429 risk — allow a bit more parallelism
-            # than the old hard cap of 3 (250 wallets × ~4s was 20–35 min cycles).
-            conc = min(max(conc, 1), 8)
+            # Blockscout-only: modest parallelism; avoid BS stampede.
+            conc = min(max(conc, 1), _BS_FALLBACK_CONCURRENCY)
+        else:
+            # Keep GMGN pressure moderate on hot batches.
+            conc = min(conc, _HOT_GMGN_CONCURRENCY)
         sem = asyncio.Semaphore(conc)
         done_count = 0
         skipped_alerts = 0
@@ -609,6 +771,7 @@ class FollowupRunner:
         gmgn_fallback_wallets = 0
         blockscout_wallets = 0
         progress_lock = asyncio.Lock()
+        scanned_addrs: list[str] = []
 
         async def _alert_deals(
             wallet: str, new_deals: list[tuple[Any, str | None]]
@@ -684,6 +847,12 @@ class FollowupRunner:
                     deals, source = [], "error"
             async with progress_lock:
                 done_count += 1
+                scanned_addrs.append(wallet)
+                tier = tier_by_addr.get(wallet, "warm")
+                if tier == "hot":
+                    self._last_hot_checked += 1
+                elif tier == "warm":
+                    self._last_warm_checked += 1
                 if source == "gmgn":
                     gmgn_ok_wallets += 1
                 elif source == "blockscout_fallback":
@@ -691,10 +860,12 @@ class FollowupRunner:
                     blockscout_wallets += 1
                 elif source == "blockscout":
                     blockscout_wallets += 1
-                if done_count % 5 == 0 or done_count == len(wallets):
-                    pct = 5 + int(90 * done_count / max(len(wallets), 1))
+                if done_count % 5 == 0 or done_count == len(scan_wallets):
+                    pct = 10 + int(85 * done_count / max(len(scan_wallets), 1))
                     self._last_message = (
-                        f"Проверено {done_count}/{len(wallets)}, "
+                        f"Проверено {done_count}/{len(scan_wallets)} due, "
+                        f"hot={self._last_hot_checked} warm={self._last_warm_checked}, "
+                        f"zero_skip={self._last_skipped_zero_balance}, "
                         f"новых сделок {self._last_new_deals}, "
                         f"алертов {self._last_alerts_sent}"
                         + (
@@ -706,7 +877,7 @@ class FollowupRunner:
                     self._append_log("scan", self._last_message, percent=pct)
             return wallet, deals
 
-        tasks = [asyncio.create_task(_scan_one(w)) for w in wallets]
+        tasks = [asyncio.create_task(_scan_one(w)) for w in scan_wallets]
         try:
             for fut in asyncio.as_completed(tasks):
                 if self._stop_requested:
@@ -725,6 +896,22 @@ class FollowupRunner:
                         t.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
 
+        if scanned_addrs:
+            self._store.mark_scanned(scanned_addrs)
+        self._last_checked = len(scanned_addrs) + len(skipped_zero)
+
+        # Estimate hot revisit from last_scanned_at → now for wallets we just did.
+        hot_gaps: list[float] = []
+        for addr in scanned_addrs:
+            if tier_by_addr.get(addr) != "hot":
+                continue
+            prev = row_by_addr.get(addr)
+            if prev and prev.last_scanned_at is not None:
+                hot_gaps.append(now - float(prev.last_scanned_at))
+        if hot_gaps:
+            hot_gaps.sort()
+            self._last_hot_revisit_sec = hot_gaps[len(hot_gaps) // 2]
+
         if self._stop_requested:
             self._last_message = "Остановлено"
             self._append_log("stop", self._last_message)
@@ -741,7 +928,7 @@ class FollowupRunner:
             if gmgn_fallback_wallets or gmgn_fallback_cycle:
                 path_note = (
                     f" · gmgn_empty_due_to_429, fallback_blockscout="
-                    f"{gmgn_fallback_wallets}/{len(wallets)}"
+                    f"{gmgn_fallback_wallets}/{len(scan_wallets)}"
                 )
             elif blockscout_wallets and not gmgn_ok_wallets:
                 path_note = f" · blockscout={blockscout_wallets}"
@@ -754,11 +941,15 @@ class FollowupRunner:
                         else ""
                     )
                 )
+            revisit_note = ""
+            if self._last_hot_revisit_sec is not None:
+                revisit_note = f" · hot_revisit≈{self._last_hot_revisit_sec:.0f}s"
             if (
                 gmgn_fallback_cycle
                 and gmgn_fallback_wallets == 0
                 and gmgn_ok_wallets == 0
                 and blockscout_wallets == 0
+                and scan_wallets
             ):
                 self._last_message = (
                     "GMGN 429 — нет скана (ни GMGN, ни Blockscout)"
@@ -770,20 +961,40 @@ class FollowupRunner:
                 )
             else:
                 self._last_message = (
-                    f"Готово — {len(wallets)} кош., "
+                    f"Готово — due={len(due)} scanned={len(scanned_addrs)} "
+                    f"hot={self._last_hot_checked} warm={self._last_warm_checked} "
+                    f"zero_skip={self._last_skipped_zero_balance}, "
                     f"{self._last_new_deals} сделок, "
-                    f"{self._last_alerts_sent} алертов{path_note}"
+                    f"{self._last_alerts_sent} алертов{path_note}{revisit_note}"
                 )
                 self._append_log("done", self._last_message, percent=100)
 
         # Prune after alerts so honeypot/TG path is not blocked by ATH fetches.
         if not self._stop_requested:
-            pruned = await self._prune_stale_wallets(cfg)
+            pruned = await self._maybe_prune(cfg, force=force_all_due)
             if pruned:
                 self._append_log(
                     "prune",
                     f"Удалено {pruned} кош. (токен #1/#2/#3 не дошёл до ATH за срок)",
                 )
+
+    async def _maybe_prune(
+        self,
+        cfg: FollowupConfig,
+        *,
+        force: bool = False,
+    ) -> int:
+        """Run ATH prune at most once per ``prune_interval_sec`` (unless forced).
+
+        Priority cycles are short; pruning every cycle stampeded Gecko into 429.
+        """
+        interval = float(getattr(cfg, "prune_interval_sec", 1800) or 1800)
+        now = time.time()
+        if not force and self._last_prune_ts > 0 and (now - self._last_prune_ts) < interval:
+            return 0
+        pruned = await self._prune_stale_wallets(cfg)
+        self._last_prune_ts = time.time()
+        return pruned
 
     async def _prune_stale_wallets(self, cfg: FollowupConfig) -> int:
         """Remove wallets when discovery/#2/#3 tokens never hit ATH in time.

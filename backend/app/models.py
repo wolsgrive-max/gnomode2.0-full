@@ -332,6 +332,20 @@ class FollowupConfig(BaseModel):
     prune_min_ath_mcap: float = Field(default=50_000.0, ge=0)
     # Hours after discovery before prune check (48 = 2 days).
     prune_after_hours: float = Field(default=48.0, ge=1, le=24 * 30)
+    # Priority scheduler: hot/warm revisit + zero-balance recheck (seconds).
+    hot_revisit_sec: int = Field(default=20, ge=5, le=300)
+    warm_revisit_sec: int = Field(default=180, ge=30, le=3600)
+    zero_balance_recheck_sec: int = Field(default=900, ge=60, le=7200)
+    balance_fresh_sec: int = Field(default=600, ge=60, le=3600)
+    # Recent discovery/deal activity window → HOT tier.
+    hot_activity_sec: int = Field(default=1800, ge=60, le=86400)
+    # Max wallets scanned (deal or balance-recheck) per cycle.
+    max_due_per_cycle: int = Field(default=24, ge=4, le=200)
+    # Fraction of each batch reserved for overdue warm (fairness).
+    warm_fair_share: float = Field(default=0.25, ge=0.05, le=0.75)
+    # ATH prune is expensive (DexScreener/Gecko); with short priority cycles
+    # throttle it so we do not stampede Gecko into 429 every minute.
+    prune_interval_sec: int = Field(default=1800, ge=60, le=86400)
 
 
 class FollowupDealRow(BaseModel):
@@ -407,4 +421,11 @@ class FollowupStatus(BaseModel):
     last_new_deals: int = 0
     last_alerts_sent: int = 0
     stop_requested: bool = False
+    # Priority scheduler telemetry (last completed cycle).
+    last_due_count: int = 0
+    last_hot_checked: int = 0
+    last_warm_checked: int = 0
+    last_zero_rechecked: int = 0
+    last_skipped_zero_balance: int = 0
+    last_hot_revisit_sec: float | None = None
     log: list[JobLogEntry] = Field(default_factory=list)
