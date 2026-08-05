@@ -89,8 +89,8 @@ type SortKey =
   | 'tokens_traded_7d'
 type AppPage = 'buyers' | 'migrations' | 'screener' | 'hvat' | 'watch' | 'followup' | 'settings'
 
-/** Visible nav tabs — migrations/watch stay mountable for session restore but are hidden. */
-const NAV_PAGES: AppPage[] = ['buyers', 'screener', 'hvat', 'followup', 'settings']
+/** Visible nav tabs — migrations/watch/settings stay mountable for session restore but are hidden. */
+const NAV_PAGES: AppPage[] = ['buyers', 'screener', 'hvat', 'followup']
 
 function normalizeAppPage(page: AppPage | undefined): AppPage {
   if (page && NAV_PAGES.includes(page)) return page
@@ -844,13 +844,6 @@ export default function App() {
         >
           Follow-up
         </button>
-        <button
-          type="button"
-          className={page === 'settings' ? 'nav-link active' : 'nav-link'}
-          onClick={() => setPage('settings')}
-        >
-          Настройки
-        </button>
       </nav>
 
       {/* Keep pages mounted so results survive tab switches */}
@@ -860,7 +853,7 @@ export default function App() {
       <div hidden={page !== 'screener'}>
         <ScreenerPage onUseInBuyers={useInBuyers} />
       </div>
-      {/* Hidden from nav: migrations / autoparse — pages kept for API parity */}
+      {/* Hidden from nav: migrations / autoparse / settings — pages kept for API parity */}
       <div hidden={page !== 'migrations'}>
         <MigrationsPage onParse={useInBuyers} />
       </div>
