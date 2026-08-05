@@ -83,7 +83,7 @@ type FollowupConfig = {
 }
 
 const DEFAULT_SCREEN: ScreenFiltersForm = {
-  min_liq: '',
+  min_liq: '500',
   max_liq: '',
   min_mcap: '',
   max_mcap: '',
@@ -91,10 +91,10 @@ const DEFAULT_SCREEN: ScreenFiltersForm = {
   min_traders: '',
   max_traders: '',
   min_pair_age_hours: '',
-  max_pair_age_hours: '',
+  max_pair_age_hours: '24',
   sort_by: 'liquidity',
   sort_order: 'desc',
-  max_results: '500',
+  max_results: '200',
   exclude_honeypots: true,
 }
 
@@ -169,7 +169,7 @@ export default function SettingsPage() {
         max_pair_age_hours: numToStr(cfg.screen.max_pair_age_hours),
         sort_by: cfg.screen.sort_by,
         sort_order: cfg.screen.sort_order,
-        max_results: String(cfg.screen.max_results || 500),
+        max_results: String(cfg.screen.max_results || 200),
         exclude_honeypots: cfg.screen.exclude_honeypots,
       })
       setWallet({
@@ -243,7 +243,7 @@ export default function SettingsPage() {
     setMsg('')
     setError('')
     try {
-      const maxResults = Math.min(2000, Math.max(1, Number(screen.max_results) || 500))
+      const maxResults = Math.min(2000, Math.max(1, Number(screen.max_results) || 200))
       const payload: WatchConfig = {
         ...baseWatch,
         screen: {

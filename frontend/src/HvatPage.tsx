@@ -197,7 +197,7 @@ type HvatStatus = {
 const PERIODS: TokensUniquePeriod[] = ['12h', '24h', '1d', '3d', '7d', '30d']
 
 const DEFAULT_SCREEN: ScreenForm = {
-  min_liq: '',
+  min_liq: '500',
   max_liq: '',
   min_mcap: '',
   max_mcap: '',
@@ -205,10 +205,10 @@ const DEFAULT_SCREEN: ScreenForm = {
   min_traders: '',
   max_traders: '',
   min_pair_age_hours: '',
-  max_pair_age_hours: '',
+  max_pair_age_hours: '24',
   sort_by: 'liquidity',
   sort_order: 'desc',
-  max_results: '500',
+  max_results: '200',
   exclude_honeypots: true,
 }
 
@@ -290,7 +290,7 @@ function cfgToScreen(cfg: WatchConfig): ScreenForm {
     max_pair_age_hours: numToStr(cfg.screen.max_pair_age_hours),
     sort_by: cfg.screen.sort_by || 'liquidity',
     sort_order: cfg.screen.sort_order || 'desc',
-    max_results: String(cfg.screen.max_results || 500),
+    max_results: String(cfg.screen.max_results || 200),
     exclude_honeypots: cfg.screen.exclude_honeypots !== false,
   }
 }
@@ -379,8 +379,8 @@ export default function HvatPage({ tabActive = true }: { tabActive?: boolean }) 
   const [globalAlert, setGlobalAlert] = useState<AlertForm>(DEFAULT_ALERT)
   const [selected, setSelected] = useState<string[]>([])
   const [focusAddr, setFocusAddr] = useState<string | null>(null)
-  const [maxTokensCycle, setMaxTokensCycle] = useState('20')
-  const [intervalMin, setIntervalMin] = useState('20')
+  const [maxTokensCycle, setMaxTokensCycle] = useState('15')
+  const [intervalMin, setIntervalMin] = useState('12')
   const [busy, setBusy] = useState(false)
   const [flash, setFlash] = useState('')
 
@@ -395,8 +395,8 @@ export default function HvatPage({ tabActive = true }: { tabActive?: boolean }) 
     if (h.config) {
       setScreen(cfgToScreen(h.config))
       setWallet(cfgToWallet(h.config))
-      setMaxTokensCycle(String(h.config.max_tokens_per_cycle || 20))
-      setIntervalMin(String(Math.max(1, Math.round((h.config.interval_sec || 1200) / 60))))
+      setMaxTokensCycle(String(h.config.max_tokens_per_cycle || 15))
+      setIntervalMin(String(Math.max(1, Math.round((h.config.interval_sec || 720) / 60))))
     }
     const gAlert = cfgToAlert(h.followup_config, h.profile)
     setGlobalAlert(gAlert)
@@ -503,9 +503,9 @@ export default function HvatPage({ tabActive = true }: { tabActive?: boolean }) 
     setBusy(true)
     setFlash('')
     try {
-      const mins = Math.max(1, Math.min(1440, Math.round(Number(intervalMin) || 20)))
+      const mins = Math.max(1, Math.min(1440, Math.round(Number(intervalMin) || 12)))
       const body = {
-        max_tokens_per_cycle: parseOpt(maxTokensCycle) ?? 20,
+        max_tokens_per_cycle: parseOpt(maxTokensCycle) ?? 15,
         interval_sec: mins * 60,
         sync_followup_mcap: false,
         screen: {
@@ -520,7 +520,7 @@ export default function HvatPage({ tabActive = true }: { tabActive?: boolean }) 
           max_pair_age_hours: parseOpt(screen.max_pair_age_hours),
           sort_by: screen.sort_by,
           sort_order: screen.sort_order,
-          max_results: parseOpt(screen.max_results) ?? 500,
+          max_results: parseOpt(screen.max_results) ?? 200,
           exclude_honeypots: screen.exclude_honeypots,
         },
         wallet: {

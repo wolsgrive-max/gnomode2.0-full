@@ -217,7 +217,8 @@ class IndexStatus(BaseModel):
 
 
 class WatchScreenFilters(BaseModel):
-    min_liq: float | None = None
+    # Defaults mirror live Хвать «фильтры токенов» (min liq / ATH / age / results).
+    min_liq: float | None = 500.0
     max_liq: float | None = None
     min_mcap: float | None = None
     max_mcap: float | None = None
@@ -227,11 +228,11 @@ class WatchScreenFilters(BaseModel):
     min_traders: float | None = None
     max_traders: float | None = None
     min_pair_age_hours: float | None = None
-    max_pair_age_hours: float | None = None
+    max_pair_age_hours: float | None = 24.0
     exclude_honeypots: bool = True
     sort_by: ScreenSortBy = ScreenSortBy.liquidity
     sort_order: ScreenSortOrder = ScreenSortOrder.desc
-    max_results: int = Field(default=500, ge=1, le=2000)
+    max_results: int = Field(default=200, ge=1, le=2000)
 
 
 class WatchWalletFilters(BaseModel):
@@ -248,7 +249,8 @@ class WatchWalletFilters(BaseModel):
 
 class WatchConfig(BaseModel):
     enabled: bool = False
-    interval_sec: int = Field(default=900, ge=60, le=86400)
+    # Default parse cadence from live Хвать token panel (12 min).
+    interval_sec: int = Field(default=720, ge=60, le=86400)
     # Keep modest — qualify hits Blockscout/RPC; prefer thorough over fast.
     max_tokens_per_cycle: int = Field(default=15, ge=1, le=2000)
     telegram_chat_id: str = ""
