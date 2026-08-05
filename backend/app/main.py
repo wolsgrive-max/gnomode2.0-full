@@ -81,6 +81,33 @@ async def index_status():
     return IndexStatus(**token_index.status())
 
 
+@app.get("/api/index/token/{address}")
+async def index_token_lookup(address: str, gecko: bool = False):
+    """Debug/ops: one indexed token's ATH + enrich state.
+
+    Pass ``gecko=1`` to force a Gecko OHLCV probe for this address.
+    """
+    key = address.strip().lower()
+    entry = token_index._tokens.get(key)
+    if entry is None:
+        return {"found": False, "address": key}
+    if gecko:
+        await token_index._apply_gecko_peaks([key], limit=1)
+    row = token_index.get_token(key)
+    return {
+        "found": True,
+        "address": key,
+        "dex": entry.dex,
+        "pool_address": entry.pool_address,
+        "created_block": entry.created_block,
+        "ath_mcap": entry.ath_mcap,
+        "gecko_ath_at": entry.gecko_ath_at,
+        "enriched_at": entry.enriched_at,
+        "first_seen": entry.first_seen,
+        "screened": row.model_dump() if row is not None else None,
+    }
+
+
 @app.post("/api/index/refresh", response_model=IndexStatus)
 async def index_refresh():
     # Fire-and-forget incremental refresh (no-op if one is already running).

@@ -246,10 +246,12 @@ async def discover_pools(rpc: RpcClient, token: str, *, deep: bool = False) -> l
         v4 = [p for p in pools if p.dex == "uniswap_v4"]
         pools = [p for p in enriched if p] + v4
 
+    # Liquidity first. Preferring USDG/WETH *before* liq picked dust V4 USDG
+    # pools over the real V3 WETH market (NASDANQ / axiomTrade early buys → 0).
     pools.sort(
         key=lambda p: (
-            _quote_rank(p.quote),
             -p.liquidity_usd,
+            _quote_rank(p.quote),
             {"uniswap_v3": 0, "uniswap_v2": 1, "uniswap_v4": 2}.get(p.dex, 9),
         )
     )
@@ -263,8 +265,14 @@ async def pick_best_pool(rpc: RpcClient, token: str) -> PoolInfo | None:
     if not pools:
         return None
     with_liq = [p for p in pools if p.liquidity_usd > 0]
-    preferred = [p for p in (with_liq or pools) if p.quote.lower() in QUOTE_TOKENS]
-    return (preferred or with_liq or pools)[0]
+    candidates = with_liq or pools
+    # Quote preference only among pools near the deepest book — never let a
+    # $400 USDG V4 beat a $45k WETH V3 just because USDG ranks higher.
+    best_liq = max(p.liquidity_usd for p in candidates)
+    floor = best_liq * 0.5 if best_liq > 0 else 0.0
+    competitive = [p for p in candidates if p.liquidity_usd >= floor] or candidates
+    preferred = [p for p in competitive if p.quote.lower() in QUOTE_TOKENS]
+    return (preferred or competitive)[0]
 
 
 async def estimate_start_block(rpc: RpcClient, pool: PoolInfo) -> int:

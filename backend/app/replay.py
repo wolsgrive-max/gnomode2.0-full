@@ -46,6 +46,31 @@ logger = logging.getLogger(__name__)
 
 ProgressCb = Callable[[str, str, float], Awaitable[None]]
 
+# Robinhood ≈ 10 blocks/sec. A brief pump above the early-mcap gate must not
+# permanently close the window — tokens often spike then dump (NASDANQ: ≥30k
+# for ~30s, then axiomTrade buys at ~18–28k ~1.6h later were missed).
+_MCAP_SUSTAINED_ABOVE_BLOCKS = 36_000  # ~1 hour continuous above threshold
+
+
+def _mcap_above_streak(
+    *,
+    mcap_now: float,
+    threshold: float,
+    block: int,
+    above_since: int | None,
+) -> tuple[bool, int | None]:
+    """Sticky-stop only after a sustained above-threshold stretch.
+
+    Returns ``(stop_window, new_above_since)``. Under threshold reopens the
+    early-buyer window (``above_since=None``).
+    """
+    if mcap_now < threshold:
+        return False, None
+    started = block if above_since is None else above_since
+    if block - started >= _MCAP_SUSTAINED_ABOVE_BLOCKS:
+        return True, started
+    return False, started
+
 
 @dataclass
 class BuyEvent:
@@ -1192,6 +1217,7 @@ async def _replay_v3(
     early_swaps: list[Any] = []
     stop_block = start_block
     crossed = False
+    above_since: int | None = None
     cursor = start_block
     total = max(end_block - start_block + 1, 1)
     prev_sqrt: int | None = None
@@ -1240,21 +1266,26 @@ async def _replay_v3(
                 prev_sqrt=prev_sqrt,
             )
             prev_sqrt = sqrt_price
+            block = _log_block(log)
             token_delta = amount0 if token_is_token0 else amount1
             # V3 pool delta: negative token ⇒ tokens left the pool ⇒ buy
             is_buy = token_delta < 0
+            stop, above_since = _mcap_above_streak(
+                mcap_now=mcap_now,
+                threshold=mcap_threshold,
+                block=block,
+                above_since=above_since,
+            )
+            if stop:
+                crossed = True
+                stop_block = block
+                break
             if not is_buy:
-                if mcap_now >= mcap_threshold:
-                    crossed = True
-                    stop_block = _log_block(log)
-                    break
                 continue
             if mcap_now >= mcap_threshold:
-                crossed = True
-                stop_block = _log_block(log)
-                break
+                continue
             early_swaps.append(log)
-            stop_block = _log_block(log)
+            stop_block = block
 
         if crossed:
             break
@@ -1384,6 +1415,7 @@ async def _replay_v4(
     early_swaps: list[Any] = []
     stop_block = start_block
     crossed = False
+    above_since: int | None = None
     cursor = start_block
     total = max(end_block - start_block + 1, 1)
     prev_sqrt: int | None = None
@@ -1438,18 +1470,23 @@ async def _replay_v4(
             # positive token amount ⇒ wallet received tokens ⇒ buy.
             token_delta = amount0 if token_is_token0 else amount1
             is_buy = token_delta > 0
+            block = _log_block(log)
+            stop, above_since = _mcap_above_streak(
+                mcap_now=mcap_now,
+                threshold=mcap_threshold,
+                block=block,
+                above_since=above_since,
+            )
+            if stop:
+                crossed = True
+                stop_block = block
+                break
             if not is_buy:
-                if mcap_now >= mcap_threshold:
-                    crossed = True
-                    stop_block = _log_block(log)
-                    break
                 continue
             if mcap_now >= mcap_threshold:
-                crossed = True
-                stop_block = _log_block(log)
-                break
+                continue
             early_swaps.append(log)
-            stop_block = _log_block(log)
+            stop_block = block
 
         if crossed:
             break

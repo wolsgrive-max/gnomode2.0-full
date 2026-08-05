@@ -454,6 +454,12 @@ class WatchRunner:
             raise _WatchStopped()
 
         screen_req = ScreenRequest(**screen.model_dump())
+        # ATH gate must NOT hard-filter the screener for watch: dumped pumps keep
+        # DexScreener spot ATH below min_ath (MEATSPIN ~$16k after ~$148k peak)
+        # and would never reach hold / young ATH-probe / classify. Manual screen
+        # UI still applies min_ath via _passes_primary.
+        if ath_gate_enabled(cfg.screen.min_ath_mcap):
+            screen_req = screen_req.model_copy(update={"min_ath_mcap": None})
         screen_task = asyncio.create_task(
             screen_tokens(screen_req, on_progress=on_progress)
         )

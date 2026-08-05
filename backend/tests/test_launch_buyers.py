@@ -44,16 +44,23 @@ def test_launch_token_is_buy_not_airdrop() -> None:
 def test_creator_launch_is_not_buy() -> None:
     """Bare pad ``launch`` / creator selectors = token create, not market buy."""
     meme_v2_sel = "0xbf388406"  # MemeLaunchV2; MemeCreatorInitialBuyV2
+    new_token_v6 = "0x8cb5772c"  # newTokenV6 create+embedded firstBuy
     assert method_is_creator_launch("launch") is True
     assert method_is_creator_launch(GUH_SEL) is True
     assert method_is_creator_launch("0x75154d70deadbeef") is True
     assert method_is_creator_launch(meme_v2_sel) is True
+    assert method_is_creator_launch("newTokenV6") is True
+    assert method_is_creator_launch(new_token_v6) is True
     assert method_is_launch_buy("launch") is False
     assert method_is_launch_buy(GUH_SEL) is False
     assert method_is_launch_buy(meme_v2_sel) is False
+    assert method_is_launch_buy("newTokenV6") is False
+    assert method_is_launch_buy(new_token_v6) is False
     assert method_is_non_buy("launch") is True
     assert method_is_non_buy(GUH_SEL) is True
     assert method_is_non_buy(meme_v2_sel) is True
+    assert method_is_non_buy("newTokenV6") is True
+    assert method_is_non_buy(new_token_v6) is True
     # launcher / launchpad noise
     assert method_is_launch_buy("launcher") is False
     assert method_is_launch_buy("launchpad") is False

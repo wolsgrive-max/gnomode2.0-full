@@ -20,6 +20,7 @@ def _entry(
     gecko_at: float = 0.0,
     pair_age_h: float | None = 2.0,
     first_seen: float | None = None,
+    liquidity_usd: float = 1_000.0,
 ) -> TokenEntry:
     return TokenEntry(
         address=addr,
@@ -36,7 +37,7 @@ def _entry(
             market_cap=ath,
             ath_mcap=ath,
             pair_age_hours=pair_age_h,
-            liquidity_usd=1_000.0,
+            liquidity_usd=liquidity_usd,
         ),
     )
 
@@ -102,6 +103,69 @@ async def test_young_never_probed_beats_old_never_probed():
     assert probed[0] == young.address.lower()
     assert young.ath_mcap == 523_000.0
     assert young.gecko_ath_at > 0
+
+
+@pytest.mark.asyncio
+async def test_young_liquid_beats_newer_dust_never_probed():
+    """MEATSPIN-class miss: mid-age liquid dump before newest V4 dust."""
+    idx = TokenIndex()
+    meat = _entry(
+        "0xMeatspin",
+        block=100,
+        ath=16_570.0,
+        gecko_at=0.0,
+        pair_age_h=20.0,
+        liquidity_usd=11_000.0,
+    )
+    dust = [
+        _entry(
+            f"0xDust{i:02d}",
+            block=10_000_000 + i,
+            ath=50.0,
+            gecko_at=0.0,
+            pair_age_h=0.2,
+            liquidity_usd=5.0,
+        )
+        for i in range(20)
+    ]
+    # Already DS-ATH≥50k liquid — must not steal the first slot from under-gate.
+    fat = _entry(
+        "0xAlreadyFat",
+        block=9_000_000,
+        ath=200_000.0,
+        gecko_at=0.0,
+        pair_age_h=22.0,
+        liquidity_usd=80_000.0,
+    )
+    # Newer under-gate liquid with higher liq — older under-gate must still win.
+    newer_liq = _entry(
+        "0xNewerLiq",
+        block=8_000_000,
+        ath=10_000.0,
+        gecko_at=0.0,
+        pair_age_h=2.0,
+        liquidity_usd=40_000.0,
+    )
+    idx._tokens[meat.address.lower()] = meat
+    idx._tokens[fat.address.lower()] = fat
+    idx._tokens[newer_liq.address.lower()] = newer_liq
+    for e in dust:
+        idx._tokens[e.address.lower()] = e
+
+    probed: list[str] = []
+
+    async def fake_fetch(token: str, pool=None):
+        probed.append(token.lower())
+        return GeckoAthResult(token=token.lower(), ath_mcap=148_000.0, pool=pool or "")
+
+    addrs = [e.address for e in dust] + [meat.address, fat.address, newer_liq.address]
+    with patch("app.ath_gecko.fetch_token_ath_mcap", new=AsyncMock(side_effect=fake_fetch)):
+        with patch("app.token_index.asyncio.sleep", new=AsyncMock()):
+            n = await idx._apply_gecko_peaks(addrs, limit=4)
+
+    assert n == 4
+    assert probed[0] == meat.address.lower()
+    assert meat.ath_mcap == 148_000.0
 
 
 @pytest.mark.asyncio

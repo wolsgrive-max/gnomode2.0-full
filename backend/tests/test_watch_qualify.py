@@ -30,6 +30,49 @@ def _tok(
     )
 
 
+def test_dump_after_pump_held_not_dropped():
+    """MEATSPIN-class: DS spot ATH < gate must enter hold (not vanish)."""
+    screened = [
+        _tok("0xMeat", mcap=15_690, ath=15_690, symbol="MEATSPIN", pair_age_hours=20.0)
+    ]
+    d = classify_for_parse(
+        screened,
+        min_ath_mcap=50_000,
+        hold={},
+        parsed={},
+        index_addresses={"0xmeat"},
+        now=100.0,
+        max_pair_age_hours=24.0,
+    )
+    assert d.candidates == []
+    assert "0xmeat" in d.held
+    assert d.ath_updates["0xmeat"][0] == 15_690.0
+
+
+def test_dump_after_pump_promotes_when_gecko_peak_in_hold():
+    screened = [
+        _tok("0xMeat", mcap=15_690, ath=15_690, symbol="MEATSPIN", pair_age_hours=20.0)
+    ]
+    hold = {
+        "0xmeat": {
+            "first_seen": 1.0,
+            "ath_mcap": 148_000.0,
+            "symbol": "MEATSPIN",
+        }
+    }
+    d = classify_for_parse(
+        screened,
+        min_ath_mcap=50_000,
+        hold=hold,
+        parsed={},
+        index_addresses={"0xmeat"},
+        now=100.0,
+        max_pair_age_hours=24.0,
+    )
+    assert "0xmeat" in d.candidates
+    assert d.ath_updates["0xmeat"][0] == 148_000.0
+
+
 def test_ath_gate_enabled():
     assert ath_gate_enabled(50_000) is True
     assert ath_gate_enabled(None) is False

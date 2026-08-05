@@ -54,11 +54,14 @@ _LAUNCH_BUY_SELECTORS = frozenset(
     }
 )
 # Creator pad ``launch(params, configId, firstBuyIn, …)`` — create, not a buy.
-_CREATOR_LAUNCH_METHODS = frozenset({"launch"})
+# Also ``newTokenV6`` factories: wallet is the token creator; GMGN may still
+# label the embedded firstBuy as «Покупка» (Хвать must not ingest creators).
+_CREATOR_LAUNCH_METHODS = frozenset({"launch", "newtokenv6"})
 _CREATOR_LAUNCH_SELECTORS = frozenset(
     {
         "0x75154d70",  # GUH-style launch((…),uint256,uint256,uint256,bytes32)
         "0xbf388406",  # MemeLaunchV2 launch((string,string,…)); MemeCreatorInitialBuyV2
+        "0x8cb5772c",  # newTokenV6((string,string,…)) — Prism-style create+firstBuy
     }
 )
 

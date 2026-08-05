@@ -58,9 +58,13 @@ _REFRESH_SLICE = 30 * _ENRICH_BATCH
 # Newest never-enriched tokens to enrich before declaring cold_started.
 # Enough for screener max_results + ATH hold; rest continues in-background.
 _COLD_READY_NEW = 1_200
-# While a parse job is active, only enrich brand-new tokens (few) and skip the
-# stale-refresh so the parser gets the RPC/HTTP budget.
-_BUSY_SLICE = 0
+# Incremental cycles must CAP never-enriched work. Unlimited newest-first
+# enrich is starved by endless V4 spam — mid-age liquid tokens (ATH≥gate)
+# stay screened=None forever and never reach watch/Хвать.
+_INCREMENTAL_NEW_LIMIT = 300
+# While a manual parse job is active: skip getLogs + stale refresh, but still
+# enrich a small newest+stride slice so the ATH queue does not freeze.
+_BUSY_NEW_LIMIT = 90
 # Hot-set: frequent DexScreener ATH samples for liquid indexed tokens.
 _HOT_ENRICH_INTERVAL_S = 120
 _HOT_ENRICH_CAP = 120
@@ -68,7 +72,7 @@ _HOT_MIN_LIQ_USD = 4_000.0
 # Gecko OHLCV peaks (rate-limited); run after DS enrich on new/hot tokens.
 # Keep small (Gecko 429s), but young never-probed must win the queue —
 # otherwise a $500k wick dumps to $2k DS spot before we ever OHLCV-probe.
-_GECKO_BATCH_LIMIT = 16
+_GECKO_BATCH_LIMIT = 24
 _GECKO_RETRY_S = 20 * 60.0
 # Young tokens still inside the watch max-age window: retry failed/zero ATH
 # probes quickly so a brief pump is not permanently missed after a dump.
@@ -84,6 +88,52 @@ def _entry_is_young(entry: "TokenEntry", now: float | None = None) -> bool:
     if entry.first_seen > 0:
         return (ts - entry.first_seen) <= _GECKO_YOUNG_AGE_H * 3600.0
     return False
+
+
+def _select_never_enriched(
+    new_tokens: list["TokenEntry"], new_limit: int
+) -> list["TokenEntry"]:
+    """Pick a never-enriched slice that covers newest, oldest, and mid-age.
+
+    ``new_tokens`` must be sorted newest-first (``-created_block``).
+    """
+    if new_limit <= 0:
+        return []
+    if len(new_tokens) <= new_limit:
+        return list(new_tokens)
+    n_new = max(1, new_limit // 3)
+    n_old = max(1, new_limit // 3)
+    n_mid = max(0, new_limit - n_new - n_old)
+    head = new_tokens[:n_new]
+    oldest = new_tokens[-n_old:] if n_old else []
+    # Middle band: everything not already taken as newest/oldest.
+    rest_end = len(new_tokens) - n_old if n_old else len(new_tokens)
+    rest = new_tokens[n_new:rest_end]
+    mid: list[TokenEntry] = []
+    if n_mid > 0 and rest:
+        step = max(1, len(rest) // n_mid)
+        mid = rest[::step][:n_mid]
+    chosen: list[TokenEntry] = []
+    seen: set[str] = set()
+    for e in head + oldest + mid:
+        key = e.address.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        chosen.append(e)
+        if len(chosen) >= new_limit:
+            break
+    # Fill leftover slots newest-first if dedupe shrank the set.
+    if len(chosen) < new_limit:
+        for e in new_tokens:
+            key = e.address.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            chosen.append(e)
+            if len(chosen) >= new_limit:
+                break
+    return chosen
 
 
 def _topic_addr(topic: Any) -> str:
@@ -378,18 +428,12 @@ class TokenIndex:
         new_tokens.sort(key=lambda e: -e.created_block)
         stale.sort(key=lambda e: e.enriched_at)  # oldest metrics first
         if new_limit is not None and len(new_tokens) > new_limit:
-            # Cover the whole 24h window: newest half + stride across the rest.
-            # Pure newest-only misses older liquid ATH≥threshold tokens.
-            head_n = max(1, new_limit // 2)
-            head = new_tokens[:head_n]
-            rest = new_tokens[head_n:]
-            need = new_limit - len(head)
-            if need > 0 and rest:
-                step = max(1, len(rest) // need)
-                tail = rest[::step][:need]
-                new_tokens = head + tail
-            else:
-                new_tokens = head
+            # Cover the whole 24h window under continuous V4 create spam:
+            # newest + oldest + stride through the middle. Newest-only leaves
+            # mid-age liquid dumps (MEATSPIN) at screened=None forever; pure
+            # stride can reshuffle and re-miss the same addresses as the
+            # front of the queue grows.
+            new_tokens = _select_never_enriched(new_tokens, new_limit)
         elif new_limit is not None:
             new_tokens = new_tokens[: max(0, new_limit)]
         if stale_limit is not None:
@@ -535,10 +579,42 @@ class TokenIndex:
             if not self.cold_started:
                 self.building = True
             parse_busy = self._parse_active()
+            # Cold tail still draining screened=None — skip competing scan/DS
+            # enrich (DexScreener budget), but keep a Gecko slice so liquid
+            # under-gate dumps (MEATSPIN) are not stuck at DS-spot ATH for the
+            # whole multi-minute tail.
+            if self._cold_tail_busy() and not cold:
+                logger.info("cold tail busy — gecko-only slice this cycle")
+                busy_gecko = self._gecko_refresh_candidates()
+                if busy_gecko:
+                    await self._apply_gecko_peaks(
+                        busy_gecko,
+                        limit=min(8, _GECKO_BATCH_LIMIT),
+                    )
+                return
             if parse_busy and not cold:
-                # Yield the entire RPC budget to the wallet parser — skip both
-                # the getLogs scan and stale enrichment while a parse is running.
-                logger.info("parse job active — skipping index scan/enrich this cycle")
+                # Still scan factories so pools created during a multi-hour
+                # parse enter `_tokens` (enrich alone cannot discover them).
+                # Skip stale re-enrich; keep a small newest/oldest/mid slice so
+                # mid-age ATH tokens are not frozen for the whole parse. Also
+                # keep a small Gecko slice (liq-first) — without it, dumped
+                # pumps stay at DS-spot ATH and never pass watch's min_ath.
+                logger.info(
+                    "parse job active — scan + busy-slice enrich (skip stale)"
+                )
+                await self.scan_new_pools(full=False, on_progress=on_progress)
+                self._prune()
+                await self.enrich_pending(
+                    stale_limit=0,
+                    new_limit=_BUSY_NEW_LIMIT,
+                    progress_label="Busy-slice enrich",
+                )
+                busy_gecko = self._gecko_refresh_candidates()
+                if busy_gecko:
+                    await self._apply_gecko_peaks(
+                        busy_gecko,
+                        limit=min(8, _GECKO_BATCH_LIMIT),
+                    )
                 return
             await self.scan_new_pools(full=cold, on_progress=on_progress)
             self._prune()
@@ -573,8 +649,12 @@ class TokenIndex:
                     )
                 self._schedule_cold_tail(gecko_candidates)
             else:
+                # Cap + stride (inside enrich_pending): pure newest-only never
+                # reaches mid-age liquid pools under V4 create spam.
                 await self.enrich_pending(
-                    stale_limit=_REFRESH_SLICE, on_progress=on_progress
+                    stale_limit=_REFRESH_SLICE,
+                    new_limit=_INCREMENTAL_NEW_LIMIT,
+                    on_progress=on_progress,
                 )
                 if gecko_candidates:
                     await self._apply_gecko_peaks(
@@ -605,16 +685,21 @@ class TokenIndex:
                 stale_limit=0,
                 progress_label="Cold remaining enrich",
             )
-            pending_gecko = [
-                k
-                for k in gecko_candidates
-                if (e := self._tokens.get(k)) is not None and e.gecko_ath_at <= 0.0
-            ]
+            # Recompute after enrich — first-wave snapshot misses tokens that
+            # only gained screened/liq in the tail (MEATSPIN-class).
+            pending_gecko = self._gecko_refresh_candidates()
+            if not pending_gecko:
+                pending_gecko = [
+                    k
+                    for k in gecko_candidates
+                    if (e := self._tokens.get(k)) is not None and e.gecko_ath_at <= 0.0
+                ]
             if pending_gecko:
                 # Keep Gecko light: hot-enrich loop densifies ATH later.
+                # Ranking (needs_gate / oldest-young) picks liquid dumps first.
                 await self._apply_gecko_peaks(
                     pending_gecko,
-                    limit=min(20, _GECKO_BATCH_LIMIT),
+                    limit=min(32, max(_GECKO_BATCH_LIMIT, 20)),
                 )
             self.last_refresh_ts = time.time()
             logger.info(
@@ -712,11 +797,12 @@ class TokenIndex:
         from .ath_gecko import fetch_token_ath_mcap
 
         now = time.time()
-        # Sort: young never-probed first (newest pools), then young retries,
-        # then old never-probed, then old retries. Without this, thousands of
-        # never-probed share the same score and a short-lived ATH pump can sit
-        # behind the Gecko queue forever while ath_mcap stays at DS spot.
-        ranked: list[tuple[int, float, str]] = []
+        # Sort: young never-probed first, then young retries, then old
+        # never-probed, then old retries. Within young+never, prefer *liquid*
+        # pools over newest-created — V4 spam would otherwise monopolize the
+        # Gecko budget while a mid-age dumped pump (MEATSPIN: DS spot ~16k,
+        # real ATH ~148k) sits at gecko_ath_at=0 forever and fails ATH≥50k.
+        ranked: list[tuple[int, float, float, str]] = []
         for raw in addresses:
             key = raw.strip().lower()
             entry = self._tokens.get(key)
@@ -736,17 +822,44 @@ class TokenIndex:
                 tier = 2
             else:
                 tier = 3
-            # Newest pools / longest-overdue probes first within a tier.
-            secondary = (
-                -float(entry.created_block or 0) if never else -age
+            liq = float(entry.screened.liquidity_usd) if entry.screened else 0.0
+            age_h = (
+                float(entry.screened.pair_age_hours)
+                if entry.screened is not None and entry.screened.pair_age_hours is not None
+                else 0.0
             )
-            ranked.append((tier, secondary, key))
+            if never:
+                # Liquid + DS-spot still under the typical watch ATH gate must
+                # win over already-passing tokens and V4 dust (MEATSPIN class).
+                # Within that set, oldest-young first — about to leave the 24h
+                # window — then higher liq.
+                needs_gate = (
+                    0
+                    if (
+                        entry.screened is not None
+                        and liq >= _HOT_MIN_LIQ_USD
+                        and float(entry.ath_mcap or 0.0) < 50_000.0
+                    )
+                    else 1
+                )
+                ranked.append(
+                    (
+                        tier,
+                        needs_gate,
+                        -age_h,
+                        -liq,
+                        -float(entry.created_block or 0),
+                        key,
+                    )
+                )
+            else:
+                ranked.append((tier, 0, -age, -liq, 0.0, key))
         ranked.sort()
         # Young fills the whole batch first; only spill leftover slots to older
         # tokens. A deep young queue must not lose slots to stale never-probed.
         lim = max(0, limit)
-        young_keys = [k for t, _, k in ranked if t <= 1]
-        other_keys = [k for t, _, k in ranked if t >= 2]
+        young_keys = [k for t, *_rest, k in ranked if t <= 1]
+        other_keys = [k for t, *_rest, k in ranked if t >= 2]
         keys = young_keys[:lim]
         if len(keys) < lim:
             keys.extend(other_keys[: lim - len(keys)])
