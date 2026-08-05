@@ -90,13 +90,13 @@ def _remote_screen_payload(
     force_enrich_addresses: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build POST /api/screen body compatible with truegnomode donor defaults."""
-    payload = req.model_dump(exclude_none=True)
+    payload = req.model_dump(mode="json", exclude_none=True)
     # Production truegnomode path — never ask for legacy LITE quality screen.
     payload["screen_pipeline_mode"] = "donor"
     if force_enrich_addresses:
-        payload["force_enrich_addresses"] = [
-            a for a in force_enrich_addresses if a and str(a).strip()
-        ]
+        cleaned = [str(a).strip() for a in force_enrich_addresses if a and str(a).strip()]
+        if cleaned:
+            payload["force_enrich_addresses"] = cleaned
     return payload
 
 

@@ -47,7 +47,7 @@ def test_remote_screen_payload_forces_donor_mode() -> None:
     )
     assert payload["screen_pipeline_mode"] == "donor"
     assert payload["min_liq"] == 100
-    assert payload["force_enrich_addresses"] == [" 0xAbc "]
+    assert payload["force_enrich_addresses"] == ["0xAbc"]
 
 
 @pytest.mark.asyncio

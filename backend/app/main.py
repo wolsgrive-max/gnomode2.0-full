@@ -117,11 +117,14 @@ async def index_refresh():
 
 @app.get("/api/health")
 async def health():
+    from .screener_feed import using_remote_screener
+
     return {
         "ok": True,
         "chain_id": 4663,
         "rpc_url": settings.rpc_url.split("/v2/")[0] if "/v2/" in settings.rpc_url else settings.rpc_url,
         "mcap_threshold": settings.mcap_threshold,
+        "screener_feed": "truegnomode" if using_remote_screener() else "local",
     }
 
 
