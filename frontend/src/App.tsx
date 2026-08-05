@@ -89,6 +89,14 @@ type SortKey =
   | 'tokens_traded_7d'
 type AppPage = 'buyers' | 'migrations' | 'screener' | 'hvat' | 'watch' | 'followup' | 'settings'
 
+/** Visible nav tabs — migrations/watch stay mountable for session restore but are hidden. */
+const NAV_PAGES: AppPage[] = ['buyers', 'screener', 'hvat', 'followup', 'settings']
+
+function normalizeAppPage(page: AppPage | undefined): AppPage {
+  if (page && NAV_PAGES.includes(page)) return page
+  return 'buyers'
+}
+
 type WalletFilters = {
   min_wallet_balance_eth: string
   max_wallet_balance_eth: string
@@ -788,7 +796,7 @@ function EarlyBuyersPage({
 
 export default function App() {
   const appRestored = useMemo(() => loadJson<AppSession>(APP_SESSION_KEY), [])
-  const [page, setPage] = useState<AppPage>(appRestored?.page ?? 'buyers')
+  const [page, setPage] = useState<AppPage>(() => normalizeAppPage(appRestored?.page))
   const [buyerInput, setBuyerInput] = useState(appRestored?.buyerInput ?? '')
 
   useEffect(() => {
@@ -810,17 +818,10 @@ export default function App() {
       <nav className="page-nav" aria-label="Главное меню">
         <button
           type="button"
-          className={page === 'migrations' ? 'nav-link active' : 'nav-link'}
-          onClick={() => setPage('migrations')}
-        >
-          Миграции
-        </button>
-        <button
-          type="button"
           className={page === 'buyers' ? 'nav-link active' : 'nav-link'}
           onClick={() => setPage('buyers')}
         >
-          Кошельки
+          Early buyers
         </button>
         <button
           type="button"
@@ -835,13 +836,6 @@ export default function App() {
           onClick={() => setPage('hvat')}
         >
           Хвать
-        </button>
-        <button
-          type="button"
-          className={page === 'watch' ? 'nav-link active' : 'nav-link'}
-          onClick={() => setPage('watch')}
-        >
-          Автопарс
         </button>
         <button
           type="button"
@@ -866,6 +860,7 @@ export default function App() {
       <div hidden={page !== 'screener'}>
         <ScreenerPage onUseInBuyers={useInBuyers} />
       </div>
+      {/* Hidden from nav: migrations / autoparse — pages kept for API parity */}
       <div hidden={page !== 'migrations'}>
         <MigrationsPage onParse={useInBuyers} />
       </div>
