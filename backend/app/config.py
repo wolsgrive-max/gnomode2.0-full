@@ -60,5 +60,13 @@ class Settings(BaseSettings):
     raybot_base_url: str = "https://webapi.raybot.app"
     raybot_webhook_auth: str = ""
 
+    # External token screener (Theseusure/truegnomode). Empty = local token_index
+    # screener. When set, watch/Хвать consumes POST/GET /api/screen from that API
+    # and does not rewrite truegnomode internals.
+    # Example: http://127.0.0.1:8001  or  http://host.docker.internal:8001
+    truegnomode_screener_url: str = ""
+    truegnomode_screen_timeout_sec: float = 180.0
+    truegnomode_poll_interval_sec: float = 0.5
+
 
 settings = Settings()

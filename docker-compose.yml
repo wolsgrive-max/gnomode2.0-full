@@ -5,6 +5,14 @@ services:
       - "${PORT:-8000}:8000"
     env_file:
       - .env
+    # Token feed for watch/Хвать:
+    # - default: local screener inside this container
+    # - optional: set TRUEGNOMODE_SCREENER_URL to a running truegnomode API
+    #   (https://github.com/Theseusure/truegnomode), e.g.
+    #   TRUEGNOMODE_SCREENER_URL=http://host.docker.internal:8001
+    #   Do not rewrite truegnomode — only consume POST/GET /api/screen.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       # Persist watch config / seen / state / ATH hold across restarts
       - ./backend/app/data:/app/backend/app/data

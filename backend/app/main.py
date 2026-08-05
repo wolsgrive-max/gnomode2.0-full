@@ -125,6 +125,23 @@ async def health():
     }
 
 
+@app.get("/api/screener-feed")
+async def screener_feed_status():
+    """Which token source watch/Хвать uses (local vs truegnomode)."""
+    from .screener_feed import truegnomode_base_url, using_remote_screener
+
+    remote = using_remote_screener()
+    return {
+        "source": "truegnomode" if remote else "local",
+        "truegnomode_screener_url": truegnomode_base_url() or None,
+        "screen_endpoint": (
+            f"{truegnomode_base_url()}/api/screen" if remote else "/api/screen (local)"
+        ),
+        "timeout_sec": settings.truegnomode_screen_timeout_sec,
+        "poll_interval_sec": settings.truegnomode_poll_interval_sec,
+    }
+
+
 @app.get("/api/migrations", response_model=MigrationResponse)
 async def migrations(
     launchpads: str = "pons,flap",

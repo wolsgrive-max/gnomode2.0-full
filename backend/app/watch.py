@@ -19,7 +19,7 @@ from .models import (
     WatchStatus,
 )
 from .replay import parse_token
-from .screener import screen_tokens
+from .screener_feed import fetch_screened_tokens, using_remote_screener
 from .telegram import resolve_chat_id, resolve_topic_id, send_buyers, telegram_configured
 from .token_index import token_index
 from .watch_qualify import (
@@ -460,8 +460,26 @@ class WatchRunner:
         # UI still applies min_ath via _passes_primary.
         if ath_gate_enabled(cfg.screen.min_ath_mcap):
             screen_req = screen_req.model_copy(update={"min_ath_mcap": None})
+        # Catch-up: ask truegnomode donor to force-enrich hold addresses (local
+        # path still refreshes via token_index in _catchup_refresh_hold).
+        force_enrich: list[str] | None = None
+        if catchup and using_remote_screener():
+            hold_addrs = list(self._store.load_hold().keys())
+            if hold_addrs:
+                force_enrich = hold_addrs
+        remote = using_remote_screener()
+        if remote:
+            self._append_log(
+                "screen",
+                f"Источник токенов: truegnomode ({settings.truegnomode_screener_url})",
+                percent=6,
+            )
         screen_task = asyncio.create_task(
-            screen_tokens(screen_req, on_progress=on_progress)
+            fetch_screened_tokens(
+                screen_req,
+                on_progress=on_progress,
+                force_enrich_addresses=force_enrich,
+            )
         )
         stop_task = asyncio.create_task(_stop_waiter())
         try:
@@ -515,12 +533,20 @@ class WatchRunner:
                 min_ath=float(min_ath),
                 max_pair_age_hours=max_pair_age,
             )
+        # Remote donor screen has no shared local index membership. Rely on
+        # hold TTL only so filtered-out tokens are not expired after 1h.
+        if gate_on and using_remote_screener():
+            index_addrs = None
+        elif gate_on:
+            index_addrs = token_index.known_addresses()
+        else:
+            index_addrs = None
         decision = classify_for_parse(
             screened,
             min_ath_mcap=min_ath,
             hold=hold_snapshot,
             parsed=parsed_at,
-            index_addresses=token_index.known_addresses() if gate_on else None,
+            index_addresses=index_addrs,
             now=now,
             max_pair_age_hours=max_pair_age,
         )
@@ -950,6 +976,15 @@ class WatchRunner:
             return
         if self._stop_requested:
             raise _WatchStopped()
+        # Remote path: force_enrich_addresses is sent with the truegnomode screen job.
+        if using_remote_screener():
+            hold_n = self._store.hold_count()
+            self._append_log(
+                "catchup",
+                f"Догон: truegnomode force-enrich hold ({hold_n} ток.) на screen-job",
+                percent=3,
+            )
+            return
         self._last_message = "Догон: прогрев индекса…"
         self._append_log("catchup", self._last_message, percent=2)
         await token_index.ensure_ready(on_progress=on_progress)
