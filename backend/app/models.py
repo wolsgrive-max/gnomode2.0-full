@@ -402,6 +402,12 @@ class FollowupConfig(BaseModel):
     safety_reconcile_sec: int = Field(default=120, ge=30, le=3600)
     # Max hot wallets touched by one safety-reconcile pass.
     safety_reconcile_max: int = Field(default=12, ge=1, le=64)
+    # Short TTL for GMGN unique-buy cache used by logwatch rank checks.
+    gmgn_rank_cache_ttl_sec: float = Field(default=60.0, ge=5.0, le=600.0)
+    # Pages for rank / repair fetches (accuracy > speed when numbering #2..#5).
+    gmgn_rank_max_pages: int = Field(default=3, ge=1, le=10)
+    # Opportunistic GMGN sync batch for undercounted watching wallets.
+    gmgn_repair_batch: int = Field(default=8, ge=0, le=64)
     # After this many consecutive logwatch hard-failures, mark degraded and
     # fall back to legacy GMGN/Blockscout. Soft getLogs timeouts do not count.
     # Default 3 absorbs single Alchemy blips without DEGRADED spam.

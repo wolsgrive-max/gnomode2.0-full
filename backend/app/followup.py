@@ -29,6 +29,7 @@ from .gmgn_portfolio import GmgnBuy, UniqueBuysResult, fetch_unique_buys
 from .models import (
     BuyerRow,
     FollowupConfig,
+    FollowupDealRow,
     FollowupStatus,
     JobLogEntry,
     WalletAlertFilters,
@@ -167,6 +168,48 @@ def deal_is_fresh_for_alert(
         if lag > block_limit:
             return False
     return True
+
+
+@dataclass(frozen=True)
+class GmgnRankVerdict:
+    """GMGN post-seed rank for a (wallet, token) seen on logwatch."""
+
+    uncertain: bool
+    reason: str
+    seed_token: str
+    post_seed: tuple[GmgnBuy, ...]
+    rank: int | None  # 2-based when token is in post_seed
+    past_max: bool  # post-seed already fills follow-up window
+
+
+def post_seed_unique_buys(
+    buys: list[GmgnBuy],
+    seed_token: str,
+) -> tuple[GmgnBuy | None, list[GmgnBuy]]:
+    """Split GMGN unique buys into (seed_buy, post-seed oldest→newest)."""
+    seed_l = (seed_token or "").strip().lower()
+    if not seed_l:
+        return None, []
+    seed_buy = next(
+        (
+            b
+            for b in buys
+            if b.token.lower() == seed_l and float(b.timestamp or 0) > 0
+        ),
+        None,
+    )
+    if seed_buy is None:
+        return None, []
+    seed_ts = float(seed_buy.timestamp)
+    post = [
+        b
+        for b in buys
+        if b.token
+        and b.token.lower() != seed_l
+        and b.token.lower() not in QUOTE_TOKENS
+        and float(b.timestamp or 0) > seed_ts
+    ]
+    return seed_buy, post
 
 
 def order_deals_for_alerts(
@@ -451,6 +494,8 @@ class FollowupRunner:
         self._last_live_success_ts: float = 0.0
         # Fresh deals missing mcap — retried every live tick (not every 60s).
         self._mcap_micro_retry: list[tuple[str, str, float]] = []
+        # Short-TTL GMGN unique-buy cache for logwatch rank (wallet → (ts, result)).
+        self._gmgn_rank_cache: dict[str, tuple[float, UniqueBuysResult]] = {}
         self._log: list[JobLogEntry] = []
 
     def _append_log(self, stage: str, message: str, *, percent: float = 0.0) -> None:
@@ -900,6 +945,17 @@ class FollowupRunner:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Follow-up safety reconcile: %s", exc)
                 self._append_log("reconcile", f"ошибка: {exc}")
+
+        if not self._stop_requested:
+            try:
+                await asyncio.wait_for(
+                    self._repair_undercounted_wallets(cfg, rpc=rpc),
+                    timeout=35.0,
+                )
+            except asyncio.TimeoutError:
+                self._append_log("repair", "GMGN repair прерван по бюджету 35s")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Follow-up GMGN repair: %s", exc)
 
         if (
             cfg.logwatch_enabled
@@ -2691,6 +2747,242 @@ class FollowupRunner:
             fetch_timeout = min(fetch_timeout, 18.0)
         return last
 
+    async def _fetch_unique_buys_cached(
+        self,
+        wallet: str,
+        *,
+        cfg: FollowupConfig,
+        max_pages: int | None = None,
+    ) -> UniqueBuysResult:
+        """Short-TTL cache so live tip does not stampede GMGN per transfer."""
+        wallet_l = wallet.lower()
+        ttl = float(getattr(cfg, "gmgn_rank_cache_ttl_sec", 60.0) or 60.0)
+        now = time.time()
+        hit = self._gmgn_rank_cache.get(wallet_l)
+        if hit is not None and (now - hit[0]) <= ttl:
+            return hit[1]
+        pages = int(
+            max_pages
+            if max_pages is not None
+            else (getattr(cfg, "gmgn_rank_max_pages", 3) or 3)
+        )
+        result = await fetch_unique_buys(wallet_l, max_pages=max(1, pages))
+        self._gmgn_rank_cache[wallet_l] = (now, result)
+        if len(self._gmgn_rank_cache) > 800:
+            # Drop oldest half by timestamp.
+            ordered = sorted(self._gmgn_rank_cache.items(), key=lambda kv: kv[1][0])
+            for key, _ in ordered[: len(ordered) // 2]:
+                self._gmgn_rank_cache.pop(key, None)
+        return result
+
+    def _invalidate_gmgn_rank_cache(self, wallet: str) -> None:
+        self._gmgn_rank_cache.pop(wallet.lower(), None)
+
+    async def _gmgn_rank_verdict(
+        self,
+        wallet: str,
+        token: str,
+        cfg: FollowupConfig,
+    ) -> GmgnRankVerdict:
+        """Establish post-seed unique-buy rank for a newly seen transfer token.
+
+        Fail-safe on circuit/429/seed-miss: ``uncertain=True`` — caller must
+        NOT invent a local deal #2/#3 Telegram alert.
+        """
+        from dataclasses import replace
+
+        from .gmgn_portfolio import gmgn_api_configured, gmgn_circuit_open
+
+        token_l = (token or "").strip().lower()
+        seed_deal = next(
+            (
+                d
+                for d in self._store.list_deals_for_wallet(wallet)
+                if int(d.get("deal_index") or 0) == 1
+            ),
+            None,
+        )
+        seed_token = str((seed_deal or {}).get("token") or "").lower()
+        max_deals = max(1, int(cfg.max_deals or 5))
+        empty = GmgnRankVerdict(
+            uncertain=True,
+            reason="unknown",
+            seed_token=seed_token,
+            post_seed=(),
+            rank=None,
+            past_max=False,
+        )
+        if not seed_token:
+            return replace(empty, reason="no_seed")
+        if not gmgn_api_configured():
+            return replace(empty, reason="gmgn_unconfigured")
+        if gmgn_circuit_open():
+            return replace(empty, reason="gmgn_circuit")
+        try:
+            result = await self._fetch_unique_buys_cached(wallet, cfg=cfg)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("GMGN rank fetch %s: %s", wallet[:10], exc)
+            return replace(empty, reason="gmgn_fetch_failed")
+        if result.rate_limited or not result.ok:
+            reason = "gmgn_429" if result.rate_limited else "gmgn_fetch_failed"
+            return replace(empty, reason=reason)
+        _seed_buy, post = post_seed_unique_buys(list(result.buys), seed_token)
+        if _seed_buy is None:
+            return replace(empty, reason="gmgn_seed_miss")
+        past_max = len(post) >= max(0, max_deals - 1)
+        # Repair / wallet-level check: no tip token — only post-seed fullness.
+        if not token_l:
+            return GmgnRankVerdict(
+                uncertain=False,
+                reason="ok",
+                seed_token=seed_token,
+                post_seed=tuple(post),
+                rank=None,
+                past_max=past_max,
+            )
+        rank: int | None = None
+        for i, buy in enumerate(post, start=2):
+            if buy.token.lower() == token_l:
+                rank = i
+                break
+        if rank is None and past_max:
+            return GmgnRankVerdict(
+                uncertain=False,
+                reason="past_max",
+                seed_token=seed_token,
+                post_seed=tuple(post),
+                rank=None,
+                past_max=True,
+            )
+        # Fresh tip buy not yet on GMGN: next slot only inside the window.
+        if rank is None and not past_max:
+            next_rank = len(post) + 2
+            if next_rank > max_deals:
+                return GmgnRankVerdict(
+                    uncertain=False,
+                    reason="beyond_window",
+                    seed_token=seed_token,
+                    post_seed=tuple(post),
+                    rank=None,
+                    past_max=True,
+                )
+            rank = next_rank
+        return GmgnRankVerdict(
+            uncertain=False,
+            reason="ok",
+            seed_token=seed_token,
+            post_seed=tuple(post),
+            rank=rank,
+            past_max=past_max or (rank is not None and rank > max_deals),
+        )
+
+    async def _sync_wallet_gmgn_order(
+        self,
+        wallet: str,
+        cfg: FollowupConfig,
+        *,
+        post_seed: list[GmgnBuy],
+        tip_token: str | None = None,
+        tip_symbol: str = "",
+        tip_tx: str = "",
+        tip_block: int = 0,
+        tip_bought_at: float | None = None,
+        tip_mcap: float | None = None,
+        tip_bought_usd: float | None = None,
+    ) -> list[Any]:
+        """Apply GMGN post-seed order; optionally append a tip buy not yet on GMGN."""
+        max_deals = max(1, int(cfg.max_deals or 5))
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        tip_l = (tip_token or "").lower()
+        for buy in post_seed:
+            tok = buy.token.lower()
+            if not tok or tok in seen:
+                continue
+            seen.add(tok)
+            rows.append(
+                {
+                    "token": tok,
+                    "symbol": buy.symbol,
+                    "tx_hash": buy.tx_hash,
+                    "block_number": 0,
+                    "bought_at": float(buy.timestamp) if buy.timestamp > 0 else None,
+                    "mcap_at_buy": None,
+                    "bought_usd": buy.cost_usd,
+                }
+            )
+        if tip_l and tip_l not in seen and tip_l not in QUOTE_TOKENS:
+            rows.append(
+                {
+                    "token": tip_l,
+                    "symbol": tip_symbol,
+                    "tx_hash": tip_tx,
+                    "block_number": tip_block,
+                    "bought_at": tip_bought_at,
+                    "mcap_at_buy": tip_mcap,
+                    "bought_usd": tip_bought_usd,
+                }
+            )
+        inserted = self._store.apply_gmgn_buy_order(
+            wallet, rows, max_deals=max_deals
+        )
+        self._invalidate_gmgn_rank_cache(wallet)
+        return inserted
+
+    async def _repair_undercounted_wallets(
+        self,
+        cfg: FollowupConfig,
+        *,
+        rpc: Any,
+    ) -> None:
+        """Jump watching wallets to done when GMGN already has ≥ max_deals uniques."""
+        from .gmgn_portfolio import gmgn_api_configured, gmgn_circuit_open
+
+        batch = int(getattr(cfg, "gmgn_repair_batch", 8) or 0)
+        if batch <= 0:
+            return
+        if not gmgn_api_configured() or gmgn_circuit_open():
+            return
+        max_deals = max(1, int(cfg.max_deals or 5))
+        watching = self._store.list_watching()
+        # Prefer undercounted (local deal_count well below cap).
+        candidates: list[tuple[int, str]] = []
+        for addr in watching:
+            _seen, deal_count, status = self._store.get_wallet_scan_meta(addr)
+            if status != "watching" or deal_count >= max_deals:
+                continue
+            candidates.append((deal_count, addr))
+        candidates.sort(key=lambda x: x[0])
+        repaired = 0
+        for _, wallet in candidates[:batch]:
+            if self._stop_requested:
+                break
+            verdict = await self._gmgn_rank_verdict(wallet, token="", cfg=cfg)
+            # Empty token → rank always None; we only care about past_max / post_seed.
+            if verdict.uncertain:
+                continue
+            if not verdict.post_seed and not verdict.past_max:
+                continue
+            local_post = max(0, self._store.get_wallet_scan_meta(wallet)[1] - 1)
+            if len(verdict.post_seed) <= local_post and not verdict.past_max:
+                continue
+            inserted = await self._sync_wallet_gmgn_order(
+                wallet, cfg, post_seed=list(verdict.post_seed)
+            )
+            _seen, deal_count, status = self._store.get_wallet_scan_meta(wallet)
+            repaired += 1
+            self._append_log(
+                "repair",
+                f"{wallet[:10]}… GMGN sync post={len(verdict.post_seed)} "
+                f"→ deal_count={deal_count} status={status} "
+                f"(+{len(inserted)} new)",
+            )
+            # Do NOT Telegram from repair — these are historical catch-ups.
+            for deal in inserted:
+                self._store.mark_notified(deal.wallet, deal.token)
+        if repaired:
+            self._append_log("repair", f"GMGN undercount repair: {repaired} кош.")
+
     def _live_tip_healthy(self, *, tip: int | None = None) -> tuple[bool, int | None]:
         """Whether live tip discovery looks fine — fail-open on unknown.
 
@@ -2900,21 +3192,111 @@ class FollowupRunner:
                     budget_sec=enrich_budget_sec,
                 )
 
-            deal = self._store.record_deal(
-                wallet=tr.wallet,
-                token=tr.token,
-                token_symbol=token_symbol,
-                token_name=token_name,
-                mcap_at_buy=mcap,
-                bought_usd=bought_usd,
-                tx_hash=tr.tx_hash,
-                block_number=tr.block_number,
-                bought_at=tr.bought_at or None,
-                max_deals=cfg.max_deals,
-            )
-            if not deal:
-                continue
-            new_deals += 1
+            # GMGN post-seed rank is authoritative. Local sequential record_deal
+            # invented fake #2/#3 when missed unique buys never entered DB.
+            from .gmgn_portfolio import gmgn_api_configured
+
+            deal = None
+            if gmgn_api_configured():
+                verdict = await self._gmgn_rank_verdict(
+                    tr.wallet, tr.token, cfg
+                )
+                if verdict.uncertain:
+                    self._append_log(
+                        "deal",
+                        f"skip invent #{tr.token[:10]}… "
+                        f"GMGN uncertain ({verdict.reason}) [{label}]",
+                    )
+                    skipped += 1
+                    continue
+                # Sync GMGN order (marks done when already ≥ max_deals uniques).
+                include_tip = (
+                    not verdict.past_max
+                    and verdict.rank is not None
+                    and verdict.rank <= int(cfg.max_deals or 5)
+                )
+                await self._sync_wallet_gmgn_order(
+                    tr.wallet,
+                    cfg,
+                    post_seed=list(verdict.post_seed),
+                    tip_token=tr.token if include_tip else None,
+                    tip_symbol=token_symbol,
+                    tip_tx=tr.tx_hash,
+                    tip_block=tr.block_number,
+                    tip_bought_at=tr.bought_at or None,
+                    tip_mcap=mcap,
+                    tip_bought_usd=bought_usd,
+                )
+                _seen, deal_count_now, status_now = self._store.get_wallet_scan_meta(
+                    tr.wallet
+                )
+                if status_now != "watching" or deal_count_now >= cfg.max_deals:
+                    self._append_log(
+                        "deal",
+                        f"GMGN past window {tr.wallet[:10]}… "
+                        f"post={len(verdict.post_seed)} status={status_now} [{label}]",
+                    )
+                    skipped += 1
+                    continue
+                # Pull the row GMGN sync assigned (correct index).
+                for row in self._store.list_deals_for_wallet(tr.wallet):
+                    if str(row.get("token") or "").lower() == tr.token.lower():
+                        deal = FollowupDealRow(
+                            wallet=tr.wallet.lower(),
+                            token=tr.token.lower(),
+                            token_symbol=str(
+                                row.get("token_symbol") or token_symbol or ""
+                            ),
+                            token_name=token_name,
+                            deal_index=int(row.get("deal_index") or 0),
+                            mcap_at_buy=(
+                                float(row["mcap_at_buy"])
+                                if row.get("mcap_at_buy") is not None
+                                else mcap
+                            ),
+                            bought_usd=(
+                                float(row["bought_usd"])
+                                if row.get("bought_usd") is not None
+                                else bought_usd
+                            ),
+                            tx_hash=str(row.get("tx_hash") or tr.tx_hash or ""),
+                            block_number=int(
+                                row.get("block_number") or tr.block_number or 0
+                            ),
+                            bought_at=(
+                                float(row["bought_at"])
+                                if row.get("bought_at")
+                                else (tr.bought_at or None)
+                            ),
+                            notified=bool(row.get("notified")),
+                            created_at=float(row.get("created_at") or time.time()),
+                        )
+                        break
+                if deal is None:
+                    # Token beyond capped GMGN prefix — not an alertable #2..N.
+                    skipped += 1
+                    continue
+                if deal.notified:
+                    skipped += 1
+                    continue
+                new_deals += 1
+            else:
+                deal = self._store.record_deal(
+                    wallet=tr.wallet,
+                    token=tr.token,
+                    token_symbol=token_symbol,
+                    token_name=token_name,
+                    mcap_at_buy=mcap,
+                    bought_usd=bought_usd,
+                    tx_hash=tr.tx_hash,
+                    block_number=tr.block_number,
+                    bought_at=tr.bought_at or None,
+                    max_deals=cfg.max_deals,
+                )
+                if not deal:
+                    continue
+                new_deals += 1
+
             self._store.advance_last_seen_block(tr.wallet, tr.block_number)
             discover_lag = (
                 max(0.0, float(deal.created_at) - float(deal.bought_at))
