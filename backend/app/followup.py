@@ -136,6 +136,39 @@ def should_alert_deal(
     return True
 
 
+def deal_is_fresh_for_alert(
+    *,
+    bought_at: float | None,
+    block_number: int | None,
+    tip: int | None,
+    now: float | None = None,
+    max_buy_age_sec: float = 900.0,
+    max_block_lag: int = 2_000,
+) -> bool:
+    """True when a deal is recent enough to warrant a Telegram alert.
+
+    Stops live-gap / hist catch-up from blasting old buys as «#2/#3 сейчас».
+    Fail-open when timestamps/tip are unknown (legacy / unit paths).
+    """
+    ts = time.time() if now is None else float(now)
+    age_limit = max(60.0, float(max_buy_age_sec or 900.0))
+    block_limit = max(100, int(max_block_lag or 2_000))
+    if bought_at is not None and float(bought_at) > 0:
+        age = ts - float(bought_at)
+        if age > age_limit:
+            return False
+    if (
+        tip is not None
+        and block_number is not None
+        and int(block_number) > 0
+        and int(tip) > 0
+    ):
+        lag = int(tip) - int(block_number)
+        if lag > block_limit:
+            return False
+    return True
+
+
 def order_deals_for_alerts(
     new_deals: list[tuple[Any, str | None]],
 ) -> list[tuple[Any, str | None]]:
@@ -1286,18 +1319,16 @@ class FollowupRunner:
             live_ok, live_behind = self._live_tip_healthy(tip=tip)
             live = self._store.get_logwatch_live_cursor()
             store_behind = (tip - int(live)) if live is not None else None
-            # Fail-open: recent live success ⇒ hist-only info, never ⚠️ live=124k.
-            # Do not print a stale store live_behind when health comes from
-            # ``_last_live_success_ts`` (cursor meta can lag while tip scans OK).
-            if live_ok or (
-                store_behind is not None and store_behind <= 2_000
-            ):
-                if live_behind is not None and live_behind <= 2_000:
-                    live_note = f" (отставание {live_behind})"
-                elif store_behind is not None and store_behind <= 2_000:
-                    live_note = f" (отставание {store_behind})"
-                else:
-                    live_note = " (недавний live success)"
+            # Prefer store watermark when known — never claim «Live tip в порядке»
+            # while live_behind is huge (e.g. 128k) just because a tick ran.
+            effective_behind = store_behind
+            if effective_behind is None:
+                effective_behind = live_behind
+            near_tip = (
+                effective_behind is not None and effective_behind <= 2_000
+            )
+            if live_ok and near_tip:
+                live_note = f" (отставание {effective_behind})"
                 text = (
                     f"ℹ️ Follow-up: hist-курсор отстаёт на {lag} блоков "
                     f"(cursor={cursor}, tip={tip}, порог={threshold}). "
@@ -1305,15 +1336,15 @@ class FollowupRunner:
                     "свежие алерты не ждут догона — догоняем только историю."
                 )
             else:
+                behind_txt = (
+                    f", live_behind={effective_behind}"
+                    if effective_behind is not None
+                    else ", live=нет"
+                )
                 text = (
                     f"⚠️ Follow-up: logwatch отстаёт на {lag} блоков "
                     f"(cursor={cursor}, tip={tip}, порог={threshold}"
-                    + (
-                        f", live_behind={live_behind}"
-                        if live_behind is not None
-                        else ", live=нет"
-                    )
-                    + "). Live tip тоже нездоров — догоняем чанками."
+                    f"{behind_txt}). Live tip тоже нездоров — догоняем чанками."
                 )
             await self._ops_alert(cfg, kind="cursor_lag", text=text)
         except TimeoutError:
@@ -1459,6 +1490,27 @@ class FollowupRunner:
                 "telegram",
                 f"skip honeypot deal #{deal.deal_index} "
                 f"{deal.token_symbol or deal.token[:10]}… ({reason})",
+            )
+            return False
+
+        if not deal_is_fresh_for_alert(
+            bought_at=getattr(deal, "bought_at", None),
+            block_number=getattr(deal, "block_number", None),
+            tip=self._last_known_tip,
+            max_buy_age_sec=float(
+                getattr(cfg, "alert_max_buy_age_sec", 900) or 900
+            ),
+            max_block_lag=int(
+                getattr(cfg, "alert_max_block_lag", 2_000) or 2_000
+            ),
+        ):
+            # Old hist/gap fills must not Telegram as «сейчас #2/#3».
+            self._store.mark_notified(deal.wallet, deal.token)
+            self._append_log(
+                "telegram",
+                f"skip stale deal #{deal.deal_index} "
+                f"block={getattr(deal, 'block_number', None)} "
+                f"tip={self._last_known_tip}",
             )
             return False
 
@@ -2235,11 +2287,18 @@ class FollowupRunner:
                 f"getLogs soft-fail — live cursor не двигаем "
                 f"(streak={self._live_timeout_streak})",
             )
-            # Soft fail still proves the live loop is alive.
-            self._last_live_success_ts = time.time()
+            # Soft-fail proves the loop is alive only when already near tip.
+            # Far-behind soft-fail must NOT stamp healthy (ops «в порядке» spam).
+            behind_now = max(0, safe_tip - live_cursor_i)
+            if behind_now <= 2_000:
+                self._last_live_success_ts = time.time()
             return True
         self._live_timeout_streak = 0
-        self._last_live_success_ts = time.time()
+        # Stamp healthy only when tip scan itself is near-tip (contiguous or
+        # tip window). Huge live watermark lag still unhealthy until gap closes.
+        behind_after_tip = max(0, safe_tip - live_cursor_i)
+        if contiguous or behind_after_tip <= 2_000:
+            self._last_live_success_ts = time.time()
         # Advance live cursor only when the scan was contiguous from the watermark.
         if contiguous:
             advance_to = res.get("advance_to")
@@ -2248,15 +2307,24 @@ class FollowupRunner:
             else:
                 self._store.set_logwatch_live_cursor(safe_tip)
 
-        # Gap below tip window after hang: backfill contiguously with enrich.
+        # Gap below tip window: near tip → enrich+alert; large lag → cursor-only
+        # (skip_enrich) so hist replay cannot Telegram fake deal #2/#3.
         live_now = self._store.get_logwatch_live_cursor()
         live_now_i = int(live_now) if live_now is not None else live_cursor_i
         if live_now_i + 1 < tip_from:
             gap_from = live_now_i + 1
             gap_to = min(tip_from - 1, gap_from + span - 1)
+            gap_behind = max(0, safe_tip - live_now_i)
+            enrich_cap = max(
+                2 * span,
+                int(getattr(cfg, "live_gap_enrich_max_blocks", 2_000) or 2_000),
+            )
+            gap_skip_enrich = gap_behind > enrich_cap
             self._append_log(
                 "live",
-                f"gap {gap_from}…{gap_to} (backfill enrich on)",
+                f"gap {gap_from}…{gap_to} "
+                f"(behind={gap_behind}, "
+                f"{'skip_enrich' if gap_skip_enrich else 'enrich on'})",
                 percent=14,
             )
             gap = await self._logwatch_scan_window(
@@ -2267,12 +2335,16 @@ class FollowupRunner:
                 to_block=gap_to,
                 fetch_timeout=fetch_timeout,
                 label="live_gap",
-                skip_enrich=False,
-                enrich_budget_sec=enrich_budget,
-                queue_mcap_retry=True,
+                skip_enrich=gap_skip_enrich,
+                enrich_budget_sec=None if gap_skip_enrich else enrich_budget,
+                queue_mcap_retry=not gap_skip_enrich,
             )
             if gap and gap.get("advanced") and gap.get("advance_to") is not None:
                 self._store.set_logwatch_live_cursor(int(gap["advance_to"]))
+                # After gap advance, refresh healthy stamp if now near tip.
+                new_live = int(gap["advance_to"])
+                if max(0, safe_tip - new_live) <= 2_000:
+                    self._last_live_success_ts = time.time()
             elif gap and not gap.get("advanced"):
                 self._live_timeout_streak += 1
 
@@ -2622,22 +2694,27 @@ class FollowupRunner:
     def _live_tip_healthy(self, *, tip: int | None = None) -> tuple[bool, int | None]:
         """Whether live tip discovery looks fine — fail-open on unknown.
 
+        Recent live tick success alone is NOT healthy when the live watermark
+        is far behind tip (gap backfill / hang). Soft-fail must not stamp
+        healthy in that case either.
+
         Important: do NOT re-query RPC here after a hist failure. A stuck RPC
         made ``_live_behind_blocks`` return None, which falsely meant
         «live tip тоже отстаёт» and triggered DEGRADED spam.
         """
         live = self._store.get_logwatch_live_cursor()
+        tip_ref = tip if tip is not None else self._last_known_tip
+        behind: int | None = None
+        if tip_ref is not None and live is not None:
+            behind = max(0, int(tip_ref) - int(live))
+        if behind is not None and behind > 2_000:
+            return False, behind
         now = time.time()
         if self._last_live_success_ts and (now - self._last_live_success_ts) <= 90.0:
-            tip_ref = tip if tip is not None else self._last_known_tip
-            behind = None
-            if tip_ref is not None and live is not None:
-                behind = max(0, int(tip_ref) - int(live))
             return True, behind
-        tip_ref = tip if tip is not None else self._last_known_tip
         if live is None or tip_ref is None:
             return True, None
-        behind = max(0, int(tip_ref) - int(live))
+        assert behind is not None
         return behind <= 2_000, behind
 
     async def _live_behind_blocks(self, rpc: Any) -> int | None:
@@ -2869,6 +2946,25 @@ class FollowupRunner:
                     and deal.deal_index in (cfg.alert_on_deals or [2, 3, 4, 5])
                 ):
                     self._queue_mcap_micro_retry(deal.wallet, deal.token)
+                skipped += 1
+                continue
+            tip_ref = self._last_known_tip
+            if not deal_is_fresh_for_alert(
+                bought_at=deal.bought_at,
+                block_number=deal.block_number,
+                tip=tip_ref,
+                max_buy_age_sec=float(
+                    getattr(cfg, "alert_max_buy_age_sec", 900) or 900
+                ),
+                max_block_lag=int(
+                    getattr(cfg, "alert_max_block_lag", 2_000) or 2_000
+                ),
+            ):
+                self._append_log(
+                    "deal",
+                    f"skip stale alert #{deal.deal_index} "
+                    f"block={deal.block_number} tip={tip_ref} [{label}]",
+                )
                 skipped += 1
                 continue
             if not tg_ok:

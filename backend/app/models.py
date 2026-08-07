@@ -377,6 +377,14 @@ class FollowupConfig(BaseModel):
     # While catching up / in the dedicated live loop, scan this many tip blocks
     # with full enrich+alert. Keep small so each live tick finishes in <1–2s.
     logwatch_live_span: int = Field(default=300, ge=50, le=20_000)
+    # Live gap backfill may enrich+alert only when live cursor is this close
+    # to tip. Larger gaps are cursor-only (skip_enrich) — otherwise hist lag
+    # replays old buys as fake «deal #2/#3» Telegram spam.
+    live_gap_enrich_max_blocks: int = Field(default=2_000, ge=100, le=50_000)
+    # Do not Telegram-alert deals whose buy is older than this (seconds).
+    alert_max_buy_age_sec: int = Field(default=900, ge=60, le=86_400)
+    # Do not Telegram-alert deals whose block is more than this behind tip.
+    alert_max_block_lag: int = Field(default=2_000, ge=100, le=50_000)
     # Tip-first / live-priority threshold for hist (hist no longer embeds live).
     logwatch_live_priority_lag: int = Field(default=3_000, ge=100, le=200_000)
     # Dedicated live tip poll period (seconds). Independent of hist cycle.

@@ -88,15 +88,14 @@ async def test_hist_multi_chunk_advances_cursor(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_cursor_lag_alert_hist_only_when_live_healthy(tmp_path):
+async def test_cursor_lag_alert_hist_only_when_live_near_tip(tmp_path):
     store = FollowupStore(
         db_path=str(tmp_path / "followup.db"),
         config_path=str(tmp_path / "followup.json"),
     )
     tip = 30_405_000
     store.set_logwatch_cursor(tip - 120_000)
-    # Stale/wrong live meta that used to produce scary live_behind=124k.
-    store.set_logwatch_live_cursor(tip - 120_000)
+    store.set_logwatch_live_cursor(tip - 500)  # live near tip
     cfg = FollowupConfig(
         enabled=True,
         cursor_lag_alert_blocks=6_000,
@@ -119,10 +118,44 @@ async def test_cursor_lag_alert_hist_only_when_live_healthy(tmp_path):
     assert alerts
     assert alerts[0].startswith("ℹ️")
     assert "hist-курсор" in alerts[0]
-    assert "⚠️" not in alerts[0]
+    assert "Live tip в порядке" in alerts[0]
     assert "live_behind=120000" not in alerts[0]
     assert "отставание 120000" not in alerts[0]
-    assert "недавний live success" in alerts[0]
+
+
+@pytest.mark.asyncio
+async def test_cursor_lag_alert_never_says_live_ok_when_far_behind(tmp_path):
+    """Recent live tick ≠ healthy when watermark is 128k behind tip."""
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    tip = 30_405_000
+    store.set_logwatch_cursor(tip - 120_000)
+    store.set_logwatch_live_cursor(tip - 128_000)
+    cfg = FollowupConfig(
+        enabled=True,
+        cursor_lag_alert_blocks=6_000,
+        ops_alert_cooldown_sec=60,
+        telegram_chat_id="1",
+    )
+    store.save_config(cfg)
+    runner = FollowupRunner(store=store)
+    runner._last_known_tip = tip
+    runner._last_live_success_ts = __import__("time").time()
+    alerts: list[str] = []
+
+    async def capture_ops(cfg, *, kind, text):
+        alerts.append(text)
+
+    rpc = MagicMock()
+    with patch.object(runner, "_ops_alert", side_effect=capture_ops):
+        await runner._maybe_alert_cursor_lag(cfg, rpc=rpc)
+    assert alerts
+    assert alerts[0].startswith("⚠️")
+    assert "Live tip в порядке" not in alerts[0]
+    assert "live_behind=128000" in alerts[0]
+    assert "нездоров" in alerts[0]
 
 
 @pytest.mark.asyncio

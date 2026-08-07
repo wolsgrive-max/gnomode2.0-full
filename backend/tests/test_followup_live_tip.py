@@ -193,11 +193,13 @@ async def test_live_gap_backfill_when_cursor_far_behind(tmp_path):
         enabled=True,
         logwatch_confirmations=0,
         logwatch_live_span=300,
+        live_gap_enrich_max_blocks=2_000,
         buys_only=False,
     )
     store.save_config(cfg)
     runner = FollowupRunner(store=store)
     labels: list[str] = []
+    gap_skip: list[bool] = []
 
     async def fake_scan(
         cfg,
@@ -214,6 +216,8 @@ async def test_live_gap_backfill_when_cursor_far_behind(tmp_path):
         queue_mcap_retry=False,
     ):
         labels.append(label)
+        if label == "live_gap":
+            gap_skip.append(skip_enrich)
         return {
             "new_deals": 0,
             "alerts": 0,
@@ -233,5 +237,114 @@ async def test_live_gap_backfill_when_cursor_far_behind(tmp_path):
             await runner._live_tip_pass(cfg, rpc=rpc)
     assert labels[0] == "live"
     assert "live_gap" in labels
+    # Far behind tip → cursor-only gap fill (no enrich/Telegram spam).
+    assert gap_skip and gap_skip[0] is True
     # Tip scan does not snap over the gap — watermark only moves via gap backfill.
     assert store.get_logwatch_live_cursor() == 50_000 + 300
+    # Recent tip tick alone must not mark healthy while 50k behind.
+    ok, behind = runner._live_tip_healthy(tip=tip)
+    assert ok is False
+    assert behind is not None and behind > 2_000
+
+
+@pytest.mark.asyncio
+async def test_live_gap_near_tip_still_enriches(tmp_path):
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    tip = 100_000
+    # Gap of ~800 blocks: inside tip_from(=99701) below live window, under enrich cap.
+    store.set_logwatch_live_cursor(99_200)
+    cfg = FollowupConfig(
+        enabled=True,
+        logwatch_confirmations=0,
+        logwatch_live_span=300,
+        live_gap_enrich_max_blocks=2_000,
+        buys_only=False,
+    )
+    store.save_config(cfg)
+    runner = FollowupRunner(store=store)
+    gap_skip: list[bool] = []
+
+    async def fake_scan(
+        cfg,
+        *,
+        rpc,
+        watching,
+        from_block,
+        to_block,
+        fetch_timeout,
+        label,
+        cursor_floor=None,
+        skip_enrich=False,
+        enrich_budget_sec=None,
+        queue_mcap_retry=False,
+    ):
+        if label == "live_gap":
+            gap_skip.append(skip_enrich)
+        return {
+            "new_deals": 0,
+            "alerts": 0,
+            "skipped": 0,
+            "advanced": True,
+            "advance_to": to_block,
+        }
+
+    rpc = MagicMock()
+    rpc.block_number = AsyncMock(return_value=tip)
+    with patch.object(runner, "_logwatch_scan_window", side_effect=fake_scan):
+        with patch.object(
+            store,
+            "list_watching",
+            return_value=["0xaaa0000000000000000000000000000000000001"],
+        ):
+            await runner._live_tip_pass(cfg, rpc=rpc)
+    assert gap_skip and gap_skip[0] is False
+
+
+def test_deal_is_fresh_for_alert_age_and_block():
+    from app.followup import deal_is_fresh_for_alert
+    import time as _t
+
+    now = _t.time()
+    tip = 100_000
+    assert deal_is_fresh_for_alert(
+        bought_at=now - 60,
+        block_number=99_900,
+        tip=tip,
+        now=now,
+        max_buy_age_sec=900,
+        max_block_lag=2_000,
+    )
+    assert not deal_is_fresh_for_alert(
+        bought_at=now - 2_000,
+        block_number=99_900,
+        tip=tip,
+        now=now,
+        max_buy_age_sec=900,
+        max_block_lag=2_000,
+    )
+    assert not deal_is_fresh_for_alert(
+        bought_at=now - 60,
+        block_number=90_000,
+        tip=tip,
+        now=now,
+        max_buy_age_sec=900,
+        max_block_lag=2_000,
+    )
+
+
+def test_live_tip_healthy_rejects_far_behind_despite_success_ts(tmp_path):
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    tip = 100_000
+    store.set_logwatch_live_cursor(50_000)
+    runner = FollowupRunner(store=store)
+    runner._last_known_tip = tip
+    runner._last_live_success_ts = __import__("time").time()
+    ok, behind = runner._live_tip_healthy(tip=tip)
+    assert ok is False
+    assert behind == 50_000
