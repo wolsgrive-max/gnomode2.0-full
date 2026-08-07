@@ -243,7 +243,7 @@ class WatchWalletFilters(BaseModel):
     min_hold_time_minutes: float | None = None
     max_hold_time_minutes: float | None = None
     min_tokens_traded_7d: float | None = 1.0
-    max_tokens_traded_7d: float | None = 1.0
+    max_tokens_traded_7d: float | None = 3.0
     tokens_unique_period: TokensUniquePeriod = TokensUniquePeriod.d7
 
 
@@ -252,7 +252,10 @@ class WatchConfig(BaseModel):
     # Default parse cadence from live Хвать token panel (12 min).
     interval_sec: int = Field(default=720, ge=60, le=86400)
     # Keep modest — qualify hits Blockscout/RPC; prefer thorough over fast.
-    max_tokens_per_cycle: int = Field(default=15, ge=1, le=2000)
+    max_tokens_per_cycle: int = Field(default=40, ge=1, le=2000)
+    # Parse drain: ATH below this goes to bulk tail (after ≥ floor), not dropped.
+    # None / 0 = no priority band (pure ATH-desc within urgent/fresh).
+    parse_priority_min_ath: float | None = 50_000.0
     telegram_chat_id: str = ""
     # Forum topic id (Telegram message_thread_id). Empty → no topic / General.
     telegram_topic_id: str = ""
@@ -298,7 +301,9 @@ class FollowupConfig(BaseModel):
     enabled: bool = False
     # Target seconds between follow-up cycle *starts*. Prefer 5–15s so we
     # do not stampede GMGN into RATE_LIMIT_BANNED; 0 = ASAP after finish.
-    interval_sec: int = Field(default=10, ge=0, le=86400)
+    # Fast logwatch target period. At ~10 blocks/sec, 3s keeps normal purchase
+    # alerts under ~8s end-to-end while remaining well below Alchemy limits.
+    interval_sec: int = Field(default=3, ge=0, le=86400)
     # Alert only when buy mcap is at or below this (USD). High mcap → record, no alert.
     max_mcap_alert: float = Field(default=20_000.0, ge=0)
     # Optional lower bound (USD). None = no floor.
@@ -322,6 +327,8 @@ class FollowupConfig(BaseModel):
     raybot_enabled: bool = False
     # When True, ingest early buyers from autoparse into the follow-up table.
     ingest_from_watch: bool = True
+    # Do not send Telegram when the deal token is flagged honeypot.
+    alert_skip_honeypot: bool = True
     # Parallel wallet scans per cycle. Keep low — shared GMGN ceiling +
     # Blockscout ~2–3 rps; high concurrency re-triggers IP bans.
     scan_concurrency: int = Field(default=3, ge=1, le=32)
@@ -346,17 +353,99 @@ class FollowupConfig(BaseModel):
     # ATH prune is expensive (DexScreener/Gecko); with short priority cycles
     # throttle it so we do not stampede Gecko into 429 every minute.
     prune_interval_sec: int = Field(default=1800, ge=60, le=86400)
+    # Primary deal discovery: eth_getLogs Transfer→watching wallets.
+    # When healthy, skips the slow per-wallet GMGN/Blockscout scan.
+    logwatch_enabled: bool = True
+    # Max blocks per eth_getLogs span. Address-less Transfer queries with
+    # hundreds of wallet topics blow up past ~5–10k blocks (Alchemy/public
+    # hang or >180s), which freezes the cursor and triggers the watchdog loop.
+    logwatch_max_span: int = Field(default=3_000, ge=100, le=200_000)
+    # When tip−cursor is moderately large, prefer this span (still finishes
+    # under the watchdog). Must NOT be clamped to a tiny hard cap — that
+    # caused a death spiral where lag grew forever at ~800 bl/cycle.
+    logwatch_catchup_span: int = Field(default=3_000, ge=100, le=50_000)
+    # Extreme hist backlog (lag ≫ 50k): start with this large window. Shrink
+    # only on getLogs timeout/400 (retry). Hist is skip_enrich; live tip
+    # covers fresh alerts, so aggressive catch-up is safe.
+    logwatch_burst_catchup_span: int = Field(default=10_000, ge=500, le=200_000)
+    # How many hist windows to scan per cycle while lag is high / budget allows.
+    logwatch_catchup_chunks_per_pass: int = Field(default=4, ge=1, le=20)
+    # Wall-time budget for multi-chunk hist catch-up inside one cycle.
+    logwatch_catchup_time_budget_sec: float = Field(default=90.0, ge=10.0, le=300.0)
+    # eth_getLogs internal block chunk for hist (keeps each RPC under wall-timeout).
+    logwatch_hist_rpc_chunk: int = Field(default=400, ge=50, le=5_000)
+    # While catching up / in the dedicated live loop, scan this many tip blocks
+    # with full enrich+alert. Keep small so each live tick finishes in <1–2s.
+    logwatch_live_span: int = Field(default=300, ge=50, le=20_000)
+    # Tip-first / live-priority threshold for hist (hist no longer embeds live).
+    logwatch_live_priority_lag: int = Field(default=3_000, ge=100, le=200_000)
+    # Dedicated live tip poll period (seconds). Independent of hist cycle.
+    live_interval_sec: float = Field(default=1.5, ge=0.5, le=30.0)
+    # Wall-time for live tip enrich (parallel mcap/meta/honeypot).
+    live_enrich_budget_sec: float = Field(default=3.0, ge=1.0, le=15.0)
+    # Watchdog for one live tip tick (must stay well under hist cycle_timeout).
+    live_cycle_timeout_sec: int = Field(default=45, ge=10, le=180)
+    # Hard wall-time for one logwatch getLogs pass (excludes enrichment).
+    logwatch_fetch_timeout_sec: int = Field(default=45, ge=5, le=300)
+    # Confirmations before advancing the log cursor (reorg safety).
+    logwatch_confirmations: int = Field(default=2, ge=0, le=64)
+    # Even when logwatch is healthy, periodically re-scan hot wallets via
+    # GMGN/Blockscout so a silent RPC gap cannot drop deals forever.
+    safety_reconcile_sec: int = Field(default=120, ge=30, le=3600)
+    # Max hot wallets touched by one safety-reconcile pass.
+    safety_reconcile_max: int = Field(default=12, ge=1, le=64)
+    # After this many consecutive logwatch hard-failures, mark degraded and
+    # fall back to legacy GMGN/Blockscout. Soft getLogs timeouts do not count.
+    # Default 3 absorbs single Alchemy blips without DEGRADED spam.
+    logwatch_fail_threshold: int = Field(default=3, ge=1, le=20)
+    # Cancel a stuck cycle after this many seconds (watchdog).
+    cycle_timeout_sec: int = Field(default=180, ge=30, le=3600)
+    # Slow maintenance loop (backfill/prune/reconcile/legacy) — separate from hist.
+    maintenance_interval_sec: float = Field(default=60.0, ge=15.0, le=3600.0)
+    maintenance_timeout_sec: int = Field(default=90, ge=30, le=600)
+    # Ops TG when tip−cursor exceeds this many blocks (~10 bl/s → 600≈1 min).
+    cursor_lag_alert_blocks: int = Field(default=6_000, ge=100, le=500_000)
+    # Min seconds between identical ops alerts (spam guard).
+    ops_alert_cooldown_sec: int = Field(default=600, ge=60, le=86400)
+    # Transactional outbox for deal alerts: claim + enqueue commit together so
+    # a crash mid-send cannot drop an alert (a dispatcher redelivers).
+    outbox_enabled: bool = True
+    # Give up (mark 'failed') after this many delivery attempts per alert.
+    outbox_max_attempts: int = Field(default=10, ge=1, le=100)
+    # Max outbox rows drained per cycle by the dispatcher.
+    outbox_dispatch_batch: int = Field(default=25, ge=1, le=500)
+    # Per-deal enrichment (entry mcap replay + quote + honeypot) is resolved
+    # concurrently for the whole logwatch batch: inline+sequential turned N new
+    # deals into N × ~10s of alert delay.
+    logwatch_enrich_concurrency: int = Field(default=6, ge=1, le=32)
+    logwatch_enrich_timeout_sec: int = Field(default=8, ge=2, le=60)
+    # Backfill retry for deals still missing mcap is comparatively expensive
+    # (quote refetch + on-chain pool discovery). Run it on its own slower cadence
+    # so it never stretches the fast logwatch loop.
+    pending_retry_interval_sec: int = Field(default=60, ge=0, le=3600)
+    # Wall-time cap for a pending-alert retry pass. Without this, a handful of
+    # null-mcap deals (6s quote + 6s on-chain each) can push the next logwatch
+    # start by a minute+ and create the ~135s discover lag seen on deal #5.
+    pending_retry_time_budget_sec: int = Field(default=12, ge=0, le=120)
+    # Hard cap on the post-discovery ATH prune so external-API 429 backoffs
+    # cannot stall the cycle (and delay the next logwatch) for minutes.
+    prune_time_budget_sec: int = Field(default=45, ge=0, le=600)
 
 
 class FollowupDealRow(BaseModel):
     wallet: str
     token: str
     token_symbol: str = ""
+    token_name: str = ""
     deal_index: int
     mcap_at_buy: float | None = None
     bought_usd: float | None = None
     tx_hash: str = ""
     block_number: int = 0
+    # Unix seconds of the buy (chain time). Used to assign deal_index;
+    # never fall back to «unknown block → sort last» (that made late
+    # Blockscout hits look like deal #1/#2 ahead of the real seed).
+    bought_at: float | None = None
     notified: bool = False
     created_at: float = 0.0
 
@@ -428,4 +517,15 @@ class FollowupStatus(BaseModel):
     last_zero_rechecked: int = 0
     last_skipped_zero_balance: int = 0
     last_hot_revisit_sec: float | None = None
+    # Resilience telemetry.
+    logwatch_degraded: bool = False
+    logwatch_fail_streak: int = 0
+    last_reconcile_ts: float | None = None
+    last_pending_alerts_retried: int = 0
+    active_rpc: str = ""
+    cursor_lag_blocks: int | None = None
+    # Transactional outbox telemetry.
+    outbox_pending: int = 0
+    outbox_failed: int = 0
+    last_outbox_dispatched: int = 0
     log: list[JobLogEntry] = Field(default_factory=list)
