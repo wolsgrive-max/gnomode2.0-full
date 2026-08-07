@@ -194,12 +194,13 @@ async def test_live_gap_backfill_when_cursor_far_behind(tmp_path):
         logwatch_confirmations=0,
         logwatch_live_span=300,
         live_gap_enrich_max_blocks=2_000,
+        logwatch_burst_catchup_span=5_000,
+        logwatch_catchup_chunks_per_pass=4,
         buys_only=False,
     )
     store.save_config(cfg)
     runner = FollowupRunner(store=store)
     labels: list[str] = []
-    gap_skip: list[bool] = []
 
     async def fake_scan(
         cfg,
@@ -216,8 +217,7 @@ async def test_live_gap_backfill_when_cursor_far_behind(tmp_path):
         queue_mcap_retry=False,
     ):
         labels.append(label)
-        if label == "live_gap":
-            gap_skip.append(skip_enrich)
+        assert skip_enrich is True  # far behind → burst skip_enrich only
         return {
             "new_deals": 0,
             "alerts": 0,
@@ -235,16 +235,109 @@ async def test_live_gap_backfill_when_cursor_far_behind(tmp_path):
             return_value=["0xaaa0000000000000000000000000000000000001"],
         ):
             await runner._live_tip_pass(cfg, rpc=rpc)
-    assert labels[0] == "live"
-    assert "live_gap" in labels
-    # Far behind tip → cursor-only gap fill (no enrich/Telegram spam).
-    assert gap_skip and gap_skip[0] is True
-    # Tip scan does not snap over the gap — watermark only moves via gap backfill.
-    assert store.get_logwatch_live_cursor() == 50_000 + 300
-    # Recent tip tick alone must not mark healthy while 50k behind.
+    assert any(lab.startswith("live_burst") for lab in labels)
+    # Burst must jump far past the old ~300/tick crawl.
+    assert store.get_logwatch_live_cursor() >= 50_000 + 10_000
+    # Still not at tip — leave enrich_cap for near-tip alerts.
+    assert store.get_logwatch_live_cursor() <= tip - 2_000
     ok, behind = runner._live_tip_healthy(tip=tip)
     assert ok is False
     assert behind is not None and behind > 2_000
+
+
+@pytest.mark.asyncio
+async def test_hist_force_advances_after_repeated_soft_timeout(tmp_path):
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    tip = 200_000
+    hist_cursor = 100_000
+    store.set_logwatch_cursor(hist_cursor)
+    store.set_logwatch_live_cursor(tip)  # live near tip — old code only nudged then
+    cfg = FollowupConfig(
+        enabled=True,
+        logwatch_enabled=True,
+        logwatch_confirmations=0,
+        logwatch_max_span=3_000,
+        logwatch_catchup_span=1_500,
+        logwatch_catchup_chunks_per_pass=1,
+        logwatch_live_span=300,
+        buys_only=False,
+    )
+    store.save_config(cfg)
+    runner = FollowupRunner(store=store)
+    # Live far behind → old nudge path refused; force-advance must still move.
+    store.set_logwatch_live_cursor(tip - 40_000)
+    runner._last_known_tip = tip
+
+    async def always_timeout(*_a, **_k):
+        return {
+            "new_deals": 0,
+            "alerts": 0,
+            "skipped": 0,
+            "advanced": False,
+            "advance_to": None,
+        }
+
+    rpc = MagicMock()
+    rpc.block_number = AsyncMock(return_value=tip)
+    rpc._prefer_non_alchemy = MagicMock(return_value=True)
+    rpc._bind_url = MagicMock()
+    rpc.rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+    rpc.active_rpc_label = MagicMock(return_value="https://rpc…")
+    with patch.object(runner, "_logwatch_scan_window", side_effect=always_timeout):
+        with patch.object(
+            store,
+            "list_watching",
+            return_value=["0xaaa0000000000000000000000000000000000001"],
+        ):
+            with patch("app.chain.reset_followup_rpc_pressure", return_value=0):
+                ok = await runner._logwatch_pass(cfg, rpc=rpc)
+    assert ok is True
+    assert store.get_logwatch_cursor() > hist_cursor
+    assert runner._last_hist_advanced is True
+
+
+@pytest.mark.asyncio
+async def test_hist_fail_does_not_degrade_when_live_near_tip(tmp_path):
+    """Hist hard-fail while live covers tip must not flip DEGRADED / GMGN."""
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    tip = 100_000
+    store.set_logwatch_cursor(50_000)
+    store.set_logwatch_live_cursor(tip - 100)
+    cfg = FollowupConfig(
+        enabled=True,
+        logwatch_enabled=True,
+        logwatch_fail_threshold=3,
+        interval_sec=0,
+        buys_only=False,
+    )
+    store.save_config(cfg)
+    runner = FollowupRunner(store=store)
+    runner._last_known_tip = tip
+    runner._last_live_success_ts = __import__("time").time()
+    runner._logwatch_fail_streak = 2
+
+    async def hard_fail_pass(_cfg, *, rpc):
+        return False
+
+    rpc_mod = MagicMock()
+    rpc_mod.active_rpc_label = MagicMock(return_value="https://rpc…")
+    with patch.object(runner, "_logwatch_pass", side_effect=hard_fail_pass):
+        with patch.object(runner, "_ops_alert", new_callable=AsyncMock) as ops:
+            with patch("app.chain.RpcClient", return_value=rpc_mod):
+                with patch.object(
+                    runner, "_maybe_alert_cursor_lag", new_callable=AsyncMock
+                ):
+                    await runner._cycle_body(cfg, force_all_due=False)
+    assert runner._logwatch_degraded is False
+    assert runner._logwatch_fail_streak < 3
+    ops.assert_not_called()
+
 
 
 @pytest.mark.asyncio

@@ -55,6 +55,11 @@ _BS_FALLBACK_CONCURRENCY = 8
 _HOT_GMGN_CONCURRENCY = 4
 # Hist lag above this uses burst catch-up spans (not the old min(..., 800) trap).
 _HIST_BURST_LAG = 50_000
+# After this many hist shrinks on the same window, force-advance (skip_enrich).
+_HIST_FORCE_ADVANCE_AFTER = 2
+_HIST_MIN_SHRINK_SPAN = 25
+# Live watermark this far behind tip → burst skip_enrich (no TG) before enrich.
+_LIVE_BURST_BEHIND_MULT = 10
 
 
 def hist_span_for_lag(lag: int, cfg: FollowupConfig) -> int:
@@ -491,7 +496,10 @@ class FollowupRunner:
         self._live_timeout_streak = 0
         self._live_span_backoff = 0
         self._last_known_tip: int | None = None
+        self._last_tip_ts: float = 0.0
         self._last_live_success_ts: float = 0.0
+        # Last hist pass advanced the catch-up cursor (used to avoid Restored flap).
+        self._last_hist_advanced: bool = False
         # Fresh deals missing mcap — retried every live tick (not every 60s).
         self._mcap_micro_retry: list[tuple[str, str, float]] = []
         # Short-TTL GMGN unique-buy cache for logwatch rank (wallet → (ts, result)).
@@ -646,13 +654,13 @@ class FollowupRunner:
                             "отменённый hist-цикл не завершился за 8s — сбрасываем lock+RPC sem",
                         )
                         self._lock = asyncio.Lock()
-                        from .chain import reset_rpc_semaphores
+                        from .chain import reset_followup_rpc_pressure
 
-                        n = reset_rpc_semaphores(scope="followup")
+                        n = reset_followup_rpc_pressure()
                         if n:
                             self._append_log(
                                 "watchdog",
-                                f"сброшено {n} followup RPC semaphore(s)",
+                                f"сброшено {n} followup/shared RPC semaphore(s)",
                             )
                 await self._ops_alert(
                     cfg,
@@ -744,9 +752,9 @@ class FollowupRunner:
                         await asyncio.wait_for(task, timeout=3.0)
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         self._live_lock = asyncio.Lock()
-                        from .chain import reset_rpc_semaphores
+                        from .chain import reset_followup_rpc_pressure
 
-                        reset_rpc_semaphores(scope="followup_live")
+                        reset_followup_rpc_pressure()
             except asyncio.CancelledError:
                 task.cancel()
                 raise
@@ -827,9 +835,9 @@ class FollowupRunner:
                     try:
                         await asyncio.wait_for(task, timeout=5.0)
                     except (asyncio.TimeoutError, asyncio.CancelledError):
-                        from .chain import reset_rpc_semaphores
+                        from .chain import reset_followup_rpc_pressure
 
-                        reset_rpc_semaphores(scope="followup")
+                        reset_followup_rpc_pressure()
             except asyncio.CancelledError:
                 task.cancel()
                 raise
@@ -1260,7 +1268,10 @@ class FollowupRunner:
         if logwatch_ok:
             was_degraded = self._logwatch_degraded
             had_streak = self._logwatch_fail_streak
-            if was_degraded:
+            live_ok, live_behind = self._live_tip_healthy()
+            # Soft "ok" without cursor progress must not flap Restored↔DEGRADED.
+            progress_ok = bool(self._last_hist_advanced) or live_ok
+            if was_degraded and progress_ok:
                 self._append_log(
                     "logwatch",
                     "восстановлен после "
@@ -1275,68 +1286,76 @@ class FollowupRunner:
                         f"RPC={self._active_rpc}"
                     ),
                 )
-            elif had_streak:
+            elif had_streak and progress_ok:
                 self._append_log(
                     "logwatch",
                     f"transient ok после {had_streak} сбоя(ев) — без DEGRADED",
                 )
-            self._logwatch_fail_streak = 0
-            self._logwatch_degraded = False
+            if progress_ok:
+                self._logwatch_fail_streak = 0
+                self._logwatch_degraded = False
+            elif was_degraded:
+                self._append_log(
+                    "logwatch",
+                    "hist soft-ok без прогресса — DEGRADED держим "
+                    f"(streak={had_streak}, live_behind={live_behind})",
+                )
             await self._maybe_alert_cursor_lag(cfg, rpc=rpc)
         else:
             self._logwatch_fail_streak += 1
-            threshold = max(1, int(cfg.logwatch_fail_threshold or 3))
+            threshold = max(1, int(cfg.logwatch_fail_threshold or 8))
             # Ops TG never fires on a single blip — even if config threshold is 1.
-            ops_threshold = max(3, threshold)
-            became = (
-                not self._logwatch_degraded
-                and self._logwatch_fail_streak >= threshold
-            )
-            self._logwatch_degraded = self._logwatch_fail_streak >= threshold
+            ops_threshold = max(5, threshold)
             live_ok, live_behind = self._live_tip_healthy()
-            if self._logwatch_degraded:
+            # Hist-only failure while live covers tip: no DEGRADED, no GMGN stampede.
+            if live_ok:
                 self._append_log(
                     "fallback",
-                    f"logwatch DEGRADED (streak={self._logwatch_fail_streak}/"
-                    f"{threshold})"
-                    + (
-                        f"; live tip ok (behind={live_behind}) — без TG/GMGN"
-                        if live_ok
-                        else " → legacy через maintenance; live tip тоже отстаёт"
-                    ),
+                    f"hist hard-fail streak={self._logwatch_fail_streak} "
+                    f"но live tip ok (behind={live_behind}) — "
+                    "без DEGRADED/TG/GMGN",
                 )
+                # Do not accumulate forever while live is fine.
+                self._logwatch_fail_streak = min(
+                    self._logwatch_fail_streak, threshold - 1
+                )
+                self._logwatch_degraded = False
             else:
-                self._append_log(
-                    "fallback",
-                    f"logwatch hard-fail streak={self._logwatch_fail_streak}/"
-                    f"{threshold} — без GMGN, курсор не двигаем"
-                    + (
-                        f"; live tip ok (behind={live_behind})"
-                        if live_ok
-                        else ""
-                    ),
+                became = (
+                    not self._logwatch_degraded
+                    and self._logwatch_fail_streak >= threshold
                 )
-            # TG only when tip discovery is actually unhealthy (store cursor),
-            # never when RPC probe for tip failed (that used to false-DEGRADE).
-            if (
-                became
-                and not live_ok
-                and self._logwatch_fail_streak >= ops_threshold
-            ):
-                await self._ops_alert(
-                    cfg,
-                    kind="degraded",
-                    text=(
-                        "⚠️ Follow-up DEGRADED: logwatch упал "
-                        f"(streak={self._logwatch_fail_streak}). "
-                        f"Live tip отстаёт на {live_behind} блоков — "
-                        "fallback GMGN/Blockscout. "
-                        f"RPC={self._active_rpc}"
-                    ),
-                )
-            # Legacy only when degraded AND live is not covering tip.
-            if self._logwatch_degraded and not live_ok:
-                self._maintenance_wake.set()
+                self._logwatch_degraded = self._logwatch_fail_streak >= threshold
+                if self._logwatch_degraded:
+                    self._append_log(
+                        "fallback",
+                        f"logwatch DEGRADED (streak={self._logwatch_fail_streak}/"
+                        f"{threshold}) → legacy через maintenance; "
+                        f"live tip тоже отстаёт (behind={live_behind})",
+                    )
+                else:
+                    self._append_log(
+                        "fallback",
+                        f"logwatch hard-fail streak={self._logwatch_fail_streak}/"
+                        f"{threshold} — без GMGN, курсор не двигаем"
+                        f"; live tip отстаёт (behind={live_behind})",
+                    )
+                # TG only when tip discovery is actually unhealthy.
+                if became and self._logwatch_fail_streak >= ops_threshold:
+                    await self._ops_alert(
+                        cfg,
+                        kind="degraded",
+                        text=(
+                            "⚠️ Follow-up DEGRADED: logwatch упал "
+                            f"(streak={self._logwatch_fail_streak}). "
+                            f"Live tip отстаёт на {live_behind} блоков — "
+                            "fallback GMGN/Blockscout. "
+                            f"RPC={self._active_rpc}"
+                        ),
+                    )
+                # Legacy only when degraded AND live is not covering tip.
+                if self._logwatch_degraded and not live_ok:
+                    self._maintenance_wake.set()
 
         # After force_all_due (run_now), also nudge maintenance for prune/retry.
         if force_all_due:
@@ -2281,9 +2300,21 @@ class FollowupRunner:
         try:
             tip = int(await asyncio.wait_for(rpc.block_number(), timeout=8.0))
         except TimeoutError:
+            from .chain import reset_followup_rpc_pressure
+
+            reset_followup_rpc_pressure()
+            try:
+                rpc._bind_url(rpc.rpc_url)  # noqa: SLF001
+            except Exception:  # noqa: BLE001
+                pass
             self._append_log("live", "block_number timeout")
-            return False
+            # Stale tip still lets gap burst make progress when RPC is wedged.
+            if self._last_known_tip is None or (time.time() - self._last_tip_ts) > 120.0:
+                return False
+            tip = int(self._last_known_tip)
+            self._append_log("live", f"block_number timeout — stale tip={tip}")
         self._last_known_tip = tip
+        self._last_tip_ts = time.time()
         conf = max(0, int(cfg.logwatch_confirmations or 0))
         safe_tip = max(0, tip - conf)
         base_span = max(50, int(getattr(cfg, "logwatch_live_span", 300) or 300))
@@ -2302,9 +2333,36 @@ class FollowupRunner:
             self._append_log("live", f"live cursor = tip {safe_tip}")
             return True
 
+        live_cursor_i = int(live_cursor)
+        behind = max(0, safe_tip - live_cursor_i)
+        enrich_cap = max(
+            2 * base_span,
+            int(getattr(cfg, "live_gap_enrich_max_blocks", 2_000) or 2_000),
+        )
+        fetch_timeout = min(
+            12.0, float(getattr(cfg, "logwatch_fetch_timeout_sec", 45) or 45)
+        )
+        enrich_budget = float(getattr(cfg, "live_enrich_budget_sec", 3.0) or 3.0)
+        burst_behind = base_span * _LIVE_BURST_BEHIND_MULT
+
+        # Large live gap: burst skip_enrich toward tip FIRST (no TG). Tip enrich
+        # on a 30k gap burned the 45s watchdog while watermark crawled ~100/tick.
+        if behind > burst_behind:
+            await self._live_burst_skip_enrich(
+                cfg,
+                rpc=rpc,
+                watching=watching,
+                safe_tip=safe_tip,
+                enrich_cap=enrich_cap,
+                fetch_timeout=fetch_timeout,
+            )
+            live_cursor = self._store.get_logwatch_live_cursor()
+            live_cursor_i = int(live_cursor) if live_cursor is not None else live_cursor_i
+            behind = max(0, safe_tip - live_cursor_i)
+            tip_from = max(0, safe_tip - span + 1)
+
         # Contiguous from live_cursor when inside/near window; always cover tip
         # for freshness. Never snap live_cursor over an unscanned gap.
-        live_cursor_i = int(live_cursor)
         tip_scan_from = tip_from
         contiguous = live_cursor_i + 1 >= tip_from
         if contiguous:
@@ -2313,15 +2371,23 @@ class FollowupRunner:
             self._last_live_success_ts = time.time()
             return True
 
+        # Still far behind after burst: skip enrich tip scan this tick (RPC save).
+        if behind > enrich_cap:
+            self._append_log(
+                "live",
+                f"tip skip enrich scan (behind={behind}>{enrich_cap}) — "
+                "burst продолжит",
+                percent=20,
+            )
+            if behind <= 2_000:
+                self._last_live_success_ts = time.time()
+            return True
+
         self._append_log(
             "live",
             f"tip {tip_scan_from}…{safe_tip} (wallets={len(watching)}, span={span})",
             percent=10,
         )
-        fetch_timeout = min(
-            12.0, float(getattr(cfg, "logwatch_fetch_timeout_sec", 45) or 45)
-        )
-        enrich_budget = float(getattr(cfg, "live_enrich_budget_sec", 3.0) or 3.0)
         res = await self._logwatch_scan_window(
             cfg,
             rpc=rpc,
@@ -2371,10 +2437,6 @@ class FollowupRunner:
             gap_from = live_now_i + 1
             gap_to = min(tip_from - 1, gap_from + span - 1)
             gap_behind = max(0, safe_tip - live_now_i)
-            enrich_cap = max(
-                2 * span,
-                int(getattr(cfg, "live_gap_enrich_max_blocks", 2_000) or 2_000),
-            )
             gap_skip_enrich = gap_behind > enrich_cap
             self._append_log(
                 "live",
@@ -2414,6 +2476,114 @@ class FollowupRunner:
             self._append_log("live", self._last_message, percent=100)
         return True
 
+    async def _live_burst_skip_enrich(
+        self,
+        cfg: FollowupConfig,
+        *,
+        rpc: Any,
+        watching: list[str],
+        safe_tip: int,
+        enrich_cap: int,
+        fetch_timeout: float,
+    ) -> None:
+        """Multi-chunk skip_enrich toward tip when live watermark is far behind.
+
+        Leaves the last ``enrich_cap`` blocks for tip enrich+alert. No Telegram
+        (skip_enrich). Force-advances stuck windows via hist shrink helper.
+        """
+        try:
+            rpc._prefer_non_alchemy()  # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            pass
+        live_now = int(self._store.get_logwatch_live_cursor() or 0)
+        target = max(live_now, safe_tip - max(100, enrich_cap))
+        if live_now >= target:
+            return
+        burst_span = max(
+            500,
+            min(
+                int(getattr(cfg, "logwatch_burst_catchup_span", 10_000) or 10_000),
+                5_000,
+            ),
+        )
+        max_chunks = max(
+            2,
+            min(8, int(getattr(cfg, "logwatch_catchup_chunks_per_pass", 4) or 4) * 2),
+        )
+        budget = min(
+            28.0,
+            float(getattr(cfg, "live_cycle_timeout_sec", 45) or 45) * 0.65,
+        )
+        t0 = time.time()
+        chunks = 0
+        advanced_total = 0
+        while live_now < target and chunks < max_chunks and (time.time() - t0) < budget:
+            if self._stop_requested:
+                break
+            gap_from = live_now + 1
+            gap_to = min(target, gap_from + burst_span - 1)
+            if gap_to < gap_from:
+                break
+            behind = max(0, safe_tip - live_now)
+            self._append_log(
+                "live",
+                f"burst {gap_from}…{gap_to} "
+                f"(behind={behind}, skip_enrich, chunk={chunks + 1}/{max_chunks})",
+                percent=12 + chunks * 5,
+            )
+            remain = budget - (time.time() - t0)
+            win_timeout = min(fetch_timeout, max(6.0, remain - 1.0))
+            res = await self._hist_scan_shrink_retry(
+                cfg,
+                rpc=rpc,
+                watching=watching,
+                from_block=gap_from,
+                to_block=gap_to,
+                fetch_timeout=win_timeout,
+                cursor_floor=live_now,
+                label=f"live_burst#{chunks + 1}",
+                force_after=1,
+                min_span=50,
+            )
+            chunks += 1
+            if not res or not res.get("advanced") or res.get("advance_to") is None:
+                # Absolute last resort: watermark jump. Deals this far behind tip
+                # are past alert_max_block_lag anyway; hist skip_enrich covers DB.
+                jump_to = min(target, gap_from + max(200, burst_span // 2) - 1)
+                if jump_to > live_now:
+                    self._append_log(
+                        "live",
+                        f"burst RPC dead — jump live {live_now}→{jump_to} "
+                        f"(skip_enrich, no TG)",
+                    )
+                    self._store.set_logwatch_live_cursor(jump_to)
+                    advanced_total += jump_to - live_now
+                    live_now = jump_to
+                    continue
+                break
+            adv = int(res["advance_to"])
+            if adv <= live_now:
+                jump_to = min(target, live_now + max(200, burst_span // 2))
+                if jump_to > live_now:
+                    self._store.set_logwatch_live_cursor(jump_to)
+                    advanced_total += jump_to - live_now
+                    live_now = jump_to
+                    continue
+                break
+            self._store.set_logwatch_live_cursor(adv)
+            advanced_total += adv - live_now
+            live_now = adv
+            if max(0, safe_tip - live_now) <= 2_000:
+                self._last_live_success_ts = time.time()
+        if advanced_total:
+            self._append_log(
+                "live",
+                f"burst +{advanced_total} блоков → live={live_now} "
+                f"(behind={max(0, safe_tip - live_now)})",
+                percent=40,
+            )
+        self._live_timeout_streak = 0
+
     async def _logwatch_pass(
         self,
         cfg: FollowupConfig,
@@ -2428,12 +2598,14 @@ class FollowupRunner:
         getLogs timeouts shrink-and-retry (never the old min(..., 800) trap).
         """
         watching = self._store.list_watching()
+        self._last_hist_advanced = False
         if not watching:
             try:
                 tip = int(
                     await asyncio.wait_for(rpc.block_number(), timeout=12.0)
                 )
                 self._last_known_tip = tip
+                self._last_tip_ts = time.time()
             except TimeoutError as exc:
                 live_ok, _ = self._live_tip_healthy()
                 if live_ok:
@@ -2460,36 +2632,53 @@ class FollowupRunner:
                 await asyncio.wait_for(rpc.block_number(), timeout=12.0)
             )
             self._last_known_tip = tip
+            self._last_tip_ts = time.time()
         except TimeoutError as exc:
-            from .chain import reset_rpc_semaphores
+            from .chain import reset_followup_rpc_pressure
 
-            reset_rpc_semaphores(scope="followup")
+            reset_followup_rpc_pressure()
             # Rebind client sem to the fresh pool (instance still holds old obj).
             try:
+                rpc._prefer_non_alchemy()  # noqa: SLF001
                 rpc._bind_url(rpc.rpc_url)  # noqa: SLF001
             except Exception:  # noqa: BLE001
                 pass
             self._append_log(
                 "logwatch",
-                "block_number timeout — сброс followup sem, повтор",
+                "block_number timeout — сброс followup/shared sem, повтор",
             )
             try:
                 tip = int(
                     await asyncio.wait_for(rpc.block_number(), timeout=12.0)
                 )
                 self._last_known_tip = tip
+                self._last_tip_ts = time.time()
             except TimeoutError:
                 live_ok, _ = self._live_tip_healthy()
-                if live_ok:
+                # Use recent tip so hist can still force-advance stuck windows.
+                if (
+                    self._last_known_tip is not None
+                    and (time.time() - self._last_tip_ts) <= 180.0
+                ):
+                    tip = int(self._last_known_tip)
+                    self._append_log(
+                        "logwatch",
+                        f"block_number timeout — stale tip={tip} "
+                        "(hist catch-up продолжаем)",
+                    )
+                elif live_ok:
                     self._append_log(
                         "logwatch",
                         "block_number timeout — live ok, soft backoff "
                         "(без DEGRADED streak)",
                     )
                     await asyncio.sleep(1.5)
+                    self._last_hist_advanced = False
                     return True
-                self._append_log("logwatch", f"block_number timeout: {exc}")
-                return False
+                else:
+                    self._append_log("logwatch", f"block_number timeout: {exc}")
+                    self._last_hist_advanced = False
+                    return False
         conf = max(0, int(cfg.logwatch_confirmations or 0))
         safe_tip = max(0, tip - conf)
         cursor = self._store.get_logwatch_cursor()
@@ -2502,6 +2691,7 @@ class FollowupRunner:
                 f"курсор = tip {safe_tip} (без реплея истории)",
                 percent=5,
             )
+            self._last_hist_advanced = True
             return True
 
         # Address-less Transfer getLogs: prefer public RPC — Alchemy often 400s.
@@ -2526,6 +2716,7 @@ class FollowupRunner:
                 f"hist up-to-date cursor={cursor} tip={tip}"
             )
             self._append_log("logwatch", self._last_message, percent=100)
+            self._last_hist_advanced = True
             return True
 
         max_chunks = 1
@@ -2646,6 +2837,7 @@ class FollowupRunner:
             ):
                 break
 
+        self._last_hist_advanced = any_advance
         if hard_fail and not any_advance:
             return False
 
@@ -2673,40 +2865,76 @@ class FollowupRunner:
         fetch_timeout: float,
         cursor_floor: int,
         label: str,
+        force_after: int | None = None,
+        min_span: int | None = None,
     ) -> dict[str, Any] | None:
         """Scan ``[from_block, to_block]``; on soft timeout/400 shrink and retry.
 
-        Hist is always ``skip_enrich``: live tip owns alerts. Shrinking keeps
-        the cursor moving instead of stalling on a too-wide OR'd topic query.
-        As a last resort when live tip is healthy, nudge the cursor by a tiny
-        safe amount so a stuck RPC window cannot freeze catch-up forever
-        (hist does not record deals during skip_enrich anyway).
+        Hist/live-burst are ``skip_enrich``: alerts stay on near-tip enrich.
+        Shrinking keeps the cursor moving instead of stalling on a too-wide
+        OR'd topic query. After N shrinks (or min span) ALWAYS force-advance —
+        even 99-block windows time out with 500+ wallet topics; skip_enrich
+        means skipping a stuck RPC window cannot invent TG deal spam.
         """
+        from .chain import reset_followup_rpc_pressure
+
         cur_to = to_block
         attempt = 0
         last: dict[str, Any] | None = None
-        while cur_to >= from_block:
+        min_span_i = max(1, int(min_span or _HIST_MIN_SHRINK_SPAN))
+        force_after_i = max(1, int(force_after or _HIST_FORCE_ADVANCE_AFTER))
+        max_attempts = max(3, force_after_i + 2)
+
+        def _force_advance(span_now: int, reason: str) -> dict[str, Any]:
+            # Skip the whole attempted window. skip_enrich: no TG; stale deals
+            # are past alert_max_block_lag. Tiny +50 steps recreated the freeze.
+            step = max(1, span_now)
+            nudge_to = from_block + step - 1
+            self._append_log(
+                "logwatch",
+                f"{label} {reason} — force-advance +{step} "
+                f"(skip_enrich) → {nudge_to}",
+            )
+            return {
+                "new_deals": 0,
+                "alerts": 0,
+                "skipped": 0,
+                "advanced": True,
+                "advance_to": nudge_to,
+            }
+
+        while cur_to >= from_block and attempt < max_attempts:
             attempt += 1
             span_now = cur_to - from_block + 1
+            if attempt >= 2:
+                try:
+                    reset_followup_rpc_pressure()
+                    rpc._prefer_non_alchemy()  # noqa: SLF001
+                    rpc._bind_url(rpc.rpc_url)  # noqa: SLF001
+                except Exception:  # noqa: BLE001
+                    pass
             res = await self._logwatch_scan_window(
                 cfg,
                 rpc=rpc,
                 watching=watching,
                 from_block=from_block,
                 to_block=cur_to,
-                fetch_timeout=fetch_timeout if attempt == 1 else min(fetch_timeout, 20.0),
+                fetch_timeout=(
+                    fetch_timeout if attempt == 1 else min(fetch_timeout, 12.0)
+                ),
                 label=label if attempt == 1 else f"{label}-shrink{attempt}",
                 cursor_floor=cursor_floor,
                 skip_enrich=True,
             )
             last = res
             if res is None:
-                if span_now <= 200:
-                    return None
-                from .chain import reset_rpc_semaphores
-
-                reset_rpc_semaphores(scope="followup")
-                cur_to = from_block + max(99, span_now // 2) - 1
+                if span_now <= min_span_i or attempt >= force_after_i:
+                    return _force_advance(
+                        span_now, "hard-fail after shrink — unstick"
+                    )
+                reset_followup_rpc_pressure()
+                next_span = max(min_span_i, span_now // 4)
+                cur_to = from_block + next_span - 1
                 self._append_log(
                     "logwatch",
                     f"{label} hard-fail — shrink-retry "
@@ -2715,37 +2943,23 @@ class FollowupRunner:
                 continue
             if res.get("advanced"):
                 return res
-            # Soft timeout / retryable empty: shrink and retry.
-            if span_now <= 150:
-                live_ok, _ = self._live_tip_healthy()
-                if live_ok:
-                    # Unstick: hist skip_enrich does not record deals; live
-                    # covers fresh alerts. Advance a tiny safe step.
-                    nudge = min(50, span_now)
-                    nudge_to = from_block + nudge - 1
-                    self._append_log(
-                        "logwatch",
-                        f"{label} soft-fail after shrink — nudge cursor "
-                        f"+{nudge} (live ok, skip_enrich) → {nudge_to}",
-                    )
-                    return {
-                        "new_deals": 0,
-                        "alerts": 0,
-                        "skipped": 0,
-                        "advanced": True,
-                        "advance_to": nudge_to,
-                    }
-                return res
-            from .chain import reset_rpc_semaphores
-
-            reset_rpc_semaphores(scope="followup")
-            cur_to = from_block + max(99, span_now // 2) - 1
+            # Soft timeout / retryable empty: shrink aggressively or force-advance.
+            if span_now <= min_span_i or attempt >= force_after_i:
+                return _force_advance(
+                    span_now, "soft-fail after shrink — unstick"
+                )
+            reset_followup_rpc_pressure()
+            next_span = max(min_span_i, span_now // 4)
+            cur_to = from_block + next_span - 1
             self._append_log(
                 "logwatch",
                 f"{label} soft-fail — shrink-retry {from_block}…{cur_to}",
             )
-            fetch_timeout = min(fetch_timeout, 18.0)
-        return last
+            fetch_timeout = min(fetch_timeout, 12.0)
+        if last and last.get("advanced"):
+            return last
+        span_left = max(1, cur_to - from_block + 1) if cur_to >= from_block else 1
+        return _force_advance(span_left, "exhausted shrink — unstick")
 
     async def _fetch_unique_buys_cached(
         self,
@@ -3062,8 +3276,8 @@ class FollowupRunner:
                 # finishes under the 15s get_logs wall-timeout. A single
                 # 800–10k OR'd-topic query routinely timed out and froze lag.
                 rpc_chunk = max(
-                    50,
-                    int(getattr(cfg, "logwatch_hist_rpc_chunk", 400) or 400),
+                    25,
+                    int(getattr(cfg, "logwatch_hist_rpc_chunk", 100) or 100),
                 )
                 chunk_size = min(window, rpc_chunk)
             else:

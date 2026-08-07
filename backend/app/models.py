@@ -242,9 +242,10 @@ class WatchWalletFilters(BaseModel):
     max_wallet_balance_eth: float | None = None
     min_hold_time_minutes: float | None = None
     max_hold_time_minutes: float | None = None
+    # Хвать: ровно одна unique-покупка за окно (первая сделка).
     min_tokens_traded_7d: float | None = 1.0
-    max_tokens_traded_7d: float | None = 3.0
-    tokens_unique_period: TokensUniquePeriod = TokensUniquePeriod.d7
+    max_tokens_traded_7d: float | None = 1.0
+    tokens_unique_period: TokensUniquePeriod = TokensUniquePeriod.d30
 
 
 class WatchConfig(BaseModel):
@@ -373,7 +374,9 @@ class FollowupConfig(BaseModel):
     # Wall-time budget for multi-chunk hist catch-up inside one cycle.
     logwatch_catchup_time_budget_sec: float = Field(default=90.0, ge=10.0, le=300.0)
     # eth_getLogs internal block chunk for hist (keeps each RPC under wall-timeout).
-    logwatch_hist_rpc_chunk: int = Field(default=400, ge=50, le=5_000)
+    # Keep small: address-less Transfer + hundreds of wallet topics times out
+    # even at ~100–400 blocks on public/Alchemy Robinhood RPCs.
+    logwatch_hist_rpc_chunk: int = Field(default=100, ge=25, le=5_000)
     # While catching up / in the dedicated live loop, scan this many tip blocks
     # with full enrich+alert. Keep small so each live tick finishes in <1–2s.
     logwatch_live_span: int = Field(default=300, ge=50, le=20_000)
@@ -410,8 +413,8 @@ class FollowupConfig(BaseModel):
     gmgn_repair_batch: int = Field(default=8, ge=0, le=64)
     # After this many consecutive logwatch hard-failures, mark degraded and
     # fall back to legacy GMGN/Blockscout. Soft getLogs timeouts do not count.
-    # Default 3 absorbs single Alchemy blips without DEGRADED spam.
-    logwatch_fail_threshold: int = Field(default=3, ge=1, le=20)
+    # Default 8 absorbs Alchemy blips + hist soft-fail flaps without DEGRADED spam.
+    logwatch_fail_threshold: int = Field(default=8, ge=1, le=20)
     # Cancel a stuck cycle after this many seconds (watchdog).
     cycle_timeout_sec: int = Field(default=180, ge=30, le=3600)
     # Slow maintenance loop (backfill/prune/reconcile/legacy) — separate from hist.
@@ -420,7 +423,8 @@ class FollowupConfig(BaseModel):
     # Ops TG when tip−cursor exceeds this many blocks (~10 bl/s → 600≈1 min).
     cursor_lag_alert_blocks: int = Field(default=6_000, ge=100, le=500_000)
     # Min seconds between identical ops alerts (spam guard).
-    ops_alert_cooldown_sec: int = Field(default=600, ge=60, le=86400)
+    # 15m cuts DEGRADED↔Restored flap noise when RPC is intermittently wedged.
+    ops_alert_cooldown_sec: int = Field(default=900, ge=60, le=86400)
     # Transactional outbox for deal alerts: claim + enqueue commit together so
     # a crash mid-send cannot drop an alert (a dispatcher redelivers).
     outbox_enabled: bool = True
