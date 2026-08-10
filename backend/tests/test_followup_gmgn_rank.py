@@ -246,6 +246,112 @@ async def test_logwatch_uncertain_gmgn_does_not_invent_deal2(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_seed_miss_with_many_uniques_marks_past_max(tmp_path, monkeypatch):
+    """Wrong seed + 100 GMGN uniques must not invent Dora-style local #4."""
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    wallet = "0xaaa0000000000000000000000000000000000001"
+    stale_seed = "0xbbb0000000000000000000000000000000000001"
+    tip = "0xccc0000000000000000000000000000000000001"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token=stale_seed,
+                token_symbol="STALE",
+                bought_tokens=1.0,
+                bought_usd=100.0,
+                mcap_at_first_buy=8_000.0,
+                buys_count=1,
+                first_tx="0xseed",
+            )
+        ],
+        max_deals=5,
+    )
+    cfg = FollowupConfig(
+        enabled=True,
+        max_deals=5,
+        alert_on_deals=[2, 3, 4, 5],
+        max_mcap_alert=50_000.0,
+        buys_only=False,
+    )
+    store.save_config(cfg)
+
+    buys = [
+        GmgnBuy(f"0x{i:040x}", f"T{i}", "", float(1_000 + i))
+        for i in range(1, 21)
+    ]
+    # tip appears late in GMGN history — not a follow-up #2…#5
+    buys.append(GmgnBuy(tip, "DORA", "", 2_000.0))
+
+    async def many_uniques(_wallet: str, **_kwargs):
+        return UniqueBuysResult(buys=buys, ok=True, rate_limited=False)
+
+    monkeypatch.setattr("app.followup.fetch_unique_buys", many_uniques)
+    monkeypatch.setattr("app.gmgn_portfolio.gmgn_api_configured", lambda: True)
+    monkeypatch.setattr("app.gmgn_portfolio.gmgn_circuit_open", lambda: False)
+
+    runner = FollowupRunner(store=store)
+    delivered: list[int] = []
+
+    async def capture_alert(*_a, **_k):
+        delivered.append(1)
+        return True
+
+    transfers = [
+        InboundTransfer(
+            wallet=wallet,
+            token=tip.lower(),
+            sender=wallet,
+            tx_hash="0xtip",
+            block_number=99_900,
+            bought_at=__import__("time").time() - 10,
+        )
+    ]
+    with (
+        patch(
+            "app.followup.fetch_inbound_transfers",
+            AsyncMock(return_value=transfers),
+        ),
+        patch.object(
+            runner,
+            "_prefetch_transfer_enrichment",
+            AsyncMock(
+                return_value={
+                    (wallet, tip.lower(), "0xtip"): (
+                        9_000.0,
+                        50.0,
+                        None,
+                        "DORA",
+                        "Dora",
+                    )
+                }
+            ),
+        ),
+        patch.object(runner, "_deliver_deal_alert", side_effect=capture_alert),
+    ):
+        await runner._logwatch_scan_window(
+            cfg,
+            rpc=MagicMock(),
+            watching=[wallet],
+            from_block=99_800,
+            to_block=100_000,
+            fetch_timeout=5.0,
+            label="live",
+        )
+
+    assert delivered == []
+    _seen, deal_count, status = store.get_wallet_scan_meta(wallet)
+    assert status == "done"
+    assert tip.lower() not in store.known_tokens(wallet) or all(
+        int(d["deal_index"]) != 4 or d["token"] != tip.lower()
+        for d in store.list_deals_for_wallet(wallet)
+    )
+
+
+@pytest.mark.asyncio
 async def test_repair_marks_done_when_gmgn_past_max(tmp_path, monkeypatch):
     store = FollowupStore(
         db_path=str(tmp_path / "followup.db"),

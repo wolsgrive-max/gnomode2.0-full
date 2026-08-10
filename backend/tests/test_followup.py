@@ -1250,6 +1250,16 @@ def test_record_deal_renumbers_by_block_not_insert_order(tmp_path):
         max_deals=5,
         max_mcap_alert=50_000,
     )
+    # Pin seed buy time so later inserts with explicit bought_at renumber
+    # against a stable timeline (ingest uses time.time() otherwise).
+    store.set_deal_block(
+        wallet,
+        "0xBBB0000000000000000000000000000000000001",
+        1000,
+        bought_at=1_000.0,
+        max_deals=5,
+        renumber=True,
+    )
     # Insert later token first (higher block), then earlier token (lower block).
     d_late = store.record_deal(
         wallet=wallet,
@@ -1258,6 +1268,7 @@ def test_record_deal_renumbers_by_block_not_insert_order(tmp_path):
         mcap_at_buy=5_000.0,
         tx_hash="0xlate",
         block_number=3000,
+        bought_at=3_000.0,
         max_deals=5,
     )
     d_early = store.record_deal(
@@ -1267,6 +1278,7 @@ def test_record_deal_renumbers_by_block_not_insert_order(tmp_path):
         mcap_at_buy=4_000.0,
         tx_hash="0xearly",
         block_number=2000,
+        bought_at=2_000.0,
         max_deals=5,
     )
     assert d_late is not None and d_early is not None
@@ -1275,6 +1287,52 @@ def test_record_deal_renumbers_by_block_not_insert_order(tmp_path):
     w = next(x for x in rows if x.address == wallet.lower())
     by_sym = {d.token_symbol: d.deal_index for d in w.deals}
     assert by_sym == {"T1": 1, "EARLY": 2, "LATE": 3}
+
+
+def test_renumber_does_not_put_known_block_before_older_seed(tmp_path):
+    """Regression: Hayden-style bug — fresh Blockscout hit must not become #2
+    ahead of an older seed that still has block_number=0.
+    """
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    wallet = "0xAAA0000000000000000000000000000000000001"
+    seed = "0xBBB0000000000000000000000000000000000001"
+    fresh = "0xCCC0000000000000000000000000000000000002"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token=seed,
+                token_symbol="SEED",
+                bought_tokens=1.0,
+                bought_usd=40.0,
+                mcap_at_first_buy=8_000.0,
+                buys_count=1,
+                first_tx="0xseed",
+            )
+        ],
+        max_deals=5,
+        max_mcap_alert=50_000,
+    )
+    # Seed stays at block=0 (legacy GMGN) but bought earlier.
+    store.set_deal_block(
+        wallet, seed, 0, bought_at=1_700_000_000.0, max_deals=5, renumber=False
+    )
+    store.record_deal(
+        wallet=wallet,
+        token=fresh,
+        token_symbol="FRESH",
+        mcap_at_buy=20_000.0,
+        tx_hash="0xfresh",
+        block_number=28_000_000,
+        bought_at=1_700_100_000.0,
+        max_deals=5,
+    )
+    w = store.list_wallets()[0]
+    by_sym = {d.token_symbol: d.deal_index for d in w.deals}
+    assert by_sym == {"SEED": 1, "FRESH": 2}
 
 
 def test_delete_airdrop_deal_renumbers(tmp_path):
@@ -1524,8 +1582,10 @@ def test_gmgn_block_keeps_earlier_buy_before_later_blockscout(tmp_path):
     ]
 
 
-def test_zero_block_gmgn_row_gets_pushed_by_renumber(tmp_path):
-    """Regression document: block=0 GMGN rows sort after real blocks → #3 after #4."""
+def test_zero_block_gmgn_row_keeps_place_via_bought_at(tmp_path):
+    """Regression: missing block_number must not push a GMGN buy after a later
+    Blockscout hit (the old «unknown block → sort last» bug).
+    """
     store = FollowupStore(
         db_path=str(tmp_path / "followup.db"),
         config_path=str(tmp_path / "followup.json"),
@@ -1551,6 +1611,9 @@ def test_zero_block_gmgn_row_gets_pushed_by_renumber(tmp_path):
         ],
         max_deals=5,
     )
+    store.set_deal_block(
+        wallet, seed, 26_334_310, bought_at=1_700_000_000.0, max_deals=5, renumber=True
+    )
     store.apply_gmgn_buy_order(
         wallet,
         [
@@ -1559,13 +1622,15 @@ def test_zero_block_gmgn_row_gets_pushed_by_renumber(tmp_path):
                 "symbol": "ALCOR",
                 "tx_hash": "0xalcor",
                 "block_number": 28_607_589,
+                "bought_at": 1_700_000_100.0,
                 "mcap_at_buy": 10_000.0,
             },
             {
                 "token": liluni,
                 "symbol": "LILUNI",
                 "tx_hash": "0xliluni",
-                "block_number": 0,  # the defect
+                "block_number": 0,  # still unknown on chain
+                "bought_at": 1_700_000_200.0,  # but GMGN knows the time
                 "mcap_at_buy": 15_529.0,
             },
         ],
@@ -1578,11 +1643,217 @@ def test_zero_block_gmgn_row_gets_pushed_by_renumber(tmp_path):
         mcap_at_buy=17_980.0,
         tx_hash="0xponsi",
         block_number=28_693_205,
+        bought_at=1_700_000_300.0,
         max_deals=5,
     )
     assert ponsi_deal is not None
-    # Without a real LILUNI block, PONSI steals a lower index — the Walter bug.
     by_sym = {
         r["token_symbol"]: r["deal_index"] for r in store.list_deals_for_wallet(wallet)
     }
-    assert by_sym["PONSI"] < by_sym["LILUNI"]
+    assert by_sym["LILUNI"] < by_sym["PONSI"]
+    assert by_sym == {"IGNOTUS": 1, "ALCOR": 2, "LILUNI": 3, "PONSI": 4}
+
+
+def test_parked_orphan_survives_renumber(tmp_path):
+    """GMGN-parked tip orphans must not re-enter #2…#N via record_deal renumber."""
+    from app.followup_store import _PARKED_DEAL_INDEX_BASE
+
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    wallet = "0xaaa0000000000000000000000000000000000001"
+    seed = "0xbbb0000000000000000000000000000000000002"
+    gmgn2 = "0xccc0000000000000000000000000000000000003"
+    orphan = "0xddd0000000000000000000000000000000000004"
+    later = "0xeee0000000000000000000000000000000000005"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token=seed,
+                token_symbol="SEED",
+                bought_tokens=1.0,
+                bought_usd=50.0,
+                mcap_at_first_buy=8_000.0,
+                buys_count=1,
+                first_block=100,
+                first_tx="0xseed",
+            )
+        ],
+        max_deals=5,
+    )
+    store.apply_gmgn_buy_order(
+        wallet,
+        [
+            {
+                "token": gmgn2,
+                "symbol": "G2",
+                "tx_hash": "0xg2",
+                "block_number": 200,
+                "bought_usd": 40.0,
+            }
+        ],
+        max_deals=5,
+    )
+    # Simulate a fresh local tip parked while GMGN lags.
+    with store._lock:
+        with store._connect() as conn:
+            conn.execute(
+                "INSERT INTO deals ("
+                "wallet, token, token_symbol, deal_index, mcap_at_buy, "
+                "bought_usd, tx_hash, block_number, bought_at, notified, created_at"
+                ") VALUES (?, ?, 'ORPH', ?, 9000, 30, '0xor', 250, ?, 0, ?)",
+                (
+                    wallet.lower(),
+                    orphan.lower(),
+                    _PARKED_DEAL_INDEX_BASE + 250,
+                    1_700_000_100.0,
+                    1_700_000_100.0,
+                ),
+            )
+            conn.commit()
+    # Later Blockscout/record_deal must not absorb the orphan into normal ranks.
+    deal = store.record_deal(
+        wallet=wallet,
+        token=later,
+        token_symbol="LATER",
+        mcap_at_buy=10_000.0,
+        bought_usd=25.0,
+        tx_hash="0xlater",
+        block_number=300,
+        bought_at=1_700_000_200.0,
+        max_deals=5,
+    )
+    assert deal is not None
+    assert 2 <= deal.deal_index <= 3
+    rows = {r["token"].lower(): int(r["deal_index"]) for r in store.list_deals_for_wallet(wallet)}
+    assert rows[seed.lower()] == 1
+    assert rows[gmgn2.lower()] < _PARKED_DEAL_INDEX_BASE
+    assert rows[later.lower()] < _PARKED_DEAL_INDEX_BASE
+    assert rows[orphan.lower()] >= _PARKED_DEAL_INDEX_BASE
+    # Parked orphan must not steal a normal alert rank.
+    assert len([i for i in rows.values() if i < _PARKED_DEAL_INDEX_BASE]) == 3
+
+
+def test_tip_filling_max_deals_marks_done_keeps_unnotified(tmp_path):
+    """Last tip slot flips wallet to done but deal stays alertable (not notified)."""
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    wallet = "0xaaa0000000000000000000000000000000000011"
+    seed = "0xbbb0000000000000000000000000000000000012"
+    tokens = [
+        f"0x{i:040x}" for i in range(0x100, 0x104)
+    ]
+    tip = "0xccc0000000000000000000000000000000000015"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token=seed,
+                token_symbol="SEED",
+                bought_tokens=1.0,
+                bought_usd=50.0,
+                mcap_at_first_buy=8_000.0,
+                buys_count=1,
+                first_block=100,
+                first_tx="0xseed",
+            )
+        ],
+        max_deals=5,
+    )
+    post = [
+        {
+            "token": tok,
+            "symbol": f"T{i}",
+            "tx_hash": f"0xt{i}",
+            "block_number": 200 + i,
+            "bought_usd": 20.0,
+        }
+        for i, tok in enumerate(tokens)
+    ]
+    post3 = post[:3]
+    store.apply_gmgn_buy_order(
+        wallet,
+        post3
+        + [
+            {
+                "token": tip,
+                "symbol": "TIP",
+                "tx_hash": "0xtip",
+                "block_number": 999,
+                "bought_usd": 22.0,
+                "mcap_at_buy": 9_000.0,
+            }
+        ],
+        max_deals=5,
+    )
+    _seen, deal_count, status = store.get_wallet_scan_meta(wallet)
+    assert deal_count == 5
+    assert status == "done"
+    tip_row = next(
+        r
+        for r in store.list_deals_for_wallet(wallet)
+        if r["token"].lower() == tip.lower()
+    )
+    assert int(tip_row["deal_index"]) == 5
+    assert not tip_row["notified"]
+
+
+def test_update_config_atomic_rmw(tmp_path):
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    store.save_config(FollowupConfig(enabled=True, max_mcap_alert=12_000, interval_sec=30))
+    store.update_config(max_mcap_alert=9_000)
+    cfg = store.load_config()
+    assert cfg.max_mcap_alert == 9_000
+    assert cfg.enabled is True
+    assert cfg.interval_sec == 30
+
+
+def test_ingest_seed_stays_first_when_later_buy_has_earlier_bought_at(tmp_path):
+    """Watch first_token must remain #1 even if a later deal has an earlier ts."""
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    wallet = "0xaaa0000000000000000000000000000000000021"
+    seed = "0xbbb0000000000000000000000000000000000022"
+    other = "0xccc0000000000000000000000000000000000023"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token=seed,
+                token_symbol="SEED",
+                bought_tokens=1.0,
+                bought_usd=50.0,
+                mcap_at_first_buy=8_000.0,
+                buys_count=1,
+                first_block=500,
+                first_tx="0xseed",
+            )
+        ],
+        max_deals=5,
+    )
+    deal = store.record_deal(
+        wallet=wallet,
+        token=other,
+        token_symbol="OTHER",
+        mcap_at_buy=9_000.0,
+        bought_usd=30.0,
+        tx_hash="0xother",
+        block_number=600,
+        bought_at=1.0,  # absurdly early vs seed created_at
+        max_deals=5,
+    )
+    assert deal is not None
+    assert deal.deal_index == 2
+    rows = store.list_deals_for_wallet(wallet)
+    by_tok = {r["token"].lower(): int(r["deal_index"]) for r in rows}
+    assert by_tok[seed.lower()] == 1
+    assert by_tok[other.lower()] == 2

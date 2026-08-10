@@ -23,6 +23,10 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
+# Fresh tip orphans parked outside the alert window until GMGN catches up
+# (or the 900s keep window expires). Must stay out of ``_renumber_deals``.
+_PARKED_DEAL_INDEX_BASE = 1_000_000
+
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 _HEADER_REPAIR_PAGE_SIZES = (4096, 8192, 2048, 1024, 512)
 _DB_OPEN_ERRORS = (
@@ -90,6 +94,18 @@ CREATE TABLE IF NOT EXISTS alert_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_due
     ON alert_outbox(status, next_attempt_at);
+CREATE TABLE IF NOT EXISTS pending_tip_transfers (
+    wallet TEXT NOT NULL,
+    token TEXT NOT NULL,
+    sender TEXT NOT NULL DEFAULT '',
+    tx_hash TEXT NOT NULL DEFAULT '',
+    block_number INTEGER NOT NULL DEFAULT 0,
+    bought_at REAL,
+    queued_at REAL NOT NULL,
+    PRIMARY KEY (wallet, token)
+);
+CREATE INDEX IF NOT EXISTS idx_pending_tip_queued
+    ON pending_tip_transfers(queued_at);
 """
 
 
@@ -145,9 +161,10 @@ def _rotate_aside(path: Path, *, suffix: str) -> Path | None:
 def _try_repair_overwritten_header(path: Path) -> Path | None:
     """Best-effort repair when page-1 header bytes were overwritten.
 
-    Observed failure mode: first ~100 bytes garbage (looks TLS-like) while the
-    rest of a 4KiB-paged DB remains readable. Returns path to a clean dump, or
-    None if repair is not possible.
+    Observed failure mode (2026-08-09): exactly one TLS 1.2 Application Data
+    record (``17 03 03`` + length, 24 bytes total) overwrote offset 0 without
+    truncating the file; the rest of a 4KiB-paged DB remained readable.
+    Returns path to a clean dump, or None if repair is not possible.
     """
     try:
         raw = path.read_bytes()
@@ -224,6 +241,7 @@ class FollowupStore:
         self._db_path = Path(db_path or settings.followup_db_path)
         self._config_path = Path(config_path or settings.followup_config_path)
         self._lock = threading.Lock()
+        self._config_lock = threading.Lock()
         self._ensured = False
         self._db_prepared = False
 
@@ -479,6 +497,21 @@ class FollowupStore:
     # --- config (JSON, same atomic pattern as watch) ---
 
     def load_config(self) -> FollowupConfig:
+        with self._config_lock:
+            return self._load_config_unlocked()
+
+    def save_config(self, cfg: FollowupConfig) -> FollowupConfig:
+        with self._config_lock:
+            return self._save_config_unlocked(cfg)
+
+    def update_config(self, **updates: Any) -> FollowupConfig:
+        """Atomic load→mutate→save so bot/API RMW races cannot drop fields."""
+        with self._config_lock:
+            cfg = self._load_config_unlocked()
+            cfg = cfg.model_copy(update=updates)
+            return self._save_config_unlocked(cfg)
+
+    def _load_config_unlocked(self) -> FollowupConfig:
         path = self._config_path
         if not path.is_file():
             return FollowupConfig()
@@ -488,7 +521,7 @@ class FollowupStore:
         except Exception:  # noqa: BLE001
             return FollowupConfig()
 
-    def save_config(self, cfg: FollowupConfig) -> FollowupConfig:
+    def _save_config_unlocked(self, cfg: FollowupConfig) -> FollowupConfig:
         path = self._config_path
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
@@ -515,13 +548,31 @@ class FollowupStore:
         Missing ``bought_at`` falls back to ``created_at`` — never push
         unknown-block rows after later known-block buys (that bug made a
         fresh Blockscout hit look like deal #2 ahead of the watch seed).
+
+        Watch ``first_token`` is always deal #1 when present. GMGN-parked
+        orphans (``deal_index >= 1_000_000``) are excluded so renumber cannot
+        pull them back into #2…#N.
         """
+        first_row = conn.execute(
+            "SELECT first_token FROM wallets WHERE address=?",
+            (wallet_l,),
+        ).fetchone()
+        first_token = (
+            str(first_row["first_token"] or "").lower() if first_row else ""
+        )
         rows = conn.execute(
-            "SELECT token FROM deals WHERE wallet=? "
-            "ORDER BY COALESCE(NULLIF(bought_at, 0), created_at) ASC, "
+            "SELECT token FROM deals WHERE wallet=? AND deal_index < ? "
+            "ORDER BY "
+            "CASE WHEN ? != '' AND lower(token) = ? THEN 0 ELSE 1 END ASC, "
+            "COALESCE(NULLIF(bought_at, 0), created_at) ASC, "
             "CASE WHEN block_number IS NULL OR block_number <= 0 "
             "THEN 0 ELSE block_number END ASC, token ASC",
-            (wallet_l,),
+            (
+                wallet_l,
+                _PARKED_DEAL_INDEX_BASE,
+                first_token,
+                first_token,
+            ),
         ).fetchall()
         for i, row in enumerate(rows, 1):
             conn.execute(
@@ -652,7 +703,10 @@ class FollowupStore:
                             b.bought_usd,
                             b.first_tx or "",
                             seed_block,
-                            now,
+                            # Never stamp wall-clock now — renumber would put
+                            # later chain buys (earlier bought_at) before seed.
+                            # first_token pin + chain backfill set real times.
+                            None,
                             now,
                         ),
                     )
@@ -672,7 +726,7 @@ class FollowupStore:
                             bought_usd=b.bought_usd,
                             tx_hash=b.first_tx or "",
                             block_number=seed_block,
-                            bought_at=now,
+                            bought_at=None,
                             notified=False,
                             created_at=now,
                         )
@@ -847,6 +901,53 @@ class FollowupStore:
                 )
                 conn.commit()
 
+    def try_claim_ops_alert(
+        self,
+        key: str,
+        *,
+        cooldown_sec: float,
+        now: float | None = None,
+    ) -> bool:
+        """Atomically claim an ops-alert slot if cooldown elapsed.
+
+        Prevents concurrent live+hist ticks from double-pinging Telegram.
+        """
+        self._ensure()
+        ts = float(now if now is not None else time.time())
+        cool = max(1.0, float(cooldown_sec))
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE key=?", (key,)
+                ).fetchone()
+                last = 0.0
+                if row is not None and row["value"] not in (None, ""):
+                    try:
+                        last = float(row["value"])
+                    except (TypeError, ValueError):
+                        last = 0.0
+                if last > 0 and (ts - last) < cool:
+                    return False
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, str(ts)),
+                )
+                conn.commit()
+                return True
+
+    def release_ops_alert_claim(self, key: str) -> None:
+        """Undo a claimed ops-alert slot after a failed / skipped send.
+
+        Without this, a Telegram transport blip would silence the same ``kind``
+        for the full cooldown window even though nothing was delivered.
+        """
+        self._ensure()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("DELETE FROM meta WHERE key=?", (key,))
+                conn.commit()
+
     def get_logwatch_cursor(self) -> int | None:
         raw = self.get_meta("logwatch_cursor")
         if raw is None or raw == "":
@@ -857,7 +958,12 @@ class FollowupStore:
             return None
 
     def set_logwatch_cursor(self, block: int) -> None:
-        self.set_meta("logwatch_cursor", str(max(0, int(block))))
+        """Advance hist cursor monotonically — never regress under races."""
+        target = max(0, int(block))
+        cur = self.get_logwatch_cursor()
+        if cur is not None and target < int(cur):
+            return
+        self.set_meta("logwatch_cursor", str(target))
 
     def get_logwatch_live_cursor(self) -> int | None:
         """Tip-priority scan cursor (independent of historical catch-up)."""
@@ -870,7 +976,12 @@ class FollowupStore:
             return None
 
     def set_logwatch_live_cursor(self, block: int) -> None:
-        self.set_meta("logwatch_live_cursor", str(max(0, int(block))))
+        """Advance tip cursor monotonically — never regress under hist/live races."""
+        target = max(0, int(block))
+        cur = self.get_logwatch_live_cursor()
+        if cur is not None and target < int(cur):
+            return
+        self.set_meta("logwatch_live_cursor", str(target))
 
     def list_deals_needing_chain_backfill(self) -> list[dict[str, Any]]:
         """Deals with a tx_hash but missing block and/or bought_at."""
@@ -1007,7 +1118,8 @@ class FollowupStore:
         Transactional outbox: the business write (notified) and the outbox row
         commit together, so a crash after this point still leaves a ``pending``
         outbox row that the dispatcher redelivers. Returns ``False`` when the
-        deal was already claimed (idempotent).
+        deal was already claimed (idempotent) or an in-flight ``sending`` lease
+        already owns the alert.
         """
         self._ensure()
         wallet_l = wallet.lower()
@@ -1015,6 +1127,14 @@ class FollowupStore:
         now = time.time()
         with self._lock:
             with self._connect() as conn:
+                existing = conn.execute(
+                    "SELECT status FROM alert_outbox WHERE dedup_key=?",
+                    (dedup_key,),
+                ).fetchone()
+                if existing is not None and str(existing["status"]) == "sending":
+                    # In-flight lease — do not re-claim (caller would see True
+                    # with no pending row for immediate dispatch).
+                    return False
                 try:
                     conn.execute(
                         "INSERT INTO alert_log (wallet, token, kind, created_at) "
@@ -1028,14 +1148,57 @@ class FollowupStore:
                     (wallet_l, token_l),
                 )
                 # INSERT OR IGNORE: a leftover row for the same key must not
-                # break the claim; the dispatcher will still deliver it.
-                conn.execute(
+                # break the claim; revive failed rows so TG still delivers.
+                cur = conn.execute(
                     "INSERT OR IGNORE INTO alert_outbox "
                     "(dedup_key, kind, payload, status, attempts, "
                     "created_at, updated_at, next_attempt_at) "
                     "VALUES (?, ?, ?, 'pending', 0, ?, ?, 0)",
                     (dedup_key, kind, payload, now, now),
                 )
+                if cur.rowcount == 0:
+                    existing = conn.execute(
+                        "SELECT status FROM alert_outbox WHERE dedup_key=?",
+                        (dedup_key,),
+                    ).fetchone()
+                    status = str(existing["status"]) if existing is not None else ""
+                    if status == "failed":
+                        conn.execute(
+                            "UPDATE alert_outbox SET status='pending', "
+                            "payload=?, attempts=0, updated_at=?, "
+                            "next_attempt_at=0, last_error=NULL "
+                            "WHERE dedup_key=?",
+                            (payload, now, dedup_key),
+                        )
+                    elif status == "pending":
+                        conn.execute(
+                            "UPDATE alert_outbox SET payload=?, updated_at=? "
+                            "WHERE dedup_key=?",
+                            (payload, now, dedup_key),
+                        )
+                    elif status == "sent":
+                        # unmark_notified may clear deal.notified without
+                        # deleting the outbox row — revive for redelivery.
+                        conn.execute(
+                            "UPDATE alert_outbox SET status='pending', "
+                            "payload=?, attempts=0, updated_at=?, "
+                            "next_attempt_at=0, last_error=NULL, sent_at=NULL "
+                            "WHERE dedup_key=?",
+                            (payload, now, dedup_key),
+                        )
+                    elif status == "sending":
+                        # Race: leased between our pre-check and insert.
+                        conn.execute(
+                            "DELETE FROM alert_log WHERE wallet=? AND token=? "
+                            "AND kind=?",
+                            (wallet_l, token_l, kind),
+                        )
+                        conn.execute(
+                            "UPDATE deals SET notified=0 WHERE wallet=? AND token=?",
+                            (wallet_l, token_l),
+                        )
+                        conn.commit()
+                        return False
                 conn.commit()
                 return True
 
@@ -1061,20 +1224,94 @@ class FollowupStore:
                 conn.commit()
                 return cur.rowcount > 0
 
-    def list_due_outbox(self, *, now: float | None = None, limit: int = 25) -> list[dict]:
-        """Pending outbox rows ready for (re)delivery, oldest first."""
+    def list_due_outbox(
+        self,
+        *,
+        now: float | None = None,
+        limit: int = 25,
+        dedup_key: str | None = None,
+    ) -> list[dict]:
+        """Pending outbox rows ready for (re)delivery, oldest first.
+
+        When ``dedup_key`` is set, fetch that row even if older pending exists
+        (immediate post-claim dispatch must not miss the just-enqueued alert).
+        """
         self._ensure()
         ts = float(now if now is not None else time.time())
         limit = max(1, min(int(limit), 500))
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT id, dedup_key, kind, payload, attempts "
-                "FROM alert_outbox "
-                "WHERE status='pending' AND next_attempt_at <= ? "
-                "ORDER BY id ASC LIMIT ?",
-                (ts, limit),
-            ).fetchall()
+            if dedup_key:
+                rows = conn.execute(
+                    "SELECT id, dedup_key, kind, payload, attempts "
+                    "FROM alert_outbox "
+                    "WHERE status='pending' AND next_attempt_at <= ? "
+                    "AND dedup_key=? "
+                    "ORDER BY id ASC LIMIT ?",
+                    (ts, str(dedup_key), limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, dedup_key, kind, payload, attempts "
+                    "FROM alert_outbox "
+                    "WHERE status='pending' AND next_attempt_at <= ? "
+                    "ORDER BY id ASC LIMIT ?",
+                    (ts, limit),
+                ).fetchall()
         return [dict(r) for r in rows]
+
+    def claim_due_outbox(
+        self,
+        *,
+        now: float | None = None,
+        limit: int = 25,
+        dedup_key: str | None = None,
+        stale_sending_sec: float = 300.0,
+    ) -> list[dict]:
+        """Atomically lease due rows (``pending`` → ``sending``) for one dispatcher.
+
+        Prevents live+hist concurrent ``_dispatch_outbox`` from double-sending
+        the same Telegram alert. Stale ``sending`` rows (crash mid-send) are
+        revived to ``pending`` before claiming.
+        """
+        self._ensure()
+        ts = float(now if now is not None else time.time())
+        limit = max(1, min(int(limit), 500))
+        stale_before = ts - max(60.0, float(stale_sending_sec))
+        claimed: list[dict] = []
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE alert_outbox SET status='pending', updated_at=? "
+                    "WHERE status='sending' AND updated_at < ?",
+                    (ts, stale_before),
+                )
+                if dedup_key:
+                    rows = conn.execute(
+                        "SELECT id, dedup_key, kind, payload, attempts, created_at "
+                        "FROM alert_outbox "
+                        "WHERE status='pending' AND next_attempt_at <= ? "
+                        "AND dedup_key=? "
+                        "ORDER BY id ASC LIMIT ?",
+                        (ts, str(dedup_key), limit),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT id, dedup_key, kind, payload, attempts, created_at "
+                        "FROM alert_outbox "
+                        "WHERE status='pending' AND next_attempt_at <= ? "
+                        "ORDER BY id ASC LIMIT ?",
+                        (ts, limit),
+                    ).fetchall()
+                for row in rows:
+                    cur = conn.execute(
+                        "UPDATE alert_outbox SET status='sending', updated_at=? "
+                        "WHERE id=? AND status='pending'",
+                        (ts, int(row["id"])),
+                    )
+                    if cur.rowcount:
+                        claimed.append(dict(row))
+                conn.commit()
+        return claimed
 
     def mark_outbox_sent(self, outbox_id: int) -> None:
         self._ensure()
@@ -1083,8 +1320,34 @@ class FollowupStore:
             with self._connect() as conn:
                 conn.execute(
                     "UPDATE alert_outbox SET status='sent', sent_at=?, "
-                    "updated_at=?, last_error=NULL WHERE id=?",
+                    "updated_at=?, last_error=NULL "
+                    "WHERE id=? AND status IN ('sending','pending')",
                     (now, now, int(outbox_id)),
+                )
+                conn.commit()
+
+    def mark_outbox_deferred(
+        self,
+        outbox_id: int,
+        *,
+        error: str,
+        next_attempt_at: float,
+    ) -> None:
+        """Soft-retry without burning ``attempts`` (GMGN circuit / tip_lag)."""
+        self._ensure()
+        now = time.time()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE alert_outbox SET status='pending', "
+                    "last_error=?, updated_at=?, next_attempt_at=? "
+                    "WHERE id=? AND status IN ('sending','pending')",
+                    (
+                        (error or "")[:400],
+                        now,
+                        float(next_attempt_at),
+                        int(outbox_id),
+                    ),
                 )
                 conn.commit()
 
@@ -1102,14 +1365,20 @@ class FollowupStore:
         with self._lock:
             with self._connect() as conn:
                 row = conn.execute(
-                    "SELECT attempts FROM alert_outbox WHERE id=?",
+                    "SELECT attempts, status FROM alert_outbox WHERE id=?",
                     (int(outbox_id),),
                 ).fetchone()
+                if row is None:
+                    return
+                # Ignore stale marks after another dispatcher already finished.
+                if str(row["status"]) not in ("sending", "pending"):
+                    return
                 attempts = (int(row["attempts"]) if row else 0) + 1
                 status = "failed" if attempts >= max(1, int(max_attempts)) else "pending"
                 conn.execute(
                     "UPDATE alert_outbox SET attempts=?, status=?, "
-                    "last_error=?, updated_at=?, next_attempt_at=? WHERE id=?",
+                    "last_error=?, updated_at=?, next_attempt_at=? "
+                    "WHERE id=? AND status IN ('sending','pending')",
                     (
                         attempts,
                         status,
@@ -1128,9 +1397,11 @@ class FollowupStore:
             rows = conn.execute(
                 "SELECT status, COUNT(*) AS n FROM alert_outbox GROUP BY status"
             ).fetchall()
-        out = {"pending": 0, "failed": 0, "sent": 0}
+        out = {"pending": 0, "failed": 0, "sent": 0, "sending": 0}
         for r in rows:
             out[str(r["status"])] = int(r["n"])
+        # In-flight leases still count as backlog for ops.
+        out["pending"] = int(out.get("pending", 0)) + int(out.get("sending", 0))
         return out
 
     def prune_outbox(self, *, keep_sent_sec: float = 7 * 24 * 3600) -> int:
@@ -1146,6 +1417,101 @@ class FollowupStore:
                 )
                 conn.commit()
                 return cur.rowcount
+
+    def upsert_pending_tip_transfers(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> int:
+        """Durable tip_lag / skip_enrich queue (survives restart)."""
+        if not rows:
+            return 0
+        self._ensure()
+        n = 0
+        with self._lock:
+            with self._connect() as conn:
+                for r in rows:
+                    wallet = str(r.get("wallet") or "").strip().lower()
+                    token = str(r.get("token") or "").strip().lower()
+                    if not wallet or not token:
+                        continue
+                    queued_at = float(r.get("queued_at") or time.time())
+                    bought = r.get("bought_at")
+                    bought_f = float(bought) if bought is not None else None
+                    conn.execute(
+                        "INSERT INTO pending_tip_transfers ("
+                        "wallet, token, sender, tx_hash, block_number, "
+                        "bought_at, queued_at"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(wallet, token) DO UPDATE SET "
+                        "sender=excluded.sender, "
+                        "tx_hash=excluded.tx_hash, "
+                        "block_number=excluded.block_number, "
+                        "bought_at=COALESCE(excluded.bought_at, "
+                        "pending_tip_transfers.bought_at), "
+                        "queued_at=MIN(pending_tip_transfers.queued_at, "
+                        "excluded.queued_at)",
+                        (
+                            wallet,
+                            token,
+                            str(r.get("sender") or ""),
+                            str(r.get("tx_hash") or ""),
+                            int(r.get("block_number") or 0),
+                            bought_f,
+                            queued_at,
+                        ),
+                    )
+                    n += 1
+                conn.commit()
+        return n
+
+    def list_pending_tip_transfers(
+        self, *, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        self._ensure()
+        limit = max(1, min(int(limit), 500))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT wallet, token, sender, tx_hash, block_number, "
+                "bought_at, queued_at FROM pending_tip_transfers "
+                "ORDER BY queued_at ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_pending_tip_transfers(
+        self, pairs: list[tuple[str, str]]
+    ) -> int:
+        if not pairs:
+            return 0
+        self._ensure()
+        n = 0
+        with self._lock:
+            with self._connect() as conn:
+                for wallet, token in pairs:
+                    cur = conn.execute(
+                        "DELETE FROM pending_tip_transfers "
+                        "WHERE wallet=? AND token=?",
+                        (
+                            str(wallet or "").lower(),
+                            str(token or "").lower(),
+                        ),
+                    )
+                    n += int(cur.rowcount or 0)
+                conn.commit()
+        return n
+
+    def touch_pending_tip_queued_at(self, *, now: float | None = None) -> int:
+        """Freeze age while GMGN circuit is open."""
+        self._ensure()
+        ts = float(now if now is not None else time.time())
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "UPDATE pending_tip_transfers SET queued_at=?",
+                    (ts,),
+                )
+                conn.commit()
+                return int(cur.rowcount or 0)
 
     def list_pending_alert_deals(
         self,
@@ -1528,8 +1894,9 @@ class FollowupStore:
         self._ensure()
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT token, token_symbol, deal_index, block_number, bought_at, "
-                "mcap_at_buy, tx_hash FROM deals WHERE wallet=? "
+                "SELECT token, token_symbol, token_name, deal_index, "
+                "block_number, bought_at, mcap_at_buy, bought_usd, tx_hash, "
+                "notified, created_at FROM deals WHERE wallet=? "
                 "ORDER BY deal_index",
                 (wallet.lower(),),
             ).fetchall()
@@ -1668,7 +2035,9 @@ class FollowupStore:
                             bought,
                             tx,
                             block,
-                            buy_ts if buy_ts > 0 else now,
+                            # Never stamp wall-clock now — that makes hist GMGN
+                            # fills look like tip buys and fires false TG.
+                            buy_ts if buy_ts > 0 else None,
                             now,
                         ),
                     )
@@ -1682,24 +2051,53 @@ class FollowupStore:
                             bought_usd=float(bought) if bought is not None else None,
                             tx_hash=tx,
                             block_number=block,
-                            bought_at=buy_ts if buy_ts > 0 else now,
+                            bought_at=buy_ts if buy_ts > 0 else None,
                             notified=False,
                             created_at=now,
                         )
                     )
                 # Drop Blockscout-only / pre-GMGN ghosts so deal_index stays unique
                 # and matches GMGN post-seed chronology (not discovery time).
+                # Keep fresh un-alerted local tip records — GMGN lag must not
+                # delete a just-bought token before Telegram fires.
                 orphans = conn.execute(
-                    "SELECT token FROM deals WHERE wallet=?",
+                    "SELECT token, notified, created_at, block_number "
+                    "FROM deals WHERE wallet=?",
                     (wallet_l,),
                 ).fetchall()
+                fresh_keep_sec = 900.0
                 for row in orphans:
                     tok = str(row["token"]).lower()
-                    if tok not in keep_tokens:
+                    if tok in keep_tokens:
+                        continue
+                    try:
+                        created = float(row["created_at"] or 0)
+                    except (TypeError, ValueError):
+                        created = 0.0
+                    notified = bool(row["notified"])
+                    try:
+                        block_n = int(row["block_number"] or 0)
+                    except (TypeError, ValueError):
+                        block_n = 0
+                    # Tip local-record always has a real block; Blockscout dust
+                    # ghosts (block=0) must still be purged for deal_index hygiene.
+                    if (
+                        (not notified)
+                        and block_n > 0
+                        and created > 0
+                        and (now - created) <= fresh_keep_sec
+                    ):
+                        # Park outside alert window with a block-unique index
+                        # (900 + block%90 collided across orphans → duplicate ranks).
                         conn.execute(
-                            "DELETE FROM deals WHERE wallet=? AND token=?",
-                            (wallet_l, tok),
+                            "UPDATE deals SET deal_index=? WHERE wallet=? AND token=?",
+                            (_PARKED_DEAL_INDEX_BASE + block_n, wallet_l, tok),
                         )
+                        continue
+                    conn.execute(
+                        "DELETE FROM deals WHERE wallet=? AND token=?",
+                        (wallet_l, tok),
+                    )
                 # GMGN's post-seed order is authoritative for this sync.
                 max_idx = rank - 1
                 status = "done" if max_idx >= limit else "watching"
@@ -1710,6 +2108,36 @@ class FollowupStore:
                 )
                 conn.commit()
         return inserted
+
+    def mark_wallet_done(
+        self,
+        wallet: str,
+        *,
+        deal_count: int | None = None,
+    ) -> None:
+        """Force ``watching`` → ``done`` (spray / seed-miss past max)."""
+        self._ensure()
+        wallet_l = wallet.lower()
+        now = time.time()
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT deal_count FROM wallets WHERE address=?",
+                    (wallet_l,),
+                ).fetchone()
+                if row is None:
+                    return
+                count = (
+                    int(deal_count)
+                    if deal_count is not None
+                    else int(row["deal_count"] or 0)
+                )
+                conn.execute(
+                    "UPDATE wallets SET status='done', deal_count=?, updated_at=? "
+                    "WHERE address=?",
+                    (max(count, int(row["deal_count"] or 0)), now, wallet_l),
+                )
+                conn.commit()
 
     def counts(self) -> tuple[int, int]:
         self._ensure()
@@ -1726,14 +2154,15 @@ class FollowupStore:
         """Move ``done`` wallets back to ``watching`` when max_deals was raised."""
         self._ensure()
         limit = max(1, int(max_deals))
-        with self._connect() as conn:
-            cur = conn.execute(
-                "UPDATE wallets SET status='watching', updated_at=? "
-                "WHERE status='done' AND deal_count < ?",
-                (time.time(), limit),
-            )
-            conn.commit()
-            return int(cur.rowcount or 0)
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "UPDATE wallets SET status='watching', updated_at=? "
+                    "WHERE status='done' AND deal_count < ?",
+                    (time.time(), limit),
+                )
+                conn.commit()
+                return int(cur.rowcount or 0)
 
     def list_wallets(
         self,

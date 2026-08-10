@@ -72,8 +72,6 @@ def classify_tier(
     activity = max(float(row.last_activity_at or 0), float(row.discovered_at or 0))
     if activity > 0 and (now - activity) <= cfg.hot_activity_sec:
         return "hot"
-    if float(row.discovered_at or 0) > 0 and (now - float(row.discovered_at)) <= cfg.hot_activity_sec:
-        return "hot"
     return "warm"
 
 

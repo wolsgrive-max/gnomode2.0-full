@@ -154,9 +154,13 @@ class FollowupBot:
                 logger.warning("Follow-up bot reply failed: %s", exc)
 
     def _chat_allowed(self, chat_id: str, *, chat_type: str = "") -> bool:
-        """Allow configured chats, watch chat, and private DMs to the bot."""
-        if chat_type == "private":
-            return True
+        """Allow only configured follow-up / watch Telegram chats.
+
+        Private DMs are allowed only when the user id is explicitly listed as
+        ``telegram_chat_id`` (or the global watch chat). Open private access
+        previously let anyone who found the bot run /off /run /set_*.
+        """
+        del chat_type  # kept for call-site compatibility
         cfg = followup_store.load_config()
         allowed = {
             resolve_chat_id(cfg.telegram_chat_id),
@@ -194,7 +198,9 @@ class FollowupBot:
             )
 
         if cmd == "/wallets":
-            rows = followup_store.list_wallets(status="watching", limit=30, include_deals=True)
+            rows = followup_store.list_wallets(
+                status="watching", limit=30, include_deals=True
+            )
             if not rows:
                 return "Нет кошельков в watching."
             lines = [f"<b>Watching ({len(rows)})</b>"]
@@ -211,16 +217,12 @@ class FollowupBot:
             return _format_filters(cfg)
 
         if cmd == "/on":
-            cfg = followup_store.load_config()
-            cfg = cfg.model_copy(update={"enabled": True})
-            followup_store.save_config(cfg)
+            followup_store.update_config(enabled=True)
             followup_runner.notify_config_changed()
             return "Follow-up <b>включён</b>."
 
         if cmd == "/off":
-            cfg = followup_store.load_config()
-            cfg = cfg.model_copy(update={"enabled": False})
-            followup_store.save_config(cfg)
+            followup_store.update_config(enabled=False)
             followup_runner.notify_config_changed()
             return "Follow-up <b>выключен</b>."
 
@@ -232,9 +234,7 @@ class FollowupBot:
             if not args:
                 return "Использование: /set_max_mcap 15000"
             val = float(args[0].replace(",", "").replace("_", ""))
-            cfg = followup_store.load_config()
-            cfg = cfg.model_copy(update={"max_mcap_alert": val})
-            followup_store.save_config(cfg)
+            followup_store.update_config(max_mcap_alert=val)
             followup_runner.notify_config_changed()
             return f"max_mcap_alert = <b>{val:,.0f}</b>"
 
@@ -244,9 +244,7 @@ class FollowupBot:
             val = _parse_optional_float(args[0])
             if args[0].strip() == "0":
                 val = 0.0
-            cfg = followup_store.load_config()
-            cfg = cfg.model_copy(update={"min_mcap_alert": val})
-            followup_store.save_config(cfg)
+            followup_store.update_config(min_mcap_alert=val)
             followup_runner.notify_config_changed()
             return f"min_mcap_alert = <b>{val if val is not None else 'off'}</b>"
 
@@ -254,9 +252,7 @@ class FollowupBot:
             if not args:
                 return "Использование: /set_min_bought 50 | /set_min_bought off"
             val = _parse_optional_float(args[0])
-            cfg = followup_store.load_config()
-            cfg = cfg.model_copy(update={"min_bought_usd": val})
-            followup_store.save_config(cfg)
+            followup_store.update_config(min_bought_usd=val)
             followup_runner.notify_config_changed()
             return f"min_bought_usd = <b>{val if val is not None else 'off'}</b>"
 
@@ -264,9 +260,7 @@ class FollowupBot:
             if not args:
                 return "Использование: /set_max_bought 5000 | /set_max_bought off"
             val = _parse_optional_float(args[0])
-            cfg = followup_store.load_config()
-            cfg = cfg.model_copy(update={"max_bought_usd": val})
-            followup_store.save_config(cfg)
+            followup_store.update_config(max_bought_usd=val)
             followup_runner.notify_config_changed()
             return f"max_bought_usd = <b>{val if val is not None else 'off'}</b>"
 
@@ -276,9 +270,7 @@ class FollowupBot:
             flag = _parse_on_off(args[0])
             if flag is None:
                 return "Использование: /set_buys_only on|off"
-            cfg = followup_store.load_config()
-            cfg = cfg.model_copy(update={"buys_only": flag})
-            followup_store.save_config(cfg)
+            followup_store.update_config(buys_only=flag)
             followup_runner.notify_config_changed()
             return f"buys_only = <b>{'on' if flag else 'off'}</b>"
 
@@ -288,9 +280,7 @@ class FollowupBot:
             flag = _parse_on_off(args[0])
             if flag is None:
                 return "Использование: /set_transfers on|off"
-            cfg = followup_store.load_config()
-            cfg = cfg.model_copy(update={"track_transfers": flag})
-            followup_store.save_config(cfg)
+            followup_store.update_config(track_transfers=flag)
             followup_runner.notify_config_changed()
             return f"track_transfers = <b>{'on' if flag else 'off'}</b>"
 
@@ -299,9 +289,7 @@ class FollowupBot:
                 return "Использование: /set_interval 300"
             sec = int(args[0])
             sec = max(5, min(sec, 86400))
-            cfg = followup_store.load_config()
-            cfg = cfg.model_copy(update={"interval_sec": sec})
-            followup_store.save_config(cfg)
+            followup_store.update_config(interval_sec=sec)
             followup_runner.notify_config_changed()
             return f"interval_sec = <b>{sec}</b>"
 

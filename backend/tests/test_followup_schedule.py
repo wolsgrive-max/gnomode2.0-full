@@ -222,6 +222,7 @@ async def test_cycle_skips_confirmed_zero_fail_open_none(tmp_path):
             scan_concurrency=2,
             max_due_per_cycle=10,
             prune_enabled=False,
+            logwatch_enabled=False,
         )
     )
     zero_w = "0xaaa0000000000000000000000000000000000001"
@@ -271,8 +272,10 @@ async def test_cycle_skips_confirmed_zero_fail_open_none(tmp_path):
         patch.object(runner, "_prune_stale_wallets", AsyncMock(return_value=0)),
         patch("app.followup.gmgn_api_configured", lambda: False, create=True),
     ):
-        # Avoid importing gmgn wait path noise — circuit block is try/except.
-        await runner.run_cycle(store.load_config())
+        cfg = store.load_config()
+        await runner.run_cycle(cfg)
+        # Balance/legacy scan lives in maintenance (off hist watchdog).
+        await runner._maintenance_pass(cfg)
 
     assert zero_w in [a.lower() for a in store.list_watching()]
     assert runner.status().last_skipped_zero_balance >= 1

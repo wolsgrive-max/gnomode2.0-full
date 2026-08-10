@@ -117,12 +117,16 @@ async def index_refresh():
 
 @app.get("/api/health")
 async def health():
+    from .chain import resolve_rpc_urls, _redact_rpc_url
     from .screener_feed import using_remote_screener
 
+    pool = resolve_rpc_urls()
     return {
         "ok": True,
         "chain_id": 4663,
-        "rpc_url": settings.rpc_url.split("/v2/")[0] if "/v2/" in settings.rpc_url else settings.rpc_url,
+        "rpc_url": _redact_rpc_url(pool[0]) if pool else settings.rpc_url,
+        "alchemy_configured": bool((settings.alchemy_api_key or "").strip()),
+        "rpc_pool_size": len(pool),
         "mcap_threshold": settings.mcap_threshold,
         "screener_feed": "truegnomode" if using_remote_screener() else "local",
     }
@@ -275,6 +279,18 @@ async def watch_test_telegram():
 async def watch_clear_seen():
     watch_store.clear_seen()
     return {"ok": True, "seen_count": 0}
+
+
+@app.post("/api/watch/clear-pending")
+async def watch_clear_pending():
+    """Soft-clear pending-parse queue (queued_at) without wiping ATH hold peaks."""
+    cleared = watch_store.clear_all_pending_queued()
+    pending_left = len(watch_store.load_pending_parse())
+    return {
+        "ok": True,
+        "cleared": cleared,
+        "pending_count": pending_left,
+    }
 
 
 @app.get("/api/hvat/status")
@@ -458,17 +474,15 @@ async def followup_raybot_webhook(request: Request):
 
 
 async def _handle_raybot_event(payload: dict, event_type: str) -> None:
-    from .followup import alert_kwargs_from_config, estimate_token_mcap, should_alert_deal
-    from .telegram import (
-        resolve_chat_id,
-        resolve_topic_id,
-        send_followup_deal,
-        telegram_configured,
-    )
+    from .followup import alert_kwargs_for_wallet, estimate_token_mcap, should_alert_deal
+    from .models import FollowupDealRow
+    from .telegram import resolve_chat_id, resolve_topic_id, telegram_configured
 
     if event_type not in ("buy", "evm_buy", "swap"):
         return
     cfg = followup_store.load_config()
+    if not cfg.enabled:
+        return
     followed = payload.get("followed_wallets") or []
     tokens = payload.get("tokens") or {}
     event = payload.get("event") or {}
@@ -502,41 +516,145 @@ async def _handle_raybot_event(payload: dict, event_type: str) -> None:
             logging.getLogger(__name__).debug("raybot entry mcap failed: %s", exc)
     if mcap is None and mint:
         mcap = await estimate_token_mcap(mint)
+    chat = resolve_chat_id(cfg.telegram_chat_id)
+    topic_id = resolve_topic_id(cfg.telegram_topic_id)
+    if not telegram_configured(chat):
+        return
     for w in followed:
         addr = str((w or {}).get("address") or "").lower()
         if not addr or not mint:
             continue
-        deal = followup_store.record_deal(
-            wallet=addr,
-            token=mint,
-            token_symbol=symbol,
-            mcap_at_buy=mcap,
-            tx_hash=tx,
-            max_deals=cfg.max_deals,
-        )
-        if not deal:
+        try:
+            verdict = await followup_runner._gmgn_rank_verdict(addr, mint, cfg)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).debug("raybot gmgn rank: %s", exc)
+            # Transient GMGN failure — durable-queue for live drain (same as
+            # logwatch tip_lag). Bare continue permanently dropped the buy.
+            try:
+                from .followup_logwatch import InboundTransfer
+
+                followup_runner._queue_skip_enrich_transfers(
+                    [
+                        InboundTransfer(
+                            wallet=addr,
+                            token=mint.lower(),
+                            sender="",
+                            tx_hash=tx or "",
+                            block_number=0,
+                            # Unknown chain time — do not invent wall clock
+                            # (that made tip_lag look forever-fresh).
+                            bought_at=0.0,
+                        )
+                    ]
+                )
+            except Exception:  # noqa: BLE001
+                pass
             continue
+        if verdict.uncertain:
+            try:
+                from .followup_logwatch import InboundTransfer
+
+                followup_runner._queue_skip_enrich_transfers(
+                    [
+                        InboundTransfer(
+                            wallet=addr,
+                            token=mint.lower(),
+                            sender="",
+                            tx_hash=tx or "",
+                            block_number=0,
+                            bought_at=0.0,
+                        )
+                    ]
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            continue
+        if verdict.past_max:
+            continue
+        if verdict.rank is None or int(verdict.rank) not in (
+            cfg.alert_on_deals or [2, 3, 4, 5]
+        ):
+            continue
+        tip_block = 0
+        tip_bought_at: float | None = None
+        if tx.startswith("0x"):
+            try:
+                from .chain import RpcClient
+
+                rpc = RpcClient(concurrency=1, sem_scope="followup")
+                results = await asyncio.wait_for(
+                    rpc._jsonrpc_batch(  # noqa: SLF001
+                        [("eth_getTransactionByHash", [tx])]
+                    ),
+                    timeout=4.0,
+                )
+                raw = results[0] if results else None
+                if isinstance(raw, dict):
+                    bn = raw.get("blockNumber")
+                    if bn is not None:
+                        tip_block = int(bn, 16) if isinstance(bn, str) else int(bn)
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger(__name__).debug("raybot tx block: %s", exc)
+        try:
+            await followup_runner._sync_wallet_gmgn_order(
+                addr,
+                cfg,
+                post_seed=list(verdict.post_seed),
+                tip_token=mint,
+                tip_symbol=symbol,
+                tip_tx=tx,
+                tip_block=tip_block,
+                tip_bought_at=tip_bought_at,
+                tip_mcap=mcap,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning("raybot sync failed: %s", exc)
+            continue
+        deal = None
+        for row in followup_store.list_deals_for_wallet(addr):
+            if str(row.get("token") or "").lower() == mint.lower():
+                deal = FollowupDealRow(
+                    wallet=addr,
+                    token=mint.lower(),
+                    token_symbol=str(row.get("token_symbol") or symbol or ""),
+                    token_name="",
+                    deal_index=int(row.get("deal_index") or 0),
+                    mcap_at_buy=(
+                        float(row["mcap_at_buy"])
+                        if row.get("mcap_at_buy") is not None
+                        else mcap
+                    ),
+                    bought_usd=(
+                        float(row["bought_usd"])
+                        if row.get("bought_usd") is not None
+                        else None
+                    ),
+                    tx_hash=str(row.get("tx_hash") or tx or ""),
+                    block_number=int(row.get("block_number") or 0),
+                    bought_at=(
+                        float(row["bought_at"]) if row.get("bought_at") else None
+                    ),
+                    notified=bool(row.get("notified")),
+                    created_at=float(row.get("created_at") or time.time()),
+                )
+                break
+        if deal is None or deal.notified:
+            continue
+        gate = alert_kwargs_for_wallet(cfg, None)
         if not should_alert_deal(
             deal.deal_index,
             deal.mcap_at_buy,
             bought_usd=deal.bought_usd,
-            **alert_kwargs_from_config(cfg),
+            **gate,
         ):
             continue
-        chat = resolve_chat_id(cfg.telegram_chat_id)
-        if not telegram_configured(chat):
-            continue
-        if not followup_store.mark_notified(deal.wallet, deal.token):
-            continue
         try:
-            await send_followup_deal(
+            await followup_runner._deliver_deal_alert(
                 chat,
-                wallet=deal.wallet,
-                token=deal.token,
-                token_symbol=deal.token_symbol,
-                deal_index=deal.deal_index,
-                mcap_at_buy=deal.mcap_at_buy,
-                topic_id=resolve_topic_id(cfg.telegram_topic_id),
+                deal=deal,
+                topic_id=topic_id,
+                check_honeypot=True,
+                origin="raybot",
             )
         except Exception as exc:  # noqa: BLE001
             logging.getLogger(__name__).warning("webhook alert failed: %s", exc)

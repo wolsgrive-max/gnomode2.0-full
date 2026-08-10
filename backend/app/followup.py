@@ -5,12 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
 
 from .blockscout import scan_address_token_transfers
-from .buy_gate import is_wallet_initiated_buy, method_is_non_buy
+from .buy_gate import (
+    is_wallet_initiated_buy,
+    method_is_non_buy,
+    wallet_sent_quote_in_tx,
+)
 from .config import settings
 from .constants import QUOTE_TOKENS
 from .followup_schedule import (
@@ -20,8 +25,12 @@ from .followup_schedule import (
     select_due_batch,
 )
 from .followup_logwatch import (
+    InboundTransfer,
     backfill_deal_chain_times,
     fetch_inbound_transfers,
+    fetch_inbound_transfers_result,
+    topic_batch_count,
+    tx_from_and_input,
     tx_senders,
 )
 from .followup_store import FollowupStore, followup_store
@@ -37,6 +46,7 @@ from .models import (
 from .pools import fetch_dexscreener_pairs
 from .raybot import RayBotClient, raybot_client, raybot_configured
 from .telegram import (
+    resolve_alert_freshness,
     resolve_chat_id,
     resolve_topic_id,
     send_followup_deal,
@@ -54,20 +64,25 @@ _BS_FALLBACK_CONCURRENCY = 8
 # Hot-path GMGN concurrency stays moderate even if config is higher.
 _HOT_GMGN_CONCURRENCY = 4
 # Hist lag above this uses burst catch-up spans (not the old min(..., 800) trap).
-_HIST_BURST_LAG = 50_000
+# Was 50k — lag ~45k stayed on tiny catchup spans forever (plateau).
+_HIST_BURST_LAG = 15_000
 # After this many hist shrinks on the same window, force-advance (skip_enrich).
 _HIST_FORCE_ADVANCE_AFTER = 2
 _HIST_MIN_SHRINK_SPAN = 25
-# Live watermark this far behind tip → burst skip_enrich (no TG) before enrich.
+# Legacy multiplier (kept for callers); live burst now triggers at enrich_cap
+# so 2001–live_span×10 is not a dead zone of tip-skip-with-no-progress.
 _LIVE_BURST_BEHIND_MULT = 10
 
 
-def hist_span_for_lag(lag: int, cfg: FollowupConfig) -> int:
+def hist_span_for_lag(
+    lag: int, cfg: FollowupConfig, n_wallets: int = 0
+) -> int:
     """Block window size for one hist getLogs attempt.
 
-    Large lag → burst span (5k–15k class). Never clamp to a tiny hard cap:
-    that made tip growth outpace catch-up forever. Shrink happens only after
-    timeout/400 via the caller retry loop.
+    Large lag → burst span (5k–15k class) when the watchlist is small.
+    With hundreds of OR'd wallet topics each eth_getLogs is heavy — cap the
+    window so progressive sub-chunks can finish inside the fetch timeout
+    instead of timing out the whole 10k window and force-advancing.
     """
     lag_i = max(0, int(lag))
     span_max = max(100, int(cfg.logwatch_max_span or 3_000))
@@ -79,10 +94,216 @@ def hist_span_for_lag(lag: int, cfg: FollowupConfig) -> int:
         int(getattr(cfg, "logwatch_burst_catchup_span", 10_000) or 10_000),
     )
     if lag_i > _HIST_BURST_LAG:
-        return span_burst
-    if lag_i > span_max * 2:
-        return span_catchup
-    return span_max
+        base = span_burst
+    elif lag_i > span_max * 2:
+        base = span_catchup
+    else:
+        base = span_max
+
+    n = max(0, int(n_wallets or 0))
+    if n <= 0:
+        return base
+    batches = topic_batch_count(n)
+    # Single topic batch is cheap enough for full burst/catchup windows.
+    if batches <= 1:
+        return base
+    rpc_chunk = max(
+        25, int(getattr(cfg, "logwatch_hist_rpc_chunk", 100) or 100)
+    )
+    # ≥3 topic batches (400+ wallets): keep each eth_getLogs small, but the
+    # *window* must still outrun tip (~10 bl/s). Cap 75 made lag grow forever.
+    if batches >= 3:
+        rpc_chunk = min(rpc_chunk, 40)
+        target_subs = max(8, 32 // batches)  # ~8–10 subcalls → 320–400 bl
+        floor = 300
+    else:
+        rpc_chunk = min(rpc_chunk, 60)
+        target_subs = max(5, 20 // batches)
+        floor = 200
+    cap = max(floor, rpc_chunk * target_subs)
+    return min(base, cap)
+
+
+def live_span_for_watchlist(base_span: int, n_wallets: int) -> int:
+    """Shrink tip enrich window when OR'd wallet topics make getLogs slow.
+
+    With 600+ wallets (≥3 topic batches) a 50–100 block tip window never
+    finishes under Alchemy load before the 8–12s tip budget — purchases at
+    tip stay invisible. Prefer tiny newest-tip windows that complete.
+    """
+    span = max(8, int(base_span or 300))
+    n = max(0, int(n_wallets or 0))
+    if n <= 0:
+        return span
+    batches = topic_batch_count(n)
+    if batches <= 1:
+        return span
+    # 2 batches → ≤40; 3+ → ≤16 (was 100 — always timed out at 634 wallets).
+    if batches >= 3:
+        return max(8, min(span, 16))
+    return max(12, min(span, 40))
+
+
+async def classify_logwatch_buys(
+    transfers: list[InboundTransfer],
+    *,
+    rpc: Any,
+    sender_map: dict[str, str | None],
+    senders_ok: bool,
+    allow_quote_lookup: bool = True,
+    quote_budget_sec: float = 4.0,
+    method_map: dict[str, str | None] | None = None,
+) -> tuple[list[InboundTransfer], list[InboundTransfer], int]:
+    """Split inbound transfers into (buys, uncertain, skipped).
+
+    Strict buy gate (Хвать):
+    - Transfer.from must not be an EOA (EOA→wallet = gift/airdrop/P2P)
+    - ``tx.from == wallet`` (wallet initiated) **or** wallet spent WETH/USDG in-tx
+    - Reject claim/airdrop/plain-transfer selectors when known
+    - Never count self-transfers / quote-token noise
+    """
+    if not transfers:
+        return [], [], 0
+    if not senders_ok:
+        return [], list(transfers), 0
+
+    methods = method_map or {}
+    from_addrs = sorted(
+        {
+            (t.sender or "").strip().lower()
+            for t in transfers
+            if (t.sender or "").strip()
+        }
+    )
+    eoa_map: dict[str, bool] = {}
+    if from_addrs and hasattr(rpc, "batch_is_eoa"):
+        try:
+            raw = await asyncio.wait_for(rpc.batch_is_eoa(from_addrs), timeout=4.0)
+            if isinstance(raw, dict):
+                eoa_map = raw
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("logwatch EOA classify: %s", exc)
+
+    buys: list[InboundTransfer] = []
+    uncertain: list[InboundTransfer] = []
+    skipped = 0
+    need_quote: list[InboundTransfer] = []
+
+    for tr in transfers:
+        wallet_l = (tr.wallet or "").strip().lower()
+        token_l = (tr.token or "").strip().lower()
+        frm = (tr.sender or "").strip().lower()
+        if not wallet_l or not token_l or not frm:
+            skipped += 1
+            continue
+        if token_l in QUOTE_TOKENS:
+            skipped += 1
+            continue
+        if frm == wallet_l:
+            skipped += 1
+            continue
+        # Plain transfer / claim / airdrop selectors — never a DEX buy.
+        if method_is_non_buy(methods.get(tr.tx_hash.lower())):
+            skipped += 1
+            continue
+        # EOA → wallet = gift / personal transfer / airdrop from person.
+        if eoa_map.get(frm) is True:
+            skipped += 1
+            continue
+        tx_from = sender_map.get(tr.tx_hash.lower())
+        if tx_from is None:
+            uncertain.append(tr)
+            continue
+        if tx_from == wallet_l:
+            buys.append(tr)
+            continue
+        # Third-party tx.from: only smart-wallet / router-on-behalf with quote.
+        if not allow_quote_lookup:
+            skipped += 1
+            continue
+        need_quote.append(tr)
+
+    if need_quote and allow_quote_lookup:
+        sem = asyncio.Semaphore(4)
+        started = time.time()
+        budget = max(1.0, float(quote_budget_sec))
+
+        async def _one(tr: InboundTransfer) -> tuple[InboundTransfer, bool | None]:
+            if time.time() - started > budget:
+                return tr, None
+            async with sem:
+                try:
+                    left = max(0.3, budget - (time.time() - started))
+                    spent = await asyncio.wait_for(
+                        wallet_sent_quote_in_tx(tr.wallet, tr.tx_hash),
+                        timeout=min(1.5, left),
+                    )
+                except Exception:  # noqa: BLE001
+                    spent = None
+                return tr, spent
+
+        results = await asyncio.gather(*[_one(tr) for tr in need_quote])
+        for tr, spent in results:
+            if spent is True:
+                buys.append(tr)
+            elif spent is False:
+                skipped += 1
+            else:
+                uncertain.append(tr)
+
+    return buys, uncertain, skipped
+
+
+def alert_filter_skip_reason(
+    deal_index: int,
+    mcap_at_buy: float | None,
+    *,
+    max_mcap_alert: float,
+    alert_on_deals: list[int],
+    min_mcap_alert: float | None = None,
+    bought_usd: float | None = None,
+    min_bought_usd: float | None = None,
+    max_bought_usd: float | None = None,
+) -> str | None:
+    """Human reason when ``should_alert_deal`` is False; None if it would alert."""
+    if deal_index not in alert_on_deals:
+        return f"deal_index={deal_index} not in alert_on_deals"
+    if mcap_at_buy is None:
+        return "mcap=None"
+    mcap = float(mcap_at_buy)
+    if mcap > float(max_mcap_alert):
+        return f"mcap={mcap:.0f}>max={float(max_mcap_alert):.0f}"
+    if min_mcap_alert is not None and mcap < float(min_mcap_alert):
+        return f"mcap={mcap:.0f}<min={float(min_mcap_alert):.0f}"
+    if bought_usd is not None:
+        usd = float(bought_usd)
+        if min_bought_usd is not None and usd < float(min_bought_usd):
+            return f"bought_usd={usd:.2f}<min={float(min_bought_usd):.2f}"
+        if max_bought_usd is not None and usd > float(max_bought_usd):
+            return f"bought_usd={usd:.2f}>max={float(max_bought_usd):.2f}"
+    elif min_bought_usd is not None:
+        return "bought_usd=None with min_bought_usd set"
+    return None
+
+
+def live_burst_span_for_watchlist(cfg: FollowupConfig, n_wallets: int) -> int:
+    """Skip-enrich live burst chunk size — never a multi-k window under OR topics."""
+    base = max(
+        100,
+        int(getattr(cfg, "logwatch_live_span", 300) or 300),
+    )
+    n = max(0, int(n_wallets or 0))
+    if n <= 0:
+        return min(
+            2_000,
+            int(getattr(cfg, "logwatch_burst_catchup_span", 10_000) or 10_000),
+        )
+    batches = topic_batch_count(n)
+    if batches >= 3:
+        return max(100, min(200, base * 2))
+    if batches == 2:
+        return max(150, min(400, base * 2))
+    return max(300, min(1_000, base * 3))
 
 
 def _addr_hash(node: object) -> str:
@@ -150,27 +371,37 @@ def deal_is_fresh_for_alert(
     now: float | None = None,
     max_buy_age_sec: float = 900.0,
     max_block_lag: int = 2_000,
+    discovered_at: float | None = None,
 ) -> bool:
     """True when a deal is recent enough to warrant a Telegram alert.
 
     Stops live-gap / hist catch-up from blasting old buys as «#2/#3 сейчас».
-    Fail-open when timestamps/tip are unknown (legacy / unit paths).
+    GMGN sync rows with neither buy time nor block are never fresh.
     """
     ts = time.time() if now is None else float(now)
     age_limit = max(60.0, float(max_buy_age_sec or 900.0))
     block_limit = max(100, int(max_block_lag or 2_000))
-    if bought_at is not None and float(bought_at) > 0:
+    has_buy_ts = bought_at is not None and float(bought_at) > 0
+    has_block = block_number is not None and int(block_number) > 0
+    if not has_buy_ts and not has_block:
+        # Hist/GMGN ghost with no chain evidence — do not alert.
+        return False
+    disc_ok = False
+    if discovered_at is not None and float(discovered_at) > 0:
+        disc_ok = (ts - float(discovered_at)) <= age_limit
+    if has_buy_ts:
         age = ts - float(bought_at)
+        # Never waive wall-clock buy age via discovered_at — that let GMGN
+        # hist fills (hours old) alert as if they were tip buys.
         if age > age_limit:
             return False
-    if (
-        tip is not None
-        and block_number is not None
-        and int(block_number) > 0
-        and int(tip) > 0
-    ):
+    if tip is not None and has_block and int(tip) > 0:
         lag = int(tip) - int(block_number)
-        if lag > block_limit:
+        # discovered_at only loosens *block* lag (cursor catch-up recovery).
+        eff_block_limit = block_limit
+        if disc_ok:
+            eff_block_limit = max(block_limit, min(block_limit * 2, 8_000))
+        if lag > eff_block_limit:
             return False
     return True
 
@@ -452,6 +683,29 @@ async def _is_buy_like_transfer(
     return bool(track_transfers)
 
 
+# Ops Telegram must not depend on a healthy followup.db for rate-limits.
+# Identical fatal errors (corrupt SQLite) previously re-claimed every cycle
+# after a fresh/empty meta table and flooded the chat.
+_OPS_FATAL_MARKERS = (
+    "file is not a database",
+    "database disk image is malformed",
+    "malformed database schema",
+    "followup db unusable",
+    "disk i/o error",
+)
+
+
+def _is_fatal_ops_text(text: str) -> bool:
+    low = (text or "").lower()
+    return any(m in low for m in _OPS_FATAL_MARKERS)
+
+
+def _ops_alert_fingerprint(kind: str, text: str) -> str:
+    # Collapse whitespace; keep kind + short body so reworded pings stay distinct.
+    body = " ".join((text or "").strip().lower().split())
+    return f"{kind}|{body[:240]}"
+
+
 class FollowupRunner:
     def __init__(self, store: FollowupStore | None = None) -> None:
         self._store = store or followup_store
@@ -495,15 +749,31 @@ class FollowupRunner:
         self._last_outbox_dispatched = 0
         self._live_timeout_streak = 0
         self._live_span_backoff = 0
-        self._last_known_tip: int | None = None
+        self._last_known_tip = None
         self._last_tip_ts: float = 0.0
         self._last_live_success_ts: float = 0.0
+        # In-memory ops rate-limit (survives corrupt/empty SQLite meta).
+        self._ops_next_allowed: dict[str, float] = {}
+        self._ops_sent_count: dict[str, int] = {}
+        self._fatal_error_backoff_until: float = 0.0
         # Last hist pass advanced the catch-up cursor (used to avoid Restored flap).
         self._last_hist_advanced: bool = False
         # Fresh deals missing mcap — retried every live tick (not every 60s).
         self._mcap_micro_retry: list[tuple[str, str, float]] = []
+        # Transfers seen during skip_enrich catch-up — drain with enrich+alert
+        # on the live path so cursor progress does not silently drop buys.
+        # Also durable in SQLite (pending_tip_transfers) across restarts.
+        self._pending_skip_transfers: list[tuple[InboundTransfer, float]] = []
+        self._pending_skip_loaded = False
         # Short-TTL GMGN unique-buy cache for logwatch rank (wallet → (ts, result)).
         self._gmgn_rank_cache: dict[str, tuple[float, UniqueBuysResult]] = {}
+        # Cap concurrent GMGN unique-buy fetches (tip bursts → 429).
+        self._gmgn_rank_sem = asyncio.Semaphore(4)
+        # Status() polls often — cache outbox COUNT(*) briefly.
+        self._outbox_stats_cache: dict[str, int] | None = None
+        self._outbox_stats_cache_ts: float = 0.0
+        # Serialize pending-tip / mcap-retry mutations across hist+live+maint.
+        self._pending_state_lock = threading.Lock()
         self._log: list[JobLogEntry] = []
 
     def _append_log(self, stage: str, message: str, *, percent: float = 0.0) -> None:
@@ -568,10 +838,17 @@ class FollowupRunner:
 
     @property
     def _outbox_counts(self) -> dict[str, int]:
+        now = time.time()
+        cached = self._outbox_stats_cache
+        if cached is not None and (now - self._outbox_stats_cache_ts) < 2.0:
+            return cached
         try:
-            return self._store.outbox_stats()
+            stats = self._store.outbox_stats()
         except Exception:  # noqa: BLE001
-            return {"pending": 0, "failed": 0, "sent": 0}
+            stats = {"pending": 0, "failed": 0, "sent": 0}
+        self._outbox_stats_cache = stats
+        self._outbox_stats_cache_ts = now
+        return stats
 
     def reset_counters(self) -> FollowupStatus:
         self._last_error = None
@@ -606,11 +883,48 @@ class FollowupRunner:
 
         Live tip must not wait for hist; hist must not wait for prune/reconcile.
         """
+        self._load_pending_skip_transfers()
         await asyncio.gather(
             self._hist_loop(),
             self._live_loop(),
             self._maintenance_loop(),
         )
+
+    def _load_pending_skip_transfers(self) -> None:
+        """Hydrate in-memory tip_lag queue from SQLite once per process."""
+        if self._pending_skip_loaded:
+            return
+        self._pending_skip_loaded = True
+        try:
+            rows = self._store.list_pending_tip_transfers(limit=200)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("load pending tip transfers: %s", exc)
+            return
+        items: list[tuple[InboundTransfer, float]] = []
+        for r in rows:
+            items.append(
+                (
+                    InboundTransfer(
+                        wallet=str(r["wallet"]),
+                        token=str(r["token"]),
+                        sender=str(r.get("sender") or ""),
+                        tx_hash=str(r.get("tx_hash") or ""),
+                        block_number=int(r.get("block_number") or 0),
+                        bought_at=(
+                            float(r["bought_at"])
+                            if r.get("bought_at") is not None
+                            else 0.0
+                        ),
+                    ),
+                    float(r.get("queued_at") or time.time()),
+                )
+            )
+        if items:
+            self._pending_skip_transfers = items
+            self._append_log(
+                "live",
+                f"restored {len(items)} pending tip transfers from DB",
+            )
 
     async def _hist_loop(self) -> None:
         while True:
@@ -649,14 +963,18 @@ class FollowupRunner:
                     try:
                         await asyncio.wait_for(task, timeout=8.0)
                     except (asyncio.TimeoutError, asyncio.CancelledError):
+                        # Never replace self._lock — a zombie still holding the
+                        # old Lock would race a fresh cycle on a new instance.
+                        # Next tick skips via acquire timeout while we only
+                        # reset RPC pressure so hung RPC waiters can unblock.
                         self._append_log(
                             "watchdog",
-                            "отменённый hist-цикл не завершился за 8s — сбрасываем lock+RPC sem",
+                            "отменённый hist-цикл не завершился за 8s — "
+                            "сбрасываем RPC sem (lock не трогаем)",
                         )
-                        self._lock = asyncio.Lock()
                         from .chain import reset_followup_rpc_pressure
 
-                        n = reset_followup_rpc_pressure()
+                        n = reset_followup_rpc_pressure(include_shared=True)
                         if n:
                             self._append_log(
                                 "watchdog",
@@ -682,11 +1000,20 @@ class FollowupRunner:
                 self._last_error = safe
                 self._last_message = f"Ошибка: {safe}"
                 self._append_log("error", self._last_message)
-                await self._ops_alert(
-                    cfg,
-                    kind="cycle_error",
-                    text=f"⚠️ Follow-up cycle error: {safe}",
-                )
+                try:
+                    await self._ops_alert(
+                        cfg,
+                        kind="cycle_error",
+                        text=f"⚠️ Follow-up cycle error: {safe}",
+                    )
+                except Exception as ops_exc:  # noqa: BLE001
+                    logger.warning("ops alert after cycle error failed: %s", ops_exc)
+                if _is_fatal_ops_text(safe):
+                    # Stop the 0s-interval spin that flooded TG with the same
+                    # SQLite error while followup.db was unusable.
+                    self._fatal_error_backoff_until = max(
+                        self._fatal_error_backoff_until, time.time() + 300.0
+                    )
             finally:
                 self._cycle_task = None
                 self._running = False
@@ -704,6 +1031,13 @@ class FollowupRunner:
                 continue
             period = max(0, int(cfg.interval_sec if cfg.interval_sec is not None else 0))
             sleep_for = max(0.0, period - float(self._last_run_duration_sec or 0))
+            # Tip soft-failing: do not spin hist every 0–3s just to log pause.
+            if self._live_timeout_streak >= 2:
+                sleep_for = max(sleep_for, 8.0)
+            # Fatal DB / storage errors: hard floor so ops cannot re-fire in a tight loop.
+            fatal_left = self._fatal_error_backoff_until - time.time()
+            if fatal_left > 0:
+                sleep_for = max(sleep_for, min(fatal_left, 300.0))
             self._next_run_ts = time.time() + sleep_for
             self._wake.clear()
             while True:
@@ -736,7 +1070,8 @@ class FollowupRunner:
 
             started = time.time()
             self._live_running = True
-            timeout = max(10, int(getattr(cfg, "live_cycle_timeout_sec", 45) or 45))
+            # Tip getLogs (soft_partial ≤22s) + enrich + TG; keep under watchdog.
+            timeout = max(45, int(getattr(cfg, "live_cycle_timeout_sec", 45) or 45))
             task = asyncio.create_task(
                 self._live_tick(cfg), name="followup-live"
             )
@@ -745,24 +1080,50 @@ class FollowupRunner:
                 await asyncio.wait_for(task, timeout=float(timeout))
             except asyncio.TimeoutError:
                 logger.error("Follow-up live tip hung >%ss — abort tick", timeout)
-                self._append_log("watchdog", f"live tip timeout {timeout}s")
+                self._last_error = f"live tip timeout {timeout}s"
+                self._last_message = self._last_error
+                self._append_log("watchdog", self._last_message)
+                self._live_timeout_streak += 1
                 if not task.done():
                     task.cancel()
                     try:
                         await asyncio.wait_for(task, timeout=3.0)
                     except (asyncio.TimeoutError, asyncio.CancelledError):
-                        self._live_lock = asyncio.Lock()
+                        # Do NOT swap self._live_lock (same dual-runner hazard
+                        # as hist). Only reset followup_live RPC sems — never
+                        # shared/token_index (that crashed Watch mid-getLogs).
+                        self._append_log(
+                            "watchdog",
+                            "отменённый live-tick не завершился за 3s — "
+                            "сбрасываем followup_live RPC sem (lock не трогаем)",
+                        )
                         from .chain import reset_followup_rpc_pressure
 
-                        reset_followup_rpc_pressure()
+                        reset_followup_rpc_pressure(include_shared=False)
+                await self._ops_alert(
+                    cfg,
+                    kind="live_hang",
+                    text=(
+                        f"⚠️ Follow-up: live tip завис >{timeout}s и был прерван. "
+                        "Hist-цикл продолжает работать отдельно."
+                    ),
+                )
             except asyncio.CancelledError:
                 task.cancel()
                 raise
             except Exception as exc:  # noqa: BLE001
                 from .chain import _redact_exc
 
-                logger.warning("Follow-up live tip failed: %s", _redact_exc(exc))
-                self._append_log("live", f"ошибка: {_redact_exc(exc)}")
+                safe = _redact_exc(exc)
+                logger.warning("Follow-up live tip failed: %s", safe)
+                self._last_error = f"live tip: {safe}"
+                self._last_message = f"Live tip ошибка: {safe}"
+                self._append_log("live", f"ошибка: {safe}")
+                await self._ops_alert(
+                    cfg,
+                    kind="live_error",
+                    text=f"⚠️ Follow-up live tip error: {safe}",
+                )
             finally:
                 self._live_task = None
                 self._live_running = False
@@ -837,7 +1198,7 @@ class FollowupRunner:
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         from .chain import reset_followup_rpc_pressure
 
-                        reset_followup_rpc_pressure()
+                        reset_followup_rpc_pressure(include_shared=True)
             except asyncio.CancelledError:
                 task.cancel()
                 raise
@@ -870,6 +1231,19 @@ class FollowupRunner:
 
         # One-shot / chunked chain-time backfill (was hanging hist on restart).
         await self._maybe_chain_backfill(cfg, rpc=rpc, budget_sec=15.0)
+
+        # Live tip tick is tip-only; watermark burst + pending drain live here
+        # so purchase alerts are never starved by catch-up getLogs.
+        if cfg.logwatch_enabled and not self._stop_requested:
+            try:
+                await asyncio.wait_for(
+                    self._live_catchup_pass(cfg, rpc=rpc),
+                    timeout=25.0,
+                )
+            except asyncio.TimeoutError:
+                self._append_log("catchup", "live catch-up прерван по бюджету 25s")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("live catch-up: %s", exc)
 
         catching_up = (self._cursor_lag_blocks or 0) > max(
             5_000, int(cfg.logwatch_max_span or 3_000) * 3
@@ -1041,26 +1415,30 @@ class FollowupRunner:
     async def _live_tick(self, cfg: FollowupConfig) -> None:
         from .chain import RpcClient
 
-        lock = self._live_lock
         try:
-            await asyncio.wait_for(lock.acquire(), timeout=2.0)
+            await asyncio.wait_for(self._live_lock.acquire(), timeout=2.0)
         except asyncio.TimeoutError:
             self._append_log("live", "предыдущий live-tick ещё держит lock — skip")
             return
         try:
             rpc = RpcClient(concurrency=3, sem_scope="followup_live")
             self._active_rpc = rpc.active_rpc_label()
+            tick_t0 = time.time()
             # Drain outbox on the fast path so TG lag does not wait for hist.
             try:
-                n = await self._dispatch_outbox(cfg, limit=5)
+                n = await self._dispatch_outbox(
+                    cfg, limit=2 if self._live_timeout_streak else 5
+                )
                 if n:
                     self._last_outbox_dispatched = n
             except Exception as exc:  # noqa: BLE001
                 logger.debug("live outbox: %s", exc)
             await self._live_tip_pass(cfg, rpc=rpc)
-            await self._micro_retry_pending_mcap(cfg, rpc=rpc)
+            # Micro-retry is secondary — never push the tip watchdog over budget.
+            if time.time() - tick_t0 < 28.0:
+                await self._micro_retry_pending_mcap(cfg, rpc=rpc)
         finally:
-            lock.release()
+            self._live_lock.release()
 
     async def _ops_alert(
         self,
@@ -1069,26 +1447,68 @@ class FollowupRunner:
         kind: str,
         text: str,
     ) -> None:
-        """Rate-limited Telegram ops notice (degradation / hang / lag)."""
-        cooldown = max(60, int(cfg.ops_alert_cooldown_sec or 600))
-        meta_key = f"ops_alert_{kind}_ts"
-        try:
-            raw = self._store.get_meta(meta_key)
-            last = float(raw) if raw else 0.0
-        except Exception:  # noqa: BLE001
-            last = 0.0
-        now = time.time()
-        if last > 0 and (now - last) < cooldown:
-            return
+        """Rate-limited Telegram ops notice (degradation / hang / lag).
+
+        Dedup is primarily **in-memory** so a corrupt/empty followup.db cannot
+        reset the cooldown and flood the chat (e.g. ``file is not a database``
+        every hist tick). Identical fatal fingerprints are one-shot per process.
+        """
         chat = resolve_chat_id(cfg.telegram_chat_id)
         if not telegram_configured(chat):
             return
+
+        now = time.time()
+        fp = _ops_alert_fingerprint(kind, text)
+        fatal = _is_fatal_ops_text(text)
+        sent_n = int(self._ops_sent_count.get(fp, 0))
+        next_ok = float(self._ops_next_allowed.get(fp, 0.0))
+        if now < next_ok:
+            return
+        # Already told the operator once about this exact fatal — stay quiet.
+        if fatal and sent_n >= 1:
+            self._ops_next_allowed[fp] = now + 86_400.0
+            return
+
+        base = max(60, int(cfg.ops_alert_cooldown_sec or 600))
+        if fatal:
+            # One ping, then silence for a day (memory). DB claim is best-effort.
+            cooldown = max(float(base), 86_400.0)
+        else:
+            # Escalating backoff for the same fingerprint: base, 2×, 4×… cap 6h.
+            cooldown = min(float(base) * (2 ** min(sent_n, 4)), 6 * 3600.0)
+
+        # Memory claim *before* send — survives SQLite death.
+        self._ops_next_allowed[fp] = now + cooldown
+
+        meta_key = f"ops_alert_{kind}_ts"
+        db_claimed = False
+        try:
+            if not self._store.try_claim_ops_alert(meta_key, cooldown_sec=cooldown):
+                return
+            db_claimed = True
+        except Exception as exc:  # noqa: BLE001
+            # Corrupt DB: memory gate already holds the slot — still allow the
+            # first (and only, if fatal) notification through.
+            logger.warning("ops alert meta claim skipped: %s", exc)
+
         topic_id = resolve_topic_id(cfg.telegram_topic_id)
         try:
             await send_message(chat, text, topic_id=topic_id)
-            self._store.set_meta(meta_key, str(now))
+            self._ops_sent_count[fp] = sent_n + 1
             self._append_log("ops", text[:160])
+            if fatal:
+                self._fatal_error_backoff_until = max(
+                    self._fatal_error_backoff_until, now + 300.0
+                )
         except Exception as exc:  # noqa: BLE001
+            # Transport blip: free the slot soon so a later send can retry,
+            # but keep a short floor so a broken bot token cannot spin-spam.
+            self._ops_next_allowed[fp] = now + (300.0 if fatal else 60.0)
+            if db_claimed:
+                try:
+                    self._store.release_ops_alert_claim(meta_key)
+                except Exception:  # noqa: BLE001
+                    pass
             logger.warning("ops alert failed: %s", exc)
 
     async def run_cycle(
@@ -1097,12 +1517,9 @@ class FollowupRunner:
         *,
         force_all_due: bool = False,
     ) -> None:
-        # Capture the lock object we acquire. Watchdog may replace self._lock
-        # to unblock the next tick; the zombie must release *this* instance,
-        # not whatever self._lock points at later.
-        lock = self._lock
+        # Acquire the stable lock instance (watchdog must never replace it).
         try:
-            await asyncio.wait_for(lock.acquire(), timeout=5.0)
+            await asyncio.wait_for(self._lock.acquire(), timeout=5.0)
         except asyncio.TimeoutError:
             self._append_log(
                 "lock",
@@ -1115,7 +1532,7 @@ class FollowupRunner:
                 force_all_due=force_all_due,
             )
         finally:
-            lock.release()
+            self._lock.release()
 
     async def ingest_from_watch(
         self,
@@ -1131,7 +1548,7 @@ class FollowupRunner:
         not follow-up renumber-from-history.
         """
         cfg = cfg or self._store.load_config()
-        if not cfg.ingest_from_watch:
+        if not cfg.enabled or not cfg.ingest_from_watch:
             return 0
         if not buyers:
             return 0
@@ -1179,37 +1596,16 @@ class FollowupRunner:
                 logger.warning("RayBot sync failed: %s", exc)
                 self._append_log("raybot", f"RayBot sync ошибка: {exc}")
 
-        # Alert immediately if watch itself produced deal #2+ @ low mcap
-        chat = resolve_chat_id(cfg.telegram_chat_id)
-        topic_id = resolve_topic_id(cfg.telegram_topic_id)
-        if telegram_configured(chat):
-            filters_map = self._store.get_alert_filters_map(
-                sorted({d.wallet for d in inserted})
+        # Watch ingest only seeds deal #1. Deal #2+ alerts are owned by
+        # logwatch + GMGN rank (local renumber invents junk indices).
+        seeded = sum(1 for d in inserted if int(d.deal_index or 0) == 1)
+        extras = [d for d in inserted if int(d.deal_index or 0) >= 2]
+        if extras:
+            self._append_log(
+                "ingest",
+                f"skip watch #2+ alerts ({len(extras)}) — GMGN/logwatch only",
             )
-            for deal in sorted(
-                inserted,
-                key=lambda d: (int(d.deal_index or 0), str(d.token or "")),
-            ):
-                gate = alert_kwargs_for_wallet(cfg, filters_map.get(deal.wallet))
-                if not should_alert_deal(
-                    deal.deal_index,
-                    deal.mcap_at_buy,
-                    bought_usd=deal.bought_usd,
-                    **gate,
-                ):
-                    continue
-                ok = await self._deliver_deal_alert(
-                    chat,
-                    deal=deal,
-                    topic_id=topic_id,
-                    check_honeypot=True,
-                )
-                if ok:
-                    self._append_log(
-                        "telegram",
-                        f"Алерт deal #{deal.deal_index} (из автопарса)",
-                    )
-        return len(inserted)
+        return seeded if seeded else len(inserted)
 
     async def _cycle_body(
         self,
@@ -1234,7 +1630,12 @@ class FollowupRunner:
             if dispatched:
                 self._append_log("outbox", f"доставлено {dispatched} из очереди")
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Follow-up outbox dispatch: %s", exc)
+            from .chain import _redact_exc
+
+            safe = _redact_exc(exc)
+            logger.warning("Follow-up outbox dispatch: %s", safe)
+            self._last_error = f"outbox: {safe}"
+            self._append_log("outbox", f"ошибка: {safe}")
 
         logwatch_ok = False
         if cfg.logwatch_enabled and not self._stop_requested:
@@ -1400,7 +1801,7 @@ class FollowupRunner:
             if effective_behind is None:
                 effective_behind = live_behind
             near_tip = (
-                effective_behind is not None and effective_behind <= 2_000
+                effective_behind is not None and effective_behind <= 3_000
             )
             if live_ok and near_tip:
                 live_note = f" (отставание {effective_behind})"
@@ -1514,6 +1915,10 @@ class FollowupRunner:
                     deal=deal,
                     topic_id=topic_id,
                     honeypot_reason=hp_reason,
+                    check_honeypot=bool(
+                        getattr(cfg, "alert_skip_honeypot", True) and hp_reason is None
+                    ),
+                    origin="reconcile",
                 )
                 if ok:
                     alerts += 1
@@ -1530,6 +1935,19 @@ class FollowupRunner:
     def _deal_dedup_key(wallet: str, token: str) -> str:
         return f"deal:{(wallet or '').lower()}:{str(token or '').lower()}"
 
+    @staticmethod
+    def _alert_origin_from_label(label: str | None) -> str:
+        lab = (label or "").strip().lower()
+        if lab.startswith("live") or lab in ("tip", "logwatch"):
+            return "live"
+        if lab.startswith("hist") or "catchup" in lab or "burst" in lab:
+            return "history"
+        if "drain" in lab or "skip" in lab:
+            return "drain"
+        if lab in ("reconcile", "legacy"):
+            return "reconcile"
+        return lab or "history"
+
     async def _deliver_deal_alert(
         self,
         chat: str,
@@ -1538,6 +1956,7 @@ class FollowupRunner:
         topic_id: int | None,
         honeypot_reason: str | None = None,
         check_honeypot: bool = False,
+        origin: str = "live",
     ) -> bool:
         """Claim + durably enqueue the alert, then try immediate delivery.
 
@@ -1558,29 +1977,60 @@ class FollowupRunner:
                 )
             except Exception:  # noqa: BLE001
                 reason = None
-        if reason and bool(getattr(cfg, "alert_skip_honeypot", True)):
-            # Suppress TG; mark notified so pending-retry does not spam.
-            self._store.mark_notified(deal.wallet, deal.token)
-            self._append_log(
-                "telegram",
-                f"skip honeypot deal #{deal.deal_index} "
-                f"{deal.token_symbol or deal.token[:10]}… ({reason})",
+        # Soft DexScreener heuristics on brand-new tokens (no_sells) are often
+        # false — enqueue with re-check so outbox can ship once the pair trades.
+        # Hard honeypots still burn permanently (anti-spam).
+        # Unresolved check (timeout) must also force outbox re-check — otherwise
+        # a hard HP ships as a normal alert after enrich timed out.
+        skip_hp = bool(getattr(cfg, "alert_skip_honeypot", True))
+        outbox_check_honeypot = bool(check_honeypot and skip_hp and reason is None)
+        outbox_honeypot_reason = reason
+        if reason and skip_hp:
+            soft_hp = str(reason).startswith("no_sells") or str(reason).startswith(
+                "buy_sell_asymmetry"
             )
-            return False
+            if soft_hp:
+                self._append_log(
+                    "telegram",
+                    f"soft honeypot → outbox recheck #{deal.deal_index} "
+                    f"{deal.token_symbol or deal.token[:10]}… ({reason})",
+                )
+                outbox_honeypot_reason = None
+                outbox_check_honeypot = True
+            else:
+                # Suppress TG; mark notified so pending-retry does not spam.
+                self._store.mark_notified(deal.wallet, deal.token)
+                self._append_log(
+                    "telegram",
+                    f"skip honeypot deal #{deal.deal_index} "
+                    f"{deal.token_symbol or deal.token[:10]}… ({reason})",
+                )
+                return False
+        elif skip_hp and reason is None and deal.token:
+            # Claim-time check was skipped or timed out — dispatch must recheck.
+            outbox_check_honeypot = True
 
+        max_age = float(getattr(cfg, "alert_max_buy_age_sec", 900) or 900)
         if not deal_is_fresh_for_alert(
             bought_at=getattr(deal, "bought_at", None),
             block_number=getattr(deal, "block_number", None),
             tip=self._last_known_tip,
-            max_buy_age_sec=float(
-                getattr(cfg, "alert_max_buy_age_sec", 900) or 900
-            ),
+            max_buy_age_sec=max_age,
             max_block_lag=int(
-                getattr(cfg, "alert_max_block_lag", 2_000) or 2_000
+                getattr(cfg, "alert_max_block_lag", 4_000) or 4_000
             ),
+            discovered_at=getattr(deal, "created_at", None),
         ):
-            # Old hist/gap fills must not Telegram as «сейчас #2/#3».
-            self._store.mark_notified(deal.wallet, deal.token)
+            # Truly old hist fills: suppress permanently. Near-tip lag misses
+            # must NOT be burned as notified — leave room for rediscovery.
+            bought = getattr(deal, "bought_at", None)
+            age = (
+                time.time() - float(bought)
+                if bought is not None and float(bought) > 0
+                else None
+            )
+            if age is not None and age > max_age * 2:
+                self._store.mark_notified(deal.wallet, deal.token)
             self._append_log(
                 "telegram",
                 f"skip stale deal #{deal.deal_index} "
@@ -1590,6 +2040,47 @@ class FollowupRunner:
             return False
 
         dedup = self._deal_dedup_key(deal.wallet, deal.token)
+        sym = str(getattr(deal, "token_symbol", "") or "").strip()
+        if not sym:
+            # Fallback label — never claim then burn outbox on missing symbol.
+            tok = str(getattr(deal, "token", "") or "")
+            sym = f"{tok[:10]}…" if tok else "TOKEN"
+            try:
+                deal.token_symbol = sym
+            except Exception:  # noqa: BLE001
+                pass
+
+        # GMGN gate before claim — invent-era local #2 must not enter outbox.
+        # Uncertain (429/circuit) still claims: dispatcher re-gates with
+        # soft defer (no attempt burn) so tip buys are not aged into suppress.
+        probe = {
+            "v": 1,
+            "kind": "deal",
+            "wallet": deal.wallet,
+            "token": deal.token,
+            "deal_index": int(deal.deal_index),
+        }
+        action, gated = await self._gate_outbox_deal(probe, cfg)
+        if action == "discard":
+            self._store.mark_notified(deal.wallet, deal.token)
+            self._append_log(
+                "telegram",
+                f"skip GMGN discard #{deal.deal_index} "
+                f"{deal.token_symbol or deal.token[:10]}… ({origin})",
+            )
+            return False
+        if action == "defer":
+            self._append_log(
+                "telegram",
+                f"GMGN uncertain → outbox defer #{deal.deal_index} "
+                f"{deal.token_symbol or deal.token[:10]}… ({origin})",
+            )
+        deal_index = int(
+            (gated or {}).get("deal_index")
+            if gated is not None
+            else deal.deal_index
+        )
+
         payload = json.dumps(
             {
                 "v": 1,
@@ -1597,15 +2088,18 @@ class FollowupRunner:
                 "chat": chat,
                 "wallet": deal.wallet,
                 "token": deal.token,
-                "token_symbol": deal.token_symbol,
+                "token_symbol": sym,
                 "token_name": getattr(deal, "token_name", ""),
-                "deal_index": deal.deal_index,
+                "deal_index": deal_index,
                 "mcap_at_buy": deal.mcap_at_buy,
                 "bought_usd": deal.bought_usd,
                 "topic_id": topic_id,
-                "honeypot_reason": reason,
-                # Already resolved above when skip is off.
-                "check_honeypot": False,
+                "honeypot_reason": outbox_honeypot_reason,
+                # Soft-HP path forces re-check; otherwise already resolved.
+                "check_honeypot": outbox_check_honeypot,
+                "origin": (origin or "live").strip().lower() or "live",
+                "bought_at": getattr(deal, "bought_at", None),
+                "block_number": getattr(deal, "block_number", None),
             }
         )
         if not self._store.claim_and_enqueue_deal(
@@ -1616,8 +2110,66 @@ class FollowupRunner:
         await self._dispatch_outbox(cfg, limit=1, only_key=dedup)
         return True
 
-    async def _send_outbox_payload(self, payload: dict) -> None:
-        """Deliver one decoded outbox payload to its sink (raises on failure)."""
+    async def _gate_outbox_deal(
+        self,
+        payload: dict,
+        cfg: FollowupConfig,
+    ) -> tuple[str, dict | None]:
+        """Re-check GMGN before TG so invent-era outbox junk cannot ship.
+
+        Returns ``(action, payload)``:
+        - ``ok`` + payload (possibly rewritten deal_index)
+        - ``discard`` — mark sent, no Telegram
+        - ``defer`` — soft fail / retry (circuit, 429, tip lag)
+        """
+        if str(payload.get("kind") or "deal") != "deal":
+            return "ok", payload
+        wallet = str(payload.get("wallet") or "").strip()
+        token = str(payload.get("token") or "").strip()
+        if not wallet or not token:
+            return "discard", None
+        claimed = int(payload.get("deal_index") or 0)
+        alert_on = {
+            int(x) for x in (getattr(cfg, "alert_on_deals", None) or [2, 3, 4, 5])
+        }
+        verdict = await self._gmgn_rank_verdict(wallet, token, cfg)
+        if verdict.uncertain:
+            # Blind send = Dora/#2 invent spam. Wait for GMGN.
+            return "defer", None
+        if verdict.past_max or verdict.reason in (
+            "past_max",
+            "gmgn_seed_miss_past",
+        ):
+            self._store.mark_wallet_done(
+                wallet, deal_count=int(getattr(cfg, "max_deals", 5) or 5)
+            )
+            return "discard", None
+        rank = verdict.rank
+        if rank is None:
+            # Defensive: tip not ranked yet should already be uncertain/tip_lag.
+            # Never permanently discard — rediscovery / drain can still alert.
+            return "defer", None
+        if rank not in alert_on:
+            if alert_on and rank > max(alert_on):
+                self._store.mark_wallet_done(
+                    wallet, deal_count=int(getattr(cfg, "max_deals", 5) or 5)
+                )
+            return "discard", None
+        if rank != claimed:
+            self._append_log(
+                "outbox",
+                f"GMGN rewrite #{claimed}→#{rank} {token[:10]}… "
+                f"({verdict.reason})",
+            )
+            return "ok", {**payload, "deal_index": rank}
+        return "ok", payload
+
+    async def _send_outbox_payload(self, payload: dict) -> str:
+        """Deliver one decoded outbox payload.
+
+        Returns ``sent`` | ``suppress`` | ``defer``. Raises on transport failure.
+        Soft honeypot heuristics must ``defer`` (not look like a successful send).
+        """
         kind = payload.get("kind", "deal")
         if kind == "deal":
             sym = str(payload.get("token_symbol") or "").strip()
@@ -1645,14 +2197,17 @@ class FollowupRunner:
                 }
                 sym = str(payload.get("token_symbol") or "").strip()
             if not sym:
-                # Still unlabeled — do not spam TG with placeholder TOKEN.
-                raise RuntimeError(
-                    f"follow-up alert missing token_symbol for "
-                    f"{str(payload.get('token') or '')[:12]}"
-                )
-            if bool(getattr(self._store.load_config(), "alert_skip_honeypot", True)):
+                tok = str(payload.get("token") or "")
+                sym = f"{tok[:10]}…" if tok else "TOKEN"
+                payload = {**payload, "token_symbol": sym}
+            cfg_now = self._store.load_config()
+            skip_hp = bool(getattr(cfg_now, "alert_skip_honeypot", True))
+            if skip_hp:
                 reason = payload.get("honeypot_reason")
-                if not reason and payload.get("check_honeypot"):
+                # Prefer explicit flag; default re-check when reason unknown so
+                # claim-time timeouts cannot ship a hard honeypot as normal.
+                should_recheck = bool(payload.get("check_honeypot")) or not reason
+                if not reason and should_recheck and payload.get("token"):
                     try:
                         from .security import honeypot_reason_for_token
 
@@ -1663,12 +2218,63 @@ class FollowupRunner:
                     except Exception:  # noqa: BLE001
                         reason = None
                 if reason:
+                    soft_hp = str(reason).startswith("no_sells") or str(
+                        reason
+                    ).startswith("buy_sell_asymmetry")
                     logger.info(
-                        "outbox skip honeypot %s (%s)",
+                        "outbox %s honeypot %s (%s)",
+                        "defer soft" if soft_hp else "skip",
                         str(payload.get("token", ""))[:12],
                         reason,
                     )
-                    return
+                    return "defer" if soft_hp else "suppress"
+            max_age = float(getattr(cfg_now, "alert_max_buy_age_sec", 900) or 900)
+            bought_at = (
+                float(payload["bought_at"])
+                if payload.get("bought_at") is not None
+                else None
+            )
+            block_number = (
+                int(payload["block_number"])
+                if payload.get("block_number") is not None
+                else None
+            )
+            queued_at = (
+                float(payload["_queued_at"])
+                if payload.get("_queued_at") is not None
+                else None
+            )
+            has_buy_evidence = (
+                (bought_at is not None and bought_at > 0)
+                or (block_number is not None and int(block_number) > 0)
+            )
+            stale = False
+            if has_buy_evidence:
+                stale = not deal_is_fresh_for_alert(
+                    bought_at=bought_at,
+                    block_number=block_number,
+                    tip=self._last_known_tip,
+                    max_buy_age_sec=max_age,
+                    max_block_lag=int(
+                        getattr(cfg_now, "alert_max_block_lag", 4_000) or 4_000
+                    ),
+                )
+            elif queued_at and (time.time() - float(queued_at)) > max_age * 2:
+                stale = True
+            if stale:
+                logger.info(
+                    "outbox suppress stale %s deal #%s",
+                    str(payload.get("token", ""))[:12],
+                    payload.get("deal_index"),
+                )
+                return "suppress"
+            freshness = resolve_alert_freshness(
+                origin=str(payload.get("origin") or "") or None,
+                bought_at=bought_at,
+                block_number=block_number,
+                tip=self._last_known_tip,
+                queued_at=queued_at,
+            )
             await send_followup_deal(
                 payload["chat"],
                 wallet=payload["wallet"],
@@ -1679,15 +2285,18 @@ class FollowupRunner:
                 mcap_at_buy=payload.get("mcap_at_buy"),
                 bought_usd=payload.get("bought_usd"),
                 topic_id=payload.get("topic_id"),
-                honeypot_reason=payload.get("honeypot_reason"),
-                check_honeypot=bool(payload.get("check_honeypot", False)),
+                honeypot_reason=None,
+                # Last-line defense if outbox HP timed out above.
+                check_honeypot=skip_hp,
+                skip_honeypot=skip_hp,
+                freshness=freshness,
             )
-            return
+            return "sent"
         if kind == "ops":
             await send_message(
                 payload["chat"], payload["text"], topic_id=payload.get("topic_id")
             )
-            return
+            return "sent"
         raise ValueError(f"unknown outbox kind: {kind}")
 
     async def _dispatch_outbox(
@@ -1703,13 +2312,17 @@ class FollowupRunner:
         Crash-safe redelivery: rows stay ``pending`` (with a growing
         ``next_attempt_at``) until delivered or ``outbox_max_attempts`` is hit,
         at which point they become ``failed`` and surface in status/ops.
+        Concurrent live+hist dispatch is serialized via lease (``sending``).
         """
         if not getattr(cfg, "outbox_enabled", True):
             return 0
         batch = int(limit if limit is not None else cfg.outbox_dispatch_batch)
-        rows = self._store.list_due_outbox(now=now, limit=batch)
         if only_key is not None:
-            rows = [r for r in rows if r.get("dedup_key") == only_key]
+            rows = self._store.claim_due_outbox(
+                now=now, limit=max(1, batch), dedup_key=only_key
+            )
+        else:
+            rows = self._store.claim_due_outbox(now=now, limit=batch)
         if not rows:
             return 0
         max_attempts = int(cfg.outbox_max_attempts or 10)
@@ -1729,14 +2342,127 @@ class FollowupRunner:
                     max_attempts=1,
                 )
                 continue
+            delivered = False
             try:
-                await self._send_outbox_payload(payload)
+                action, gated = await self._gate_outbox_deal(payload, cfg)
+                if action == "discard":
+                    self._store.mark_outbox_sent(oid)
+                    self._append_log(
+                        "outbox",
+                        f"discard invent/past-max "
+                        f"{str(payload.get('token') or '')[:10]}… "
+                        f"claimed=#{payload.get('deal_index')}",
+                    )
+                    continue
+                # Soft-defer rows can sit for hours — drop once buy is too old.
+                # Missing buy evidence: fall back to outbox queue age only.
+                max_age = float(getattr(cfg, "alert_max_buy_age_sec", 900) or 900)
+                bought_at = (
+                    float(payload["bought_at"])
+                    if payload.get("bought_at") is not None
+                    else None
+                )
+                block_number = (
+                    int(payload["block_number"])
+                    if payload.get("block_number") is not None
+                    else None
+                )
+                queued_at = float(row.get("created_at") or 0) or None
+                has_buy_evidence = (
+                    (bought_at is not None and bought_at > 0)
+                    or (block_number is not None and int(block_number) > 0)
+                )
+                stale = False
+                if has_buy_evidence:
+                    stale = not deal_is_fresh_for_alert(
+                        bought_at=bought_at,
+                        block_number=block_number,
+                        tip=self._last_known_tip,
+                        max_buy_age_sec=max_age,
+                        max_block_lag=int(
+                            getattr(cfg, "alert_max_block_lag", 4_000) or 4_000
+                        ),
+                    )
+                elif queued_at and (time.time() - queued_at) > max_age * 2:
+                    stale = True
+                if stale:
+                    self._store.mark_outbox_sent(oid)
+                    self._append_log(
+                        "outbox",
+                        f"suppress stale "
+                        f"{str(payload.get('token') or '')[:10]}… "
+                        f"#{payload.get('deal_index')}",
+                    )
+                    continue
+                if action == "defer":
+                    # Soft defer — do NOT burn attempts (circuit/429/tip_lag).
+                    backoff = 20.0
+                    self._store.mark_outbox_deferred(
+                        oid,
+                        error="gmgn gate defer (uncertain)",
+                        next_attempt_at=time.time() + backoff,
+                    )
+                    self._append_log(
+                        "outbox",
+                        f"defer GMGN gate "
+                        f"{str(payload.get('token') or '')[:10]}… "
+                        f"(retry in {backoff:.0f}s)",
+                    )
+                    continue
+                result = await self._send_outbox_payload(
+                    {
+                        **payload,
+                        **(gated or {}),
+                        "_queued_at": float(row.get("created_at") or 0)
+                        or None,
+                    }
+                )
+                if result == "defer":
+                    backoff = 45.0
+                    self._store.mark_outbox_deferred(
+                        oid,
+                        error="soft honeypot defer",
+                        next_attempt_at=time.time() + backoff,
+                    )
+                    continue
+                # sent or hard-honeypot/stale suppress — release lease either way.
+                delivered = result == "sent"
                 self._store.mark_outbox_sent(oid)
-                sent += 1
+                if result == "sent":
+                    sent += 1
+            except asyncio.CancelledError:
+                # CancelledError is BaseException — release lease unless TG
+                # already completed (avoid double-send after HTTP ok).
+                if not delivered:
+                    self._store.mark_outbox_deferred(
+                        oid,
+                        error="cancelled during outbox",
+                        next_attempt_at=time.time() + 5.0,
+                    )
+                else:
+                    self._store.mark_outbox_sent(oid)
+                raise
             except Exception as exc:  # noqa: BLE001
+                # Real TG/transport failures raise; honeypot uses return codes
+                # or honeypot_suppress from send_followup_deal last-line check.
+                msg = str(exc)
+                if msg.startswith("honeypot_suppress:"):
+                    reason = msg.split(":", 1)[-1]
+                    soft_hp = reason.startswith("no_sells") or reason.startswith(
+                        "buy_sell_asymmetry"
+                    )
+                    if soft_hp:
+                        self._store.mark_outbox_deferred(
+                            oid,
+                            error=f"soft honeypot defer ({reason})",
+                            next_attempt_at=time.time() + 45.0,
+                        )
+                    else:
+                        self._store.mark_outbox_sent(oid)
+                    continue
                 attempts = int(row.get("attempts", 0)) + 1
                 backoff = min(30.0 * (2 ** attempts), 3600.0)
-                safe = str(exc)[:300]
+                safe = msg[:300]
                 self._store.mark_outbox_failed(
                     oid,
                     error=safe,
@@ -1760,6 +2486,7 @@ class FollowupRunner:
                             f"({row.get('dedup_key')})."
                         ),
                     )
+        self._outbox_stats_cache = None
         return sent
 
     async def _retry_pending_alerts(
@@ -1840,12 +2567,14 @@ class FollowupRunner:
                 **gate,
             ):
                 continue
-            # Honeypot already checked on first attempt path; keep retry fast.
+            # Soft-HP tip defer leaves notified=0; re-check honeypot on retry
+            # so hard honeypots cannot slip through after enrich timeout.
             ok = await self._deliver_deal_alert(
                 chat,
                 deal=deal,
                 topic_id=topic_id,
-                check_honeypot=False,
+                check_honeypot=bool(getattr(cfg, "alert_skip_honeypot", True)),
+                origin="pending_retry",
             )
             if ok:
                 sent += 1
@@ -2196,14 +2925,15 @@ class FollowupRunner:
     def _queue_mcap_micro_retry(self, wallet: str, token: str) -> None:
         key = (wallet.lower(), token.lower())
         now = time.time()
-        self._mcap_micro_retry = [
-            (w, t, ts)
-            for w, t, ts in self._mcap_micro_retry
-            if not (w == key[0] and t == key[1]) and (now - ts) < 600
-        ]
-        self._mcap_micro_retry.append((key[0], key[1], now))
-        if len(self._mcap_micro_retry) > 40:
-            self._mcap_micro_retry = self._mcap_micro_retry[-40:]
+        with self._pending_state_lock:
+            self._mcap_micro_retry = [
+                (w, t, ts)
+                for w, t, ts in self._mcap_micro_retry
+                if not (w == key[0] and t == key[1]) and (now - ts) < 600
+            ]
+            self._mcap_micro_retry.append((key[0], key[1], now))
+            if len(self._mcap_micro_retry) > 40:
+                self._mcap_micro_retry = self._mcap_micro_retry[-40:]
 
     async def _micro_retry_pending_mcap(
         self,
@@ -2212,78 +2942,92 @@ class FollowupRunner:
         rpc: Any,
     ) -> None:
         """Fast mcap backfill for fresh live deals (every live tick, not 60s)."""
-        if not self._mcap_micro_retry:
-            return
+        with self._pending_state_lock:
+            if not self._mcap_micro_retry:
+                return
+            pending = list(self._mcap_micro_retry)
+            self._mcap_micro_retry = []
         chat = resolve_chat_id(cfg.telegram_chat_id)
         topic_id = resolve_topic_id(cfg.telegram_topic_id)
         tg_ok = telegram_configured(chat)
-        pending = list(self._mcap_micro_retry)
-        self._mcap_micro_retry = []
         sent = 0
-        for wallet, token, _ts in pending[:8]:
-            if self._stop_requested:
-                break
-            deals = [
-                d
-                for d in self._store.list_pending_alert_deals(
-                    alert_on_deals=list(cfg.alert_on_deals or [2, 3, 4, 5]),
-                    limit=20,
-                    max_age_sec=600,
-                    max_mcap_alert=float(cfg.max_mcap_alert or 0) or None,
-                )
-                if d.wallet.lower() == wallet and d.token.lower() == token
-            ]
-            if not deals:
-                continue
-            deal = deals[0]
-            mcap = deal.mcap_at_buy
-            if mcap is None:
-                try:
-                    from .replay import estimate_onchain_spot_mcap
-
-                    mcap = await asyncio.wait_for(
-                        estimate_onchain_spot_mcap(deal.token, rpc=rpc),
-                        timeout=2.5,
+        batch = pending[:8]
+        leftovers = pending[8:]
+        processed = 0
+        try:
+            for wallet, token, _ts in batch:
+                if self._stop_requested:
+                    break
+                processed += 1
+                deals = [
+                    d
+                    for d in self._store.list_pending_alert_deals(
+                        alert_on_deals=list(cfg.alert_on_deals or [2, 3, 4, 5]),
+                        limit=20,
+                        max_age_sec=600,
+                        max_mcap_alert=float(cfg.max_mcap_alert or 0) or None,
                     )
-                except Exception:  # noqa: BLE001
-                    mcap = None
+                    if d.wallet.lower() == wallet and d.token.lower() == token
+                ]
+                if not deals:
+                    continue
+                deal = deals[0]
+                mcap = deal.mcap_at_buy
                 if mcap is None:
                     try:
-                        mcap, _ = await asyncio.wait_for(
-                            estimate_token_quote(deal.token), timeout=2.5
+                        from .replay import estimate_onchain_spot_mcap
+
+                        mcap = await asyncio.wait_for(
+                            estimate_onchain_spot_mcap(deal.token, rpc=rpc),
+                            timeout=2.5,
                         )
                     except Exception:  # noqa: BLE001
                         mcap = None
-                if mcap is not None:
-                    self._store.update_deal_quote(
-                        deal.wallet, deal.token, mcap_at_buy=mcap
-                    )
-                    deal = deal.model_copy(update={"mcap_at_buy": mcap})
-            if mcap is None:
-                self._queue_mcap_micro_retry(wallet, token)
-                continue
-            deal = await self._ensure_deal_token_labels(deal, rpc=rpc)
-            gate = alert_kwargs_for_wallet(
-                cfg, self._store.get_alert_filters_map([deal.wallet]).get(deal.wallet)
-            )
-            if not should_alert_deal(
-                deal.deal_index,
-                deal.mcap_at_buy,
-                bought_usd=deal.bought_usd,
-                **gate,
-            ):
-                continue
-            if not tg_ok:
-                continue
-            ok = await self._deliver_deal_alert(
-                chat, deal=deal, topic_id=topic_id, check_honeypot=False
-            )
-            if ok:
-                sent += 1
-                self._append_log(
-                    "telegram",
-                    f"micro-retry deal #{deal.deal_index} · {deal.wallet[:10]}…",
+                    if mcap is None:
+                        try:
+                            mcap, _ = await asyncio.wait_for(
+                                estimate_token_quote(deal.token), timeout=2.5
+                            )
+                        except Exception:  # noqa: BLE001
+                            mcap = None
+                    if mcap is not None:
+                        self._store.update_deal_quote(
+                            deal.wallet, deal.token, mcap_at_buy=mcap
+                        )
+                        deal = deal.model_copy(update={"mcap_at_buy": mcap})
+                if mcap is None:
+                    self._queue_mcap_micro_retry(wallet, token)
+                    continue
+                deal = await self._ensure_deal_token_labels(deal, rpc=rpc)
+                gate = alert_kwargs_for_wallet(
+                    cfg, self._store.get_alert_filters_map([deal.wallet]).get(deal.wallet)
                 )
+                if not should_alert_deal(
+                    deal.deal_index,
+                    deal.mcap_at_buy,
+                    bought_usd=deal.bought_usd,
+                    **gate,
+                ):
+                    continue
+                if not tg_ok:
+                    continue
+                ok = await self._deliver_deal_alert(
+                    chat,
+                    deal=deal,
+                    topic_id=topic_id,
+                    check_honeypot=bool(getattr(cfg, "alert_skip_honeypot", True)),
+                    origin="micro_retry",
+                )
+                if ok:
+                    sent += 1
+                    self._append_log(
+                        "telegram",
+                        f"micro-retry deal #{deal.deal_index} · {deal.wallet[:10]}…",
+                    )
+        finally:
+            # Never drop the tail or unprocessed head (stop / cancel mid-loop).
+            for wallet, token, _ts in batch[processed:] + leftovers:
+                self._queue_mcap_micro_retry(wallet, token)
         if sent:
             self._last_alerts_sent += sent
 
@@ -2297,30 +3041,68 @@ class FollowupRunner:
         watching = self._store.list_watching()
         if not watching:
             return True
+        tip_verified = False
         try:
             tip = int(await asyncio.wait_for(rpc.block_number(), timeout=8.0))
+            tip_verified = True
         except TimeoutError:
             from .chain import reset_followup_rpc_pressure
 
             reset_followup_rpc_pressure()
             try:
+                rpc._prefer_non_alchemy()  # noqa: SLF001
                 rpc._bind_url(rpc.rpc_url)  # noqa: SLF001
             except Exception:  # noqa: BLE001
                 pass
             self._append_log("live", "block_number timeout")
-            # Stale tip still lets gap burst make progress when RPC is wedged.
-            if self._last_known_tip is None or (time.time() - self._last_tip_ts) > 120.0:
-                return False
-            tip = int(self._last_known_tip)
-            self._append_log("live", f"block_number timeout — stale tip={tip}")
-        self._last_known_tip = tip
-        self._last_tip_ts = time.time()
+            try:
+                tip = int(await asyncio.wait_for(rpc.block_number(), timeout=8.0))
+                tip_verified = True
+                self._append_log(
+                    "live",
+                    f"block_number ok after non-Alchemy failover "
+                    f"tip={tip}",
+                )
+            except TimeoutError:
+                # Stale tip: estimate forward so we do not rescan the same
+                # 4 dead blocks forever while RPC is wedged.
+                if self._last_known_tip is None:
+                    return False
+                verified_age = time.time() - float(self._last_tip_ts or 0)
+                if verified_age > 300.0:
+                    self._append_log(
+                        "live",
+                        f"block_number dead >{verified_age:.0f}s — tip skip",
+                    )
+                    return False
+                # Robinhood L2 is fast; ~2 blk/s is conservative vs observed.
+                base = int(self._last_known_tip)
+                tip = base + max(0, int(verified_age * 2.0))
+                self._append_log(
+                    "live",
+                    f"block_number timeout — estimated tip={tip} "
+                    f"(+{tip - base} from verified {base})",
+                )
+        if tip_verified:
+            self._last_known_tip = tip
+            self._last_tip_ts = time.time()
+        # else: tip is a scan-only estimate — keep verified tip/ts untouched
         conf = max(0, int(cfg.logwatch_confirmations or 0))
         safe_tip = max(0, tip - conf)
-        base_span = max(50, int(getattr(cfg, "logwatch_live_span", 300) or 300))
-        if self._live_timeout_streak >= 2:
-            span = min(base_span, 100)
+        base_span = max(8, int(getattr(cfg, "logwatch_live_span", 300) or 300))
+        base_span = live_span_for_watchlist(base_span, len(watching))
+        batches = topic_batch_count(len(watching))
+        if self._live_timeout_streak >= 1:
+            # Soft-fail → shrink harder + leave Alchemy (public RPC often OK).
+            floor = 4 if batches >= 3 else 8
+            span = min(base_span, floor)
             self._live_span_backoff = span
+            try:
+                rpc._prefer_non_alchemy()  # noqa: SLF001
+                rpc._bind_url(rpc.rpc_url)  # noqa: SLF001
+                self._active_rpc = rpc.active_rpc_label()
+            except Exception:  # noqa: BLE001
+                pass
         else:
             span = base_span
             self._live_span_backoff = 0
@@ -2336,33 +3118,51 @@ class FollowupRunner:
         live_cursor_i = int(live_cursor)
         behind = max(0, safe_tip - live_cursor_i)
         enrich_cap = max(
-            2 * base_span,
-            int(getattr(cfg, "live_gap_enrich_max_blocks", 2_000) or 2_000),
+            2 * max(50, base_span),
+            int(getattr(cfg, "live_gap_enrich_max_blocks", 3_000) or 3_000),
         )
-        fetch_timeout = min(
-            12.0, float(getattr(cfg, "logwatch_fetch_timeout_sec", 45) or 45)
-        )
+        _ = _LIVE_BURST_BEHIND_MULT  # retained for API/compat
+        # Tip path must finish in a few seconds — never share the tick with
+        # burst/gap/drain (those starved TG alerts and tripped the 45s watchdog).
+        # soft_partial tip fetch uses per-batch timeouts; keep outer budget tight.
+        if self._live_timeout_streak >= 2:
+            fetch_timeout = 18.0 if batches >= 3 else 14.0
+        else:
+            fetch_timeout = 14.0 if batches >= 3 else 12.0
         enrich_budget = float(getattr(cfg, "live_enrich_budget_sec", 3.0) or 3.0)
-        burst_behind = base_span * _LIVE_BURST_BEHIND_MULT
+        enrich_budget = max(3.0, min(6.0, enrich_budget))
 
-        # Large live gap: burst skip_enrich toward tip FIRST (no TG). Tip enrich
-        # on a 30k gap burned the 45s watchdog while watermark crawled ~100/tick.
-        if behind > burst_behind:
-            await self._live_burst_skip_enrich(
-                cfg,
-                rpc=rpc,
-                watching=watching,
-                safe_tip=safe_tip,
-                enrich_cap=enrich_cap,
-                fetch_timeout=fetch_timeout,
+        # Far behind: jump watermark only when tip is healthy. Jumping while
+        # soft-failing skips blocks that hist cannot cover (hist is paused).
+        if behind > enrich_cap and self._live_timeout_streak < 2:
+            target = max(live_cursor_i, safe_tip - max(100, enrich_cap))
+            if target > live_cursor_i:
+                await self._queue_before_live_jump(
+                    cfg,
+                    rpc=rpc,
+                    watching=watching,
+                    from_block=live_cursor_i + 1,
+                    to_block=target,
+                    safe_tip=safe_tip,
+                    label="live_jump",
+                    fetch_timeout=min(8.0, fetch_timeout),
+                )
+                self._store.set_logwatch_live_cursor(target)
+                self._append_log(
+                    "live",
+                    f"watermark jump {live_cursor_i}→{target} "
+                    f"(behind was {behind}; tip enrich continues)",
+                    percent=8,
+                )
+                live_cursor_i = target
+                behind = max(0, safe_tip - live_cursor_i)
+        elif behind > enrich_cap and self._live_timeout_streak >= 2:
+            self._append_log(
+                "live",
+                f"watermark hold (behind={behind}, tip soft-fail "
+                f"streak={self._live_timeout_streak})",
             )
-            live_cursor = self._store.get_logwatch_live_cursor()
-            live_cursor_i = int(live_cursor) if live_cursor is not None else live_cursor_i
-            behind = max(0, safe_tip - live_cursor_i)
-            tip_from = max(0, safe_tip - span + 1)
 
-        # Contiguous from live_cursor when inside/near window; always cover tip
-        # for freshness. Never snap live_cursor over an unscanned gap.
         tip_scan_from = tip_from
         contiguous = live_cursor_i + 1 >= tip_from
         if contiguous:
@@ -2371,21 +3171,13 @@ class FollowupRunner:
             self._last_live_success_ts = time.time()
             return True
 
-        # Still far behind after burst: skip enrich tip scan this tick (RPC save).
-        if behind > enrich_cap:
-            self._append_log(
-                "live",
-                f"tip skip enrich scan (behind={behind}>{enrich_cap}) — "
-                "burst продолжит",
-                percent=20,
-            )
-            if behind <= 2_000:
-                self._last_live_success_ts = time.time()
-            return True
-
+        # Single tip window only — newest-first multi-window previously advanced
+        # the contiguous cursor over unscanned older tip blocks (missed buys).
         self._append_log(
             "live",
-            f"tip {tip_scan_from}…{safe_tip} (wallets={len(watching)}, span={span})",
+            f"tip {tip_scan_from}…{safe_tip} "
+            f"(wallets={len(watching)}, span={safe_tip - tip_scan_from + 1}, "
+            f"behind={behind})",
             percent=10,
         )
         res = await self._logwatch_scan_window(
@@ -2399,82 +3191,155 @@ class FollowupRunner:
             skip_enrich=False,
             enrich_budget_sec=enrich_budget,
             queue_mcap_retry=True,
+            soft_partial=batches >= 2,
         )
         if res is None:
             return False
+        total_new = int(res.get("new_deals") or 0)
+        total_alerts = int(res.get("alerts") or 0)
+        incomplete = bool(res.get("incomplete"))
+        fetched = int(res.get("fetched") or 0)
         if not res.get("advanced"):
+            # Partial topic batches may still have produced alerts — count as
+            # tip progress so hist unpauses, but do not advance the cursor.
+            if total_new or total_alerts:
+                self._live_timeout_streak = 0
+                if behind <= 2_000:
+                    self._last_live_success_ts = time.time()
+                self._last_new_deals = total_new
+                self._last_alerts_sent = total_alerts
+                self._last_message = (
+                    f"live tip partial: {total_new} сделок, "
+                    f"{total_alerts} алертов"
+                )
+                self._append_log("live", self._last_message, percent=100)
+                if not contiguous and behind <= enrich_cap:
+                    park = max(live_cursor_i, tip_from - 1)
+                    if park > live_cursor_i:
+                        self._store.set_logwatch_live_cursor(park)
+                return True
+            if incomplete and fetched > 0:
+                # Got real logs from some batches (all filtered) — RPC ok.
+                self._live_timeout_streak = 0
+                if behind <= 2_000:
+                    self._last_live_success_ts = time.time()
+                self._append_log(
+                    "live",
+                    f"tip partial getLogs — {fetched} transfers filtered, "
+                    "cursor hold",
+                )
+                if not contiguous and behind <= enrich_cap:
+                    park = max(live_cursor_i, tip_from - 1)
+                    if park > live_cursor_i:
+                        self._store.set_logwatch_live_cursor(park)
+                return True
+            if incomplete and fetched == 0:
+                # Empty + failed batches: do NOT reset streak — that kept hist
+                # hammering Alchemy while tip stuck on a stale tip window.
+                # Do NOT park the live watermark here: parking skips the gap
+                # while hist is paused → tip buys in the gap age out unseen.
+                self._live_timeout_streak += 1
+                self._append_log(
+                    "live",
+                    f"tip partial empty — cursor hold "
+                    f"(streak={self._live_timeout_streak})",
+                )
+                return True
             self._live_timeout_streak += 1
             self._append_log(
                 "live",
-                f"getLogs soft-fail — live cursor не двигаем "
+                f"getLogs soft-fail — tip cursor не двигаем "
                 f"(streak={self._live_timeout_streak})",
             )
-            # Soft-fail proves the loop is alive only when already near tip.
-            # Far-behind soft-fail must NOT stamp healthy (ops «в порядке» spam).
-            behind_now = max(0, safe_tip - live_cursor_i)
-            if behind_now <= 2_000:
-                self._last_live_success_ts = time.time()
+            # Soft-fail must NOT stamp healthy — otherwise hist/drain stay
+            # paused while ops think tip is fine and queued alerts age out.
             return True
+
         self._live_timeout_streak = 0
-        # Stamp healthy only when tip scan itself is near-tip (contiguous or
-        # tip window). Huge live watermark lag still unhealthy until gap closes.
-        behind_after_tip = max(0, safe_tip - live_cursor_i)
-        if contiguous or behind_after_tip <= 2_000:
+        if contiguous or behind <= 2_000:
             self._last_live_success_ts = time.time()
-        # Advance live cursor only when the scan was contiguous from the watermark.
         if contiguous:
             advance_to = res.get("advance_to")
             if advance_to is not None and int(advance_to) > live_cursor_i:
                 self._store.set_logwatch_live_cursor(int(advance_to))
             else:
                 self._store.set_logwatch_live_cursor(safe_tip)
+        elif behind <= enrich_cap:
+            # Near tip but not contiguous: park live cursor at tip-enrich edge
+            # so next tick becomes contiguous without waiting on hist.
+            park = max(live_cursor_i, tip_from - 1)
+            if park > live_cursor_i:
+                self._store.set_logwatch_live_cursor(park)
 
-        # Gap below tip window: near tip → enrich+alert; large lag → cursor-only
-        # (skip_enrich) so hist replay cannot Telegram fake deal #2/#3.
-        live_now = self._store.get_logwatch_live_cursor()
-        live_now_i = int(live_now) if live_now is not None else live_cursor_i
-        if live_now_i + 1 < tip_from:
-            gap_from = live_now_i + 1
-            gap_to = min(tip_from - 1, gap_from + span - 1)
-            gap_behind = max(0, safe_tip - live_now_i)
-            gap_skip_enrich = gap_behind > enrich_cap
-            self._append_log(
-                "live",
-                f"gap {gap_from}…{gap_to} "
-                f"(behind={gap_behind}, "
-                f"{'skip_enrich' if gap_skip_enrich else 'enrich on'})",
-                percent=14,
-            )
-            gap = await self._logwatch_scan_window(
-                cfg,
-                rpc=rpc,
-                watching=watching,
-                from_block=gap_from,
-                to_block=gap_to,
-                fetch_timeout=fetch_timeout,
-                label="live_gap",
-                skip_enrich=gap_skip_enrich,
-                enrich_budget_sec=None if gap_skip_enrich else enrich_budget,
-                queue_mcap_retry=not gap_skip_enrich,
-            )
-            if gap and gap.get("advanced") and gap.get("advance_to") is not None:
-                self._store.set_logwatch_live_cursor(int(gap["advance_to"]))
-                # After gap advance, refresh healthy stamp if now near tip.
-                new_live = int(gap["advance_to"])
-                if max(0, safe_tip - new_live) <= 2_000:
-                    self._last_live_success_ts = time.time()
-            elif gap and not gap.get("advanced"):
-                self._live_timeout_streak += 1
-
-        if res.get("new_deals") or res.get("alerts"):
-            self._last_new_deals = int(res.get("new_deals") or 0)
-            self._last_alerts_sent = int(res.get("alerts") or 0)
+        if total_new or total_alerts:
+            self._last_new_deals = total_new
+            self._last_alerts_sent = total_alerts
             self._last_message = (
-                f"live {tip_scan_from}…{safe_tip}: "
-                f"{res.get('new_deals', 0)} сделок, {res.get('alerts', 0)} алертов"
+                f"live tip: {total_new} сделок, {total_alerts} алертов"
             )
             self._append_log("live", self._last_message, percent=100)
         return True
+
+    async def _live_catchup_pass(
+        self,
+        cfg: FollowupConfig,
+        *,
+        rpc: Any,
+    ) -> None:
+        """Off-tip watermark catch-up + pending drain (never on live tip tick)."""
+        watching = self._store.list_watching()
+        if not watching:
+            return
+        tip_soft = self._live_timeout_streak >= 2
+        # Always drain already-queued tip/uncertain transfers — pausing drain
+        # while tip soft-fails ages out GMGN tip_lag alerts silently.
+        if self._pending_skip_transfers:
+            try:
+                await self._drain_pending_skip_transfers(
+                    cfg,
+                    rpc=rpc,
+                    enrich_budget_sec=float(
+                        getattr(cfg, "live_enrich_budget_sec", 3.0) or 3.0
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("maint pending drain: %s", exc)
+        if tip_soft:
+            self._append_log(
+                "live",
+                f"catchup burst pause — tip soft-fail streak="
+                f"{self._live_timeout_streak}",
+            )
+            return
+        try:
+            tip = int(await asyncio.wait_for(rpc.block_number(), timeout=6.0))
+            self._last_known_tip = tip
+            self._last_tip_ts = time.time()
+        except Exception:  # noqa: BLE001
+            if self._last_known_tip is None:
+                return
+            tip = int(self._last_known_tip)
+        conf = max(0, int(cfg.logwatch_confirmations or 0))
+        safe_tip = max(0, tip - conf)
+        base_span = max(8, int(getattr(cfg, "logwatch_live_span", 300) or 300))
+        base_span = live_span_for_watchlist(base_span, len(watching))
+        enrich_cap = max(
+            2 * max(50, base_span),
+            int(getattr(cfg, "live_gap_enrich_max_blocks", 3_000) or 3_000),
+        )
+        live_cursor = self._store.get_logwatch_live_cursor()
+        if live_cursor is None:
+            return
+        behind = max(0, safe_tip - int(live_cursor))
+        if behind > enrich_cap:
+            await self._live_burst_skip_enrich(
+                cfg,
+                rpc=rpc,
+                watching=watching,
+                safe_tip=safe_tip,
+                enrich_cap=enrich_cap,
+                fetch_timeout=10.0,
+            )
 
     async def _live_burst_skip_enrich(
         self,
@@ -2499,20 +3364,40 @@ class FollowupRunner:
         target = max(live_now, safe_tip - max(100, enrich_cap))
         if live_now >= target:
             return
-        burst_span = max(
-            500,
-            min(
-                int(getattr(cfg, "logwatch_burst_catchup_span", 10_000) or 10_000),
-                5_000,
-            ),
-        )
+        behind0 = max(0, safe_tip - live_now)
+        # Far behind: one watermark jump to the enrich window. Crawling +200
+        # after getLogs timeouts never beats tip (~10 bl/s) with 500+ wallets.
+        if behind0 > max(4_000, int(enrich_cap) * 2):
+            await self._queue_before_live_jump(
+                cfg,
+                rpc=rpc,
+                watching=watching,
+                from_block=live_now + 1,
+                to_block=target,
+                safe_tip=safe_tip,
+                label="burst_jump",
+                fetch_timeout=min(8.0, fetch_timeout),
+            )
+            self._store.set_logwatch_live_cursor(target)
+            self._append_log(
+                "live",
+                f"burst watermark jump {live_now}→{target} "
+                f"(behind was {behind0}, skip_enrich, no TG)",
+                percent=15,
+            )
+            if max(0, safe_tip - target) <= 2_000:
+                self._last_live_success_ts = time.time()
+            return
+        # Watchlist-sized burst chunks (not multi-k windows that always 15s-timeout).
+        burst_span = live_burst_span_for_watchlist(cfg, len(watching))
         max_chunks = max(
-            2,
-            min(8, int(getattr(cfg, "logwatch_catchup_chunks_per_pass", 4) or 4) * 2),
+            3,
+            min(10, int(getattr(cfg, "logwatch_catchup_chunks_per_pass", 4) or 4) * 2),
         )
+        # Leave headroom for tip-enrich on the same live tick / next tick.
         budget = min(
-            28.0,
-            float(getattr(cfg, "live_cycle_timeout_sec", 45) or 45) * 0.65,
+            16.0,
+            float(getattr(cfg, "live_cycle_timeout_sec", 45) or 45) * 0.35,
         )
         t0 = time.time()
         chunks = 0
@@ -2547,9 +3432,10 @@ class FollowupRunner:
             )
             chunks += 1
             if not res or not res.get("advanced") or res.get("advance_to") is None:
-                # Absolute last resort: watermark jump. Deals this far behind tip
-                # are past alert_max_block_lag anyway; hist skip_enrich covers DB.
-                jump_to = min(target, gap_from + max(200, burst_span // 2) - 1)
+                # Jump toward tip enrich window — not a tiny +200 crawl.
+                behind_now = max(0, safe_tip - live_now)
+                step = max(burst_span, min(2_000, max(200, behind_now - enrich_cap)))
+                jump_to = min(target, live_now + step)
                 if jump_to > live_now:
                     self._append_log(
                         "live",
@@ -2563,7 +3449,9 @@ class FollowupRunner:
                 break
             adv = int(res["advance_to"])
             if adv <= live_now:
-                jump_to = min(target, live_now + max(200, burst_span // 2))
+                behind_now = max(0, safe_tip - live_now)
+                step = max(burst_span, min(2_000, max(200, behind_now - enrich_cap)))
+                jump_to = min(target, live_now + step)
                 if jump_to > live_now:
                     self._store.set_logwatch_live_cursor(jump_to)
                     advanced_total += jump_to - live_now
@@ -2582,7 +3470,8 @@ class FollowupRunner:
                 f"(behind={max(0, safe_tip - live_now)})",
                 percent=40,
             )
-        self._live_timeout_streak = 0
+        # Do NOT reset tip soft-fail streak here — burst success must not
+        # re-inflate tip span while tip getLogs is still timing out.
 
     async def _logwatch_pass(
         self,
@@ -2599,6 +3488,16 @@ class FollowupRunner:
         """
         watching = self._store.list_watching()
         self._last_hist_advanced = False
+        # Tip purchase alerts are primary, but pausing hist entirely while tip
+        # soft-fails made cursor lag explode (ops spam). Keep skip_enrich
+        # catch-up alive with a reduced budget.
+        hist_soft = self._live_timeout_streak >= 2
+        if hist_soft:
+            self._append_log(
+                "logwatch",
+                f"hist soft-mode — tip soft-fail streak="
+                f"{self._live_timeout_streak}",
+            )
         if not watching:
             try:
                 tip = int(
@@ -2706,9 +3605,69 @@ class FollowupRunner:
         live_span = max(
             50, int(getattr(cfg, "logwatch_live_span", 300) or 300)
         )
-        catching_up = lag > max(
-            5_000, int(cfg.logwatch_max_span or 3_000) * 3
+        live_span = live_span_for_watchlist(live_span, len(watching))
+        # Catch-up before the ops alert (6k). Lag 4–6k with catching_up=False
+        # used to run ONE hist chunk then break → tip outruns forever.
+        alert_thr = max(
+            3_000, int(getattr(cfg, "cursor_lag_alert_blocks", 6_000) or 6_000)
         )
+        catching_up = lag > max(4_000, alert_thr // 2)
+
+        # Hist skip_enrich does not record deals (GMGN rank is authoritative for
+        # alerts). Blocks older than alert_max_block_lag are also TG-stale.
+        # Fast-forward the watermark past that floor so ops lag clears instead
+        # of crawling forever under a 500+ wallet topic OR.
+        alert_lag = max(
+            500, int(getattr(cfg, "alert_max_block_lag", 2_000) or 2_000)
+        )
+        stale_floor = max(0, safe_tip - alert_lag - live_span)
+        if catching_up and cursor < stale_floor and lag >= 4_000:
+            self._store.set_logwatch_cursor(stale_floor)
+            jumped = stale_floor - cursor
+            self._append_log(
+                "logwatch",
+                f"hist fast-forward +{jumped} → {stale_floor} "
+                f"(stale past alert_lag={alert_lag}, skip_enrich)",
+                percent=8,
+            )
+            cursor = stale_floor
+            lag = max(0, safe_tip - cursor)
+            self._cursor_lag_blocks = tip - cursor
+            catching_up = lag > max(4_000, alert_thr // 2)
+            self._last_hist_advanced = True
+
+        # Dual-jump: if live is also far behind, snap it to the enrich window
+        # now — do not wait for the live loop under shared RPC pressure.
+        live_now = self._store.get_logwatch_live_cursor()
+        if live_now is not None:
+            live_behind = max(0, safe_tip - int(live_now))
+            enrich_cap = max(
+                2 * live_span,
+                int(getattr(cfg, "live_gap_enrich_max_blocks", 2_000) or 2_000),
+            )
+            if live_behind > max(4_000, int(enrich_cap) * 2):
+                live_target = max(int(live_now), safe_tip - max(100, enrich_cap))
+                if live_target > int(live_now):
+                    await self._queue_before_live_jump(
+                        cfg,
+                        rpc=rpc,
+                        watching=watching,
+                        from_block=int(live_now) + 1,
+                        to_block=live_target,
+                        safe_tip=safe_tip,
+                        label="dual_jump",
+                        fetch_timeout=8.0,
+                    )
+                    self._store.set_logwatch_live_cursor(live_target)
+                    self._append_log(
+                        "logwatch",
+                        f"live dual-jump {live_now}→{live_target} "
+                        f"(behind was {live_behind}, skip_enrich, no TG)",
+                        percent=9,
+                    )
+                    # Do NOT stamp _last_live_success_ts — no tip getLogs ran.
+                    # Fake success suppressed DEGRADED/legacy while gap buys
+                    # were skipped.
 
         if cursor >= safe_tip:
             self._last_checked = len(watching)
@@ -2733,21 +3692,29 @@ class FollowupRunner:
                     int(getattr(cfg, "logwatch_catchup_chunks_per_pass", 4) or 4),
                 ),
             )
+        # Many OR'd wallets → tiny spans; need more chunks/pass to clear lag.
+        if topic_batch_count(len(watching)) >= 3 and lag > 3_000:
+            max_chunks = max(max_chunks, 8)
         budget = float(
             getattr(cfg, "logwatch_catchup_time_budget_sec", 90.0) or 90.0
         )
-        cycle_cap = float(cfg.cycle_timeout_sec or 180) * 0.55
-        budget = min(budget, cycle_cap)
+        cycle_cap = float(cfg.cycle_timeout_sec or 180) * 0.7
+        budget = min(max(budget, 60.0), cycle_cap)
+        if hist_soft:
+            # Tip is struggling — still clear hist lag, but don't hog RPC.
+            budget = min(budget, 35.0)
+            max_chunks = min(max_chunks, 4)
         t0 = time.time()
 
         base_fetch_timeout = float(
             getattr(cfg, "logwatch_fetch_timeout_sec", 45) or 45
         )
-        # Per-window timeout: allow burst windows to finish via small RPC chunks.
-        # Do NOT clamp to 20s on large lag — that froze the cursor on every try.
+        # Per-window timeout: progressive sub-chunks use this as a budget.
         fetch_timeout = min(base_fetch_timeout, 45.0)
         if lag > _HIST_BURST_LAG:
-            fetch_timeout = min(max(base_fetch_timeout, 35.0), 55.0)
+            fetch_timeout = min(max(base_fetch_timeout, 35.0), 60.0)
+        if topic_batch_count(len(watching)) >= 3:
+            fetch_timeout = max(fetch_timeout, 40.0)
 
         total_new = 0
         total_alerts = 0
@@ -2760,13 +3727,22 @@ class FollowupRunner:
         while chunks_done < max_chunks and (time.time() - t0) < budget:
             if self._stop_requested:
                 break
+            # Tip soft-failed mid-pass (started healthy) — yield RPC. Soft-mode
+            # hist already entered with a reduced budget; do not abort it here.
+            if not hist_soft and self._live_timeout_streak >= 2:
+                self._append_log(
+                    "logwatch",
+                    f"hist mid-pass pause — tip soft-fail streak="
+                    f"{self._live_timeout_streak}",
+                )
+                break
             cursor = self._store.get_logwatch_cursor() or cursor
             lag = max(0, safe_tip - cursor)
             self._cursor_lag_blocks = tip - cursor
             if cursor >= safe_tip:
                 break
 
-            span = hist_span_for_lag(lag, cfg)
+            span = hist_span_for_lag(lag, cfg, n_wallets=len(watching))
             from_block = cursor + 1
             to_block = min(safe_tip, from_block + span - 1)
             # Stop hist before the live tip window so we do not race live alerts.
@@ -2827,14 +3803,62 @@ class FollowupRunner:
                     last_to = adv
             total_new += int(hist_res.get("new_deals") or 0)
             total_alerts += int(hist_res.get("alerts") or 0)
-            # Soft fail with no advance: shrink-retry already exhausted — stop
-            # this cycle; next pass retries. Do not burn the whole budget.
+            # Soft fail with no advance: near tip / inside alert horizon —
+            # stop and retry (never skip unscanned alertable blocks). Far
+            # behind past alert_max_block_lag — force-advance so tip cannot
+            # outrun forever under a stuck OR'd getLogs window.
             if not hist_res.get("advanced"):
-                break
-            # Near tip: one chunk is enough.
-            if not catching_up and lag <= max(
-                5_000, int(cfg.logwatch_max_span or 3_000) * 3
-            ):
+                high_lag = lag > max(4_000, alert_thr // 2)
+                past_alert = cursor < max(0, safe_tip - alert_lag)
+                if not (high_lag and past_alert):
+                    # Near tip / inside alert horizon: never skip unscanned
+                    # blocks, but durable-queue a tip-adjacent slice so live
+                    # drain can still alert while getLogs is wedged.
+                    try:
+                        queued = await self._queue_before_live_jump(
+                            cfg,
+                            rpc=rpc,
+                            watching=watching,
+                            from_block=from_block,
+                            to_block=to_block,
+                            safe_tip=safe_tip,
+                            label="hist_soft_near_tip",
+                            fetch_timeout=min(8.0, win_timeout),
+                        )
+                        if queued:
+                            self._append_log(
+                                "logwatch",
+                                f"hist soft-fail near tip — queued {queued} "
+                                f"transfers [{from_block}…{to_block}]",
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("hist near-tip queue: %s", exc)
+                    break
+                step = max(
+                    300,
+                    int(hist_span_for_lag(lag, cfg, n_wallets=len(watching))),
+                )
+                # Cap at the alert floor — never jump into the TG horizon.
+                alert_floor = max(0, safe_tip - alert_lag)
+                jump_to = min(alert_floor, cursor + step)
+                live_c = self._store.get_logwatch_live_cursor()
+                if live_c is not None:
+                    jump_to = min(jump_to, max(live_floor, int(live_c)))
+                if jump_to <= cursor:
+                    break
+                self._store.set_logwatch_cursor(jump_to)
+                any_advance = True
+                last_to = jump_to
+                self._append_log(
+                    "logwatch",
+                    f"hist soft-fail force-advance {cursor}→{jump_to} "
+                    f"(lag={lag}, keep multi-chunk)",
+                )
+                continue
+            # Only stop multi-chunk when near tip — the old lag<=9k break
+            # aborted catch-up after ONE chunk while tip kept growing.
+            near_tip = max(0, safe_tip - (self._store.get_logwatch_cursor() or cursor))
+            if near_tip <= max(2_000, int(live_span) * 3):
                 break
 
         self._last_hist_advanced = any_advance
@@ -2886,13 +3910,42 @@ class FollowupRunner:
         max_attempts = max(3, force_after_i + 2)
 
         def _force_advance(span_now: int, reason: str) -> dict[str, Any]:
-            # Skip the whole attempted window. skip_enrich: no TG; stale deals
-            # are past alert_max_block_lag. Tiny +50 steps recreated the freeze.
+            # Skip only windows already past the TG alert horizon. Near-tip
+            # force-advance permanently drops buys live has not tip-scanned
+            # (hist stops before tip; dual-jump can leave a gap).
+            tip = self._last_known_tip
+            alert_lag = max(
+                500, int(getattr(cfg, "alert_max_block_lag", 4_000) or 4_000)
+            )
+            if tip is not None and from_block > int(tip) - alert_lag:
+                self._append_log(
+                    "logwatch",
+                    f"{label} {reason} — refuse force-advance near tip "
+                    f"(from={from_block}, tip={tip}, alert_lag={alert_lag})",
+                )
+                return {
+                    "new_deals": 0,
+                    "alerts": 0,
+                    "skipped": 0,
+                    "advanced": False,
+                    "advance_to": None,
+                }
             step = max(1, span_now)
             nudge_to = from_block + step - 1
+            # Never advance past the alert floor even on far-behind skips.
+            if tip is not None:
+                nudge_to = min(nudge_to, max(from_block - 1, int(tip) - alert_lag))
+            if nudge_to < from_block:
+                return {
+                    "new_deals": 0,
+                    "alerts": 0,
+                    "skipped": 0,
+                    "advanced": False,
+                    "advance_to": None,
+                }
             self._append_log(
                 "logwatch",
-                f"{label} {reason} — force-advance +{step} "
+                f"{label} {reason} — force-advance +{nudge_to - from_block + 1} "
                 f"(skip_enrich) → {nudge_to}",
             )
             return {
@@ -2967,20 +4020,23 @@ class FollowupRunner:
         *,
         cfg: FollowupConfig,
         max_pages: int | None = None,
+        bypass_cache: bool = False,
     ) -> UniqueBuysResult:
         """Short-TTL cache so live tip does not stampede GMGN per transfer."""
         wallet_l = wallet.lower()
         ttl = float(getattr(cfg, "gmgn_rank_cache_ttl_sec", 60.0) or 60.0)
         now = time.time()
-        hit = self._gmgn_rank_cache.get(wallet_l)
-        if hit is not None and (now - hit[0]) <= ttl:
-            return hit[1]
+        if not bypass_cache:
+            hit = self._gmgn_rank_cache.get(wallet_l)
+            if hit is not None and (now - hit[0]) <= ttl:
+                return hit[1]
         pages = int(
             max_pages
             if max_pages is not None
             else (getattr(cfg, "gmgn_rank_max_pages", 3) or 3)
         )
-        result = await fetch_unique_buys(wallet_l, max_pages=max(1, pages))
+        async with self._gmgn_rank_sem:
+            result = await fetch_unique_buys(wallet_l, max_pages=max(1, pages))
         self._gmgn_rank_cache[wallet_l] = (now, result)
         if len(self._gmgn_rank_cache) > 800:
             # Drop oldest half by timestamp.
@@ -3042,6 +4098,20 @@ class FollowupRunner:
             return replace(empty, reason=reason)
         _seed_buy, post = post_seed_unique_buys(list(result.buys), seed_token)
         if _seed_buy is None:
+            # Stale/wrong seed (e.g. Blockscout dust). Truncated GMGN pages can
+            # omit the seed while still returning ≥max_deals buys — only close
+            # the wallet when the sample is clearly a spray/past history.
+            n_uniques = len(result.buys or [])
+            past_floor = max(15, int(max_deals) * 3)
+            if n_uniques >= past_floor:
+                return GmgnRankVerdict(
+                    uncertain=False,
+                    reason="gmgn_seed_miss_past",
+                    seed_token=seed_token,
+                    post_seed=tuple(result.buys[: max(0, max_deals - 1)]),
+                    rank=None,
+                    past_max=True,
+                )
             return replace(empty, reason="gmgn_seed_miss")
         past_max = len(post) >= max(0, max_deals - 1)
         # Repair / wallet-level check: no tip token — only post-seed fullness.
@@ -3068,19 +4138,53 @@ class FollowupRunner:
                 rank=None,
                 past_max=True,
             )
-        # Fresh tip buy not yet on GMGN: next slot only inside the window.
-        if rank is None and not past_max:
-            next_rank = len(post) + 2
-            if next_rank > max_deals:
+        # Tip not in cached GMGN list: one forced refresh, then tip_lag.
+        # Do NOT bypass cache on every tip transfer (GMGN 429 stampede).
+        if rank is None and not past_max and token_l:
+            try:
+                result = await self._fetch_unique_buys_cached(
+                    wallet, cfg=cfg, bypass_cache=True
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("GMGN tip refresh %s: %s", wallet[:10], exc)
+                return replace(
+                    empty,
+                    reason="gmgn_tip_lag",
+                    seed_token=seed_token,
+                    post_seed=tuple(post),
+                )
+            if result.rate_limited or not result.ok:
+                return replace(
+                    empty,
+                    reason="gmgn_tip_lag",
+                    seed_token=seed_token,
+                    post_seed=tuple(post),
+                )
+            _seed_buy, post = post_seed_unique_buys(list(result.buys), seed_token)
+            if _seed_buy is None:
+                return replace(empty, reason="gmgn_seed_miss")
+            past_max = len(post) >= max(0, max_deals - 1)
+            if past_max:
                 return GmgnRankVerdict(
                     uncertain=False,
-                    reason="beyond_window",
+                    reason="past_max",
                     seed_token=seed_token,
                     post_seed=tuple(post),
                     rank=None,
                     past_max=True,
                 )
-            rank = next_rank
+            rank = None
+            for i, buy in enumerate(post, start=2):
+                if buy.token.lower() == token_l:
+                    rank = i
+                    break
+            if rank is None:
+                return replace(
+                    empty,
+                    reason="gmgn_tip_lag",
+                    seed_token=seed_token,
+                    post_seed=tuple(post),
+                )
         return GmgnRankVerdict(
             uncertain=False,
             reason="ok",
@@ -3140,6 +4244,13 @@ class FollowupRunner:
         inserted = self._store.apply_gmgn_buy_order(
             wallet, rows, max_deals=max_deals
         )
+        # GMGN sibling fills (no chain block) must never pending-retry as tip.
+        for deal in inserted:
+            tok = str(getattr(deal, "token", "") or "").lower()
+            if tip_l and tok == tip_l:
+                continue
+            if int(getattr(deal, "block_number", 0) or 0) <= 0:
+                self._store.mark_notified(wallet, tok)
         self._invalidate_gmgn_rank_cache(wallet)
         return inserted
 
@@ -3213,7 +4324,10 @@ class FollowupRunner:
         behind: int | None = None
         if tip_ref is not None and live is not None:
             behind = max(0, int(tip_ref) - int(live))
-        if behind is not None and behind > 2_000:
+        # Burst intentionally parks near live_gap_enrich_max_blocks (~2k);
+        # tip grows during the tick — allow headroom before declaring unhealthy.
+        unhealthy_behind = 3_000
+        if behind is not None and behind > unhealthy_behind:
             return False, behind
         now = time.time()
         if self._last_live_success_ts and (now - self._last_live_success_ts) <= 90.0:
@@ -3221,7 +4335,7 @@ class FollowupRunner:
         if live is None or tip_ref is None:
             return True, None
         assert behind is not None
-        return behind <= 2_000, behind
+        return behind <= unhealthy_behind, behind
 
     async def _live_behind_blocks(self, rpc: Any) -> int | None:
         """Tip − live cursor via RPC; None if tip unavailable.
@@ -3238,6 +4352,438 @@ class FollowupRunner:
             return None
         return max(0, tip - int(live))
 
+    def _queue_skip_enrich_transfers(
+        self, transfers: list[InboundTransfer]
+    ) -> None:
+        """Remember transfers seen while catching up without enrich+alert."""
+        if not transfers:
+            return
+        now = time.time()
+        tip = self._last_known_tip
+        max_age = 900.0
+        max_block = 8_000
+        with self._pending_state_lock:
+            # Preserve first-seen queued_at on re-queue (tip_lag retries).
+            by_key: dict[tuple[str, str], tuple[InboundTransfer, float]] = {
+                (t.wallet.lower(), t.token.lower()): (t, ts)
+                for t, ts in self._pending_skip_transfers
+            }
+            added = 0
+            refreshed = 0
+            for tr in transfers:
+                key = (tr.wallet.lower(), tr.token.lower())
+                if tr.bought_at and float(tr.bought_at) > 0:
+                    if now - float(tr.bought_at) > max_age:
+                        continue
+                if (
+                    tip is not None
+                    and tr.block_number > 0
+                    and int(tip) - int(tr.block_number) > max_block
+                ):
+                    continue
+                prev = by_key.get(key)
+                if prev is not None:
+                    # Keep original queued_at; refresh transfer payload.
+                    by_key[key] = (tr, prev[1])
+                    refreshed += 1
+                    continue
+                by_key[key] = (tr, now)
+                added += 1
+            items = sorted(by_key.values(), key=lambda x: x[1])
+            if len(items) > 120:
+                # Persist the ones we are about to drop? Prefer keep newest for TG.
+                dropped = items[:-120]
+                items = items[-120:]
+                try:
+                    self._store.delete_pending_tip_transfers(
+                        [(t.wallet, t.token) for t, _ in dropped]
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            self._pending_skip_transfers = items
+            pending_n = len(items)
+            persist_rows = [
+                {
+                    "wallet": t.wallet,
+                    "token": t.token,
+                    "sender": t.sender,
+                    "tx_hash": t.tx_hash,
+                    "block_number": t.block_number,
+                    "bought_at": t.bought_at or None,
+                    "queued_at": ts,
+                }
+                for t, ts in items
+            ]
+        try:
+            self._store.upsert_pending_tip_transfers(persist_rows)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("persist pending tip transfers: %s", exc)
+        if added or refreshed:
+            self._append_log(
+                "live",
+                f"queued {added} skip-enrich transfers "
+                f"(refresh={refreshed}, pending={pending_n})",
+            )
+
+    async def _queue_before_live_jump(
+        self,
+        cfg: FollowupConfig,
+        *,
+        rpc: Any,
+        watching: list[str],
+        from_block: int,
+        to_block: int,
+        safe_tip: int,
+        label: str,
+        fetch_timeout: float = 8.0,
+    ) -> int:
+        """Best-effort skip_enrich of the tip-adjacent slice before a watermark jump.
+
+        Pure jumps used to skip blocks with no pending queue; hist may be far
+        behind or later fast-forward past them. Scan only the newest slice still
+        inside ``alert_max_block_lag`` so tip buys are not silently dropped.
+        """
+        if to_block < from_block or not watching:
+            return 0
+        alert_lag = max(
+            500, int(getattr(cfg, "alert_max_block_lag", 4_000) or 4_000)
+        )
+        # Anything older than alert_lag from tip is TG-stale by design.
+        fresh_from = max(from_block, safe_tip - alert_lag)
+        if fresh_from > to_block:
+            return 0
+        live_span = max(50, int(getattr(cfg, "logwatch_live_span", 300) or 300))
+        live_span = live_span_for_watchlist(live_span, len(watching))
+        scan_span = min(to_block - fresh_from + 1, max(200, live_span * 2))
+        scan_from = max(fresh_from, to_block - scan_span + 1)
+        try:
+            res = await self._logwatch_scan_window(
+                cfg,
+                rpc=rpc,
+                watching=watching,
+                from_block=scan_from,
+                to_block=to_block,
+                fetch_timeout=max(4.0, float(fetch_timeout)),
+                label=label,
+                skip_enrich=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("queue before jump %s: %s", label, exc)
+            return 0
+        if not res:
+            return 0
+        queued = int(res.get("skipped") or 0)
+        if queued:
+            self._append_log(
+                "live",
+                f"{label}: queued ~{queued} transfers "
+                f"{scan_from}…{to_block} before watermark jump",
+            )
+        return queued
+
+    async def _drain_pending_skip_transfers(
+        self,
+        cfg: FollowupConfig,
+        *,
+        rpc: Any,
+        enrich_budget_sec: float | None = None,
+    ) -> dict[str, int]:
+        """Enrich+alert transfers that skip_enrich previously only counted."""
+        with self._pending_state_lock:
+            if not self._pending_skip_transfers:
+                return {"new_deals": 0, "alerts": 0}
+            pending_snapshot = list(self._pending_skip_transfers)
+        from .gmgn_portfolio import gmgn_circuit_open
+
+        # Circuit open → keep queue intact and freeze queued_at so a long
+        # 429 window does not age-out tip_lag buys the moment circuit clears.
+        if gmgn_circuit_open():
+            now_f = time.time()
+            with self._pending_state_lock:
+                self._pending_skip_transfers = [
+                    (tr, now_f) for tr, _ts in self._pending_skip_transfers
+                ]
+                pending_n = len(self._pending_skip_transfers)
+            try:
+                self._store.touch_pending_tip_queued_at(now=now_f)
+            except Exception:  # noqa: BLE001
+                pass
+            self._append_log(
+                "live",
+                f"drain pause — GMGN circuit "
+                f"(pending={pending_n}, age frozen)",
+            )
+            return {"new_deals": 0, "alerts": 0}
+        now = time.time()
+        tip = self._last_known_tip
+        max_age = float(getattr(cfg, "alert_max_buy_age_sec", 900) or 900)
+        keep: list[tuple[InboundTransfer, float]] = []
+        batch: list[InboundTransfer] = []
+        batch_meta: list[tuple[InboundTransfer, float]] = []
+        expired: list[tuple[str, str]] = []
+        for tr, queued_at in pending_snapshot:
+            if now - queued_at > max_age:
+                expired.append((tr.wallet, tr.token))
+                continue
+            if tr.bought_at and float(tr.bought_at) > 0:
+                if now - float(tr.bought_at) > max_age * 2:
+                    expired.append((tr.wallet, tr.token))
+                    continue
+            if (
+                tip is not None
+                and tr.block_number > 0
+                and int(tip) - int(tr.block_number)
+                > int(getattr(cfg, "alert_max_block_lag", 4_000) or 4_000) * 2
+            ):
+                expired.append((tr.wallet, tr.token))
+                continue
+            if len(batch) < 12:
+                batch.append(tr)
+                batch_meta.append((tr, queued_at))
+            else:
+                keep.append((tr, queued_at))
+        with self._pending_state_lock:
+            # Merge: drop expired/batch from current queue; keep rest + any
+            # newly queued keys that arrived while we classified.
+            batch_keys = {(t.wallet.lower(), t.token.lower()) for t in batch}
+            expired_keys = {(w.lower(), t.lower()) for w, t in expired}
+            drop_keys = batch_keys | expired_keys
+            merged: dict[tuple[str, str], tuple[InboundTransfer, float]] = {
+                (t.wallet.lower(), t.token.lower()): (t, ts) for t, ts in keep
+            }
+            for t, ts in self._pending_skip_transfers:
+                key = (t.wallet.lower(), t.token.lower())
+                if key in drop_keys:
+                    continue
+                merged.setdefault(key, (t, ts))
+            self._pending_skip_transfers = sorted(
+                merged.values(), key=lambda x: x[1]
+            )
+        if expired:
+            try:
+                self._store.delete_pending_tip_transfers(expired)
+            except Exception:  # noqa: BLE001
+                pass
+        if not batch:
+            return {"new_deals": 0, "alerts": 0}
+        self._append_log(
+            "live",
+            f"drain {len(batch)} pending skip-enrich transfers",
+            percent=50,
+        )
+        try:
+            stats = await self._process_logwatch_transfers(
+                batch,
+                cfg=cfg,
+                rpc=rpc,
+                label="pending",
+                enrich_budget_sec=enrich_budget_sec,
+                queue_mcap_retry=True,
+                cursor_floor=None,
+                from_block=min(t.block_number for t in batch),
+                to_block=max(t.block_number for t in batch),
+            )
+            # Only drop keys that were NOT re-queued (GMGN uncertain / tip_lag).
+            # Blind delete of the whole batch wiped durable rows that
+            # ``_queue_skip_enrich_transfers`` just upserted — restart miss.
+            with self._pending_state_lock:
+                pending_keys = {
+                    (t.wallet.lower(), t.token.lower())
+                    for t, _ts in self._pending_skip_transfers
+                }
+            done_keys = [
+                (t.wallet, t.token)
+                for t in batch
+                if (t.wallet.lower(), t.token.lower()) not in pending_keys
+            ]
+            if done_keys:
+                try:
+                    self._store.delete_pending_tip_transfers(done_keys)
+                except Exception:  # noqa: BLE001
+                    pass
+            return stats
+        except Exception:
+            # Put the batch back — otherwise tip_lag items vanish on RPC blip.
+            with self._pending_state_lock:
+                restored = {
+                    (t.wallet.lower(), t.token.lower()): (t, ts)
+                    for t, ts in batch_meta
+                }
+                for t, ts in self._pending_skip_transfers:
+                    restored.setdefault((t.wallet.lower(), t.token.lower()), (t, ts))
+                self._pending_skip_transfers = sorted(
+                    restored.values(), key=lambda x: x[1]
+                )
+            raise
+
+    async def _skip_enrich_progressive_fetch(
+        self,
+        cfg: FollowupConfig,
+        *,
+        rpc: Any,
+        watching: list[str],
+        from_block: int,
+        to_block: int,
+        fetch_timeout: float,
+        label: str,
+        empty: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Fetch hist/burst windows in sub-chunks; advance as far as budget allows.
+
+        One outer ``wait_for`` over thousands of blocks × hundreds of OR'd wallet
+        topics always timed out with zero cursor progress (lag alerts forever).
+        """
+        from .chain import _is_retryable, _redact_exc
+
+        batches = topic_batch_count(len(watching))
+        rpc_chunk = max(
+            25, int(getattr(cfg, "logwatch_hist_rpc_chunk", 100) or 100)
+        )
+        # Cap start size under heavy OR topics; grow back after successes.
+        max_rpc_chunk = rpc_chunk
+        if batches >= 3:
+            rpc_chunk = min(rpc_chunk, 25)
+            max_rpc_chunk = min(max_rpc_chunk, 100)
+        elif batches >= 2:
+            rpc_chunk = min(rpc_chunk, 50)
+            max_rpc_chunk = min(max_rpc_chunk, 100)
+
+        deadline = time.monotonic() + max(3.0, float(fetch_timeout))
+        cur = int(from_block)
+        last_ok = int(from_block) - 1
+        total_transfers = 0
+        soft_errs = 0
+        success_streak = 0
+
+        while cur <= to_block:
+            remain = deadline - time.monotonic()
+            if remain < 1.5:
+                break
+            end = min(cur + rpc_chunk - 1, to_block)
+            sub_timeout = min(remain - 0.2, max(3.0, min(12.0, float(fetch_timeout) * 0.45)))
+            try:
+                part = await asyncio.wait_for(
+                    fetch_inbound_transfers(
+                        rpc,
+                        watching,
+                        from_block=cur,
+                        to_block=end,
+                        chunk_size=max(1, end - cur + 1),
+                    ),
+                    timeout=sub_timeout,
+                )
+            except asyncio.TimeoutError:
+                # Halve once inside remaining budget; else stop with partial.
+                success_streak = 0
+                half = max(10, (end - cur + 1) // 2)
+                rpc_chunk = max(10, half)
+                if half >= (end - cur + 1):
+                    self._append_log(
+                        "logwatch",
+                        f"getLogs timeout {sub_timeout:.0f}s на {cur}…{end} "
+                        f"({label}) — partial→{last_ok}",
+                    )
+                    break
+                end = cur + half - 1
+                remain = deadline - time.monotonic()
+                if remain < 1.5:
+                    break
+                try:
+                    part = await asyncio.wait_for(
+                        fetch_inbound_transfers(
+                            rpc,
+                            watching,
+                            from_block=cur,
+                            to_block=end,
+                            chunk_size=max(1, end - cur + 1),
+                        ),
+                        timeout=min(remain - 0.2, 8.0),
+                    )
+                except asyncio.TimeoutError:
+                    success_streak = 0
+                    self._append_log(
+                        "logwatch",
+                        f"getLogs timeout на {cur}…{end} ({label}) — "
+                        f"partial→{last_ok}",
+                    )
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    if _is_retryable(exc):
+                        soft_errs += 1
+                        success_streak = 0
+                        self._append_log(
+                            "logwatch",
+                            f"getLogs soft-err ({label}): {_redact_exc(exc)} "
+                            f"— partial→{last_ok}",
+                        )
+                        break
+                    self._append_log(
+                        "logwatch",
+                        f"getLogs ошибка ({label}): {_redact_exc(exc)}",
+                    )
+                    if last_ok >= from_block:
+                        break
+                    return empty
+            except Exception as exc:  # noqa: BLE001
+                if _is_retryable(exc):
+                    soft_errs += 1
+                    success_streak = 0
+                    self._append_log(
+                        "logwatch",
+                        f"getLogs soft-err ({label}): {_redact_exc(exc)} "
+                        f"— partial→{last_ok}",
+                    )
+                    break
+                self._append_log(
+                    "logwatch",
+                    f"getLogs ошибка ({label}): {_redact_exc(exc)}",
+                )
+                if last_ok >= from_block:
+                    break
+                return empty
+
+            if part:
+                self._queue_skip_enrich_transfers(part)
+            total_transfers += len(part or [])
+            last_ok = end
+            cur = end + 1
+            # Grow sub-window after consecutive successes (replay-style).
+            success_streak += 1
+            if success_streak >= 2 and rpc_chunk < max_rpc_chunk:
+                rpc_chunk = min(max_rpc_chunk, max(rpc_chunk * 2, rpc_chunk + 25))
+                success_streak = 0
+
+        if last_ok < from_block:
+            if soft_errs:
+                return empty
+            self._append_log(
+                "logwatch",
+                f"getLogs timeout {fetch_timeout:.0f}s на {from_block}…{to_block} "
+                f"({label}) — курсор не двигаем",
+            )
+            return empty
+
+        if total_transfers:
+            self._append_log(
+                "logwatch",
+                f"hist skip enrich ({total_transfers} transfers) — "
+                f"queued for live alert [{from_block}…{last_ok}]",
+                percent=40,
+            )
+        elif last_ok < to_block:
+            self._append_log(
+                "logwatch",
+                f"{label} progressive +{last_ok - from_block + 1} блоков "
+                f"→ {last_ok} (budget)",
+            )
+        return {
+            "new_deals": 0,
+            "alerts": 0,
+            "skipped": total_transfers,
+            "advanced": True,
+            "advance_to": last_ok,
+        }
+
     async def _logwatch_scan_window(
         self,
         cfg: FollowupConfig,
@@ -3252,6 +4798,7 @@ class FollowupRunner:
         skip_enrich: bool = False,
         enrich_budget_sec: float | None = None,
         queue_mcap_retry: bool = False,
+        soft_partial: bool = False,
     ) -> dict[str, Any] | None:
         """Fetch+enrich+alert one block window.
 
@@ -3259,6 +4806,9 @@ class FollowupRunner:
         yields advanced=False so cursors stay put. ``skip_enrich`` skips
         tx_senders + mcap enrich (hist catch-up only advances cursor / records
         with null mcap) so hist cannot stall on RPC batches.
+
+        ``soft_partial`` (tip): merge successful topic batches even when some
+        time out — purchase alerts must not wait for a perfect 7/7 gather.
         """
         empty = {
             "new_deals": 0,
@@ -3266,32 +4816,60 @@ class FollowupRunner:
             "skipped": 0,
             "advanced": False,
             "advance_to": None,
+            "incomplete": False,
+            "fetched": 0,
         }
         if to_block < from_block:
             return {**empty, "advanced": True, "advance_to": cursor_floor}
+        incomplete = False
         try:
             window = max(1, to_block - from_block + 1)
             if skip_enrich:
-                # Hist catch-up: split into small RPC chunks so each call
-                # finishes under the 15s get_logs wall-timeout. A single
-                # 800–10k OR'd-topic query routinely timed out and froze lag.
-                rpc_chunk = max(
-                    25,
-                    int(getattr(cfg, "logwatch_hist_rpc_chunk", 100) or 100),
+                # Progressive sub-chunks: a single wait_for over 10k×N-wallet
+                # OR'd topics always timed out → zero progress → lag alert.
+                # Advance as far as we got before the budget expires.
+                return await self._skip_enrich_progressive_fetch(
+                    cfg,
+                    rpc=rpc,
+                    watching=watching,
+                    from_block=from_block,
+                    to_block=to_block,
+                    fetch_timeout=fetch_timeout,
+                    label=label,
+                    empty=empty,
                 )
-                chunk_size = min(window, rpc_chunk)
-            else:
-                chunk_size = min(window, 2_000)
-            transfers = await asyncio.wait_for(
-                fetch_inbound_transfers(
+            chunk_size = min(window, 2_000)
+            if soft_partial:
+                # Per-batch timeouts + deadline merge: never outer-cancel
+                # successful topic waves (that discarded buys and inflated streak).
+                batch_to = min(10.0, max(6.0, float(fetch_timeout) * 0.75))
+                parallel = 2 if self._live_timeout_streak >= 2 else 3
+                n_batches = topic_batch_count(len(watching))
+                rounds = max(1, (n_batches + parallel - 1) // parallel)
+                # Leave headroom for classify/enrich under the live watchdog.
+                soft_budget = min(28.0, max(float(fetch_timeout), batch_to * rounds + 1.5))
+                transfers, incomplete = await fetch_inbound_transfers_result(
                     rpc,
                     watching,
                     from_block=from_block,
                     to_block=to_block,
                     chunk_size=chunk_size,
-                ),
-                timeout=fetch_timeout,
-            )
+                    soft_partial=True,
+                    batch_timeout_sec=batch_to,
+                    batch_parallel=parallel,
+                    deadline_mono=time.monotonic() + soft_budget,
+                )
+            else:
+                transfers = await asyncio.wait_for(
+                    fetch_inbound_transfers(
+                        rpc,
+                        watching,
+                        from_block=from_block,
+                        to_block=to_block,
+                        chunk_size=chunk_size,
+                    ),
+                    timeout=fetch_timeout,
+                )
         except asyncio.TimeoutError:
             self._append_log(
                 "logwatch",
@@ -3318,36 +4896,15 @@ class FollowupRunner:
             )
             return None
 
-        sender_map: dict[str, str | None] = {}
-        # Hist skip_enrich: do not burn RPC on tx_senders — that batch is what
-        # turned a healthy tip into «hist hung >180s» when prune also ran.
-        if cfg.buys_only and transfers and not skip_enrich:
-            try:
-                sender_map = await asyncio.wait_for(
-                    tx_senders(rpc, [t.tx_hash for t in transfers]),
-                    timeout=min(20.0, fetch_timeout),
-                )
-            except asyncio.TimeoutError:
-                self._append_log(
-                    "logwatch",
-                    f"tx_senders timeout ({label}) — fail-open без фильтра from",
-                )
-                sender_map = {}
-
-        chat = resolve_chat_id(cfg.telegram_chat_id)
-        topic_id = resolve_topic_id(cfg.telegram_topic_id)
-        tg_ok = telegram_configured(chat)
-        filters_map = self._store.get_alert_filters_map(
-            sorted({t.wallet for t in transfers})
-        )
-
         if skip_enrich:
-            # Cursor-only. Recording deals without tx_senders/enrich stamped
-            # airdrops as deal #2..N (empty TOKEN, inflated deal_count).
+            # Cursor-only record path is unsafe (airdrops). Queue fresh
+            # transfers for the live drain instead of dropping them.
             if transfers:
+                self._queue_skip_enrich_transfers(transfers)
                 self._append_log(
                     "logwatch",
-                    f"hist skip enrich ({len(transfers)} transfers) — только курсор",
+                    f"hist skip enrich ({len(transfers)} transfers) — "
+                    "queued for live alert",
                     percent=40,
                 )
             return {
@@ -3356,19 +4913,132 @@ class FollowupRunner:
                 "skipped": len(transfers),
                 "advanced": True,
                 "advance_to": to_block,
+                "incomplete": False,
             }
-        else:
-            enrich = await self._prefetch_transfer_enrichment(
+
+        if incomplete:
+            self._append_log(
+                "live",
+                f"tip soft_partial: {len(transfers)} transfers "
+                f"(some topic batches failed) [{from_block}…{to_block}]",
+            )
+
+        stats = await self._process_logwatch_transfers(
+            transfers,
+            cfg=cfg,
+            rpc=rpc,
+            label=label,
+            enrich_budget_sec=enrich_budget_sec,
+            queue_mcap_retry=queue_mcap_retry,
+            cursor_floor=cursor_floor,
+            from_block=from_block,
+            to_block=to_block,
+            fetch_timeout=fetch_timeout,
+        )
+        stats = {
+            **stats,
+            "fetched": len(transfers),
+            "incomplete": bool(incomplete),
+        }
+        if incomplete:
+            # Alerts may have fired; do not advance cursor over uncovered wallets.
+            stats["advanced"] = False
+        return stats
+
+    async def _process_logwatch_transfers(
+        self,
+        transfers: list[InboundTransfer],
+        *,
+        cfg: FollowupConfig,
+        rpc: Any,
+        label: str,
+        enrich_budget_sec: float | None = None,
+        queue_mcap_retry: bool = False,
+        cursor_floor: int | None = None,
+        from_block: int = 0,
+        to_block: int = 0,
+        fetch_timeout: float = 12.0,
+    ) -> dict[str, Any]:
+        """Enrich + rank + alert a batch of inbound transfers."""
+        if not transfers:
+            return {
+                "new_deals": 0,
+                "alerts": 0,
+                "skipped": 0,
+                "advanced": True,
+                "advance_to": to_block,
+            }
+        sender_map: dict[str, str | None] = {}
+        method_map: dict[str, str | None] = {}
+        senders_ok = True
+        if cfg.buys_only and transfers:
+            try:
+                meta = await asyncio.wait_for(
+                    tx_from_and_input(rpc, [t.tx_hash for t in transfers]),
+                    timeout=min(12.0, fetch_timeout),
+                )
+                for h, (frm, inp) in meta.items():
+                    sender_map[h] = frm
+                    method_map[h] = inp
+            except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+                senders_ok = False
+                self._append_log(
+                    "logwatch",
+                    f"tx_senders fail ({label}) — fail-closed: "
+                    f"{type(exc).__name__}",
+                )
+                sender_map = {}
+                method_map = {}
+
+        # Strict buys-only before enrich: drop gifts/airdrops/EOA transfers and
+        # bound quote-spend lookups so live tip cannot hang on Blockscout.
+        unknown_buy_senders: list[InboundTransfer] = []
+        skipped = 0
+        if cfg.buys_only:
+            live_fast = label in ("live", "pending", "tip")
+            allow_quote = True
+            quote_budget = 4.0
+            if live_fast and self._live_timeout_streak >= 1:
+                # Under tip pressure: wallet-initiated only (no Blockscout spend).
+                allow_quote = False
+                quote_budget = 0.0
+            elif live_fast:
+                quote_budget = 3.0
+            buys, uncertain, skipped_buys = await classify_logwatch_buys(
                 transfers,
-                cfg=cfg,
                 rpc=rpc,
                 sender_map=sender_map,
-                budget_sec=enrich_budget_sec,
+                senders_ok=senders_ok,
+                allow_quote_lookup=allow_quote,
+                quote_budget_sec=quote_budget,
+                method_map=method_map,
             )
+            skipped += skipped_buys
+            unknown_buy_senders.extend(uncertain)
+            transfers = buys
+            if uncertain:
+                self._append_log(
+                    "logwatch",
+                    f"buys_only: {len(buys)} buys, {skipped_buys} skip, "
+                    f"{len(uncertain)} requeue ({label})",
+                )
+
+        chat = resolve_chat_id(cfg.telegram_chat_id)
+        topic_id = resolve_topic_id(cfg.telegram_topic_id)
+        tg_ok = telegram_configured(chat)
+        filters_map = self._store.get_alert_filters_map(
+            sorted({t.wallet for t in transfers})
+        ) if transfers else {}
+        enrich = await self._prefetch_transfer_enrichment(
+            transfers,
+            cfg=cfg,
+            rpc=rpc,
+            sender_map=sender_map,
+            budget_sec=enrich_budget_sec,
+        )
 
         new_deals = 0
         alerts = 0
-        skipped = 0
         advance_to = to_block
         stopped_early = False
         floor = cursor_floor if cursor_floor is not None else from_block - 1
@@ -3383,11 +5053,6 @@ class FollowupRunner:
             _, deal_count, status = self._store.get_wallet_scan_meta(tr.wallet)
             if status != "watching" or deal_count >= cfg.max_deals:
                 continue
-            if cfg.buys_only:
-                sender = sender_map.get(tr.tx_hash.lower())
-                if sender is not None and sender != tr.wallet:
-                    skipped += 1
-                    continue
 
             cached = enrich.get((tr.wallet, tr.token, tr.tx_hash))
             if cached is not None:
@@ -3411,89 +5076,151 @@ class FollowupRunner:
             from .gmgn_portfolio import gmgn_api_configured
 
             deal = None
+            live_fast = label in ("live", "pending")
             if gmgn_api_configured():
-                verdict = await self._gmgn_rank_verdict(
-                    tr.wallet, tr.token, cfg
-                )
+                try:
+                    verdict = await asyncio.wait_for(
+                        self._gmgn_rank_verdict(tr.wallet, tr.token, cfg),
+                        timeout=4.0 if live_fast else 12.0,
+                    )
+                except asyncio.TimeoutError:
+                    verdict = GmgnRankVerdict(
+                        uncertain=True,
+                        reason="gmgn_timeout",
+                        seed_token="",
+                        post_seed=(),
+                        rank=None,
+                        past_max=False,
+                    )
                 if verdict.uncertain:
+                    # Never invent local #2…#5 for TG. Re-queue so tip cursor
+                    # advance does not permanently drop the transfer while GMGN
+                    # is 429/circuit/lagging.
+                    self._queue_skip_enrich_transfers([tr])
                     self._append_log(
                         "deal",
                         f"skip invent #{tr.token[:10]}… "
-                        f"GMGN uncertain ({verdict.reason}) [{label}]",
+                        f"GMGN uncertain ({verdict.reason}) — queued [{label}]",
                     )
                     skipped += 1
                     continue
-                # Sync GMGN order (marks done when already ≥ max_deals uniques).
-                include_tip = (
-                    not verdict.past_max
-                    and verdict.rank is not None
-                    and verdict.rank <= int(cfg.max_deals or 5)
-                )
-                await self._sync_wallet_gmgn_order(
-                    tr.wallet,
-                    cfg,
-                    post_seed=list(verdict.post_seed),
-                    tip_token=tr.token if include_tip else None,
-                    tip_symbol=token_symbol,
-                    tip_tx=tr.tx_hash,
-                    tip_block=tr.block_number,
-                    tip_bought_at=tr.bought_at or None,
-                    tip_mcap=mcap,
-                    tip_bought_usd=bought_usd,
-                )
-                _seen, deal_count_now, status_now = self._store.get_wallet_scan_meta(
-                    tr.wallet
-                )
-                if status_now != "watching" or deal_count_now >= cfg.max_deals:
-                    self._append_log(
-                        "deal",
-                        f"GMGN past window {tr.wallet[:10]}… "
-                        f"post={len(verdict.post_seed)} status={status_now} [{label}]",
-                    )
-                    skipped += 1
-                    continue
-                # Pull the row GMGN sync assigned (correct index).
-                for row in self._store.list_deals_for_wallet(tr.wallet):
-                    if str(row.get("token") or "").lower() == tr.token.lower():
-                        deal = FollowupDealRow(
-                            wallet=tr.wallet.lower(),
-                            token=tr.token.lower(),
-                            token_symbol=str(
-                                row.get("token_symbol") or token_symbol or ""
-                            ),
-                            token_name=token_name,
-                            deal_index=int(row.get("deal_index") or 0),
-                            mcap_at_buy=(
-                                float(row["mcap_at_buy"])
-                                if row.get("mcap_at_buy") is not None
-                                else mcap
-                            ),
-                            bought_usd=(
-                                float(row["bought_usd"])
-                                if row.get("bought_usd") is not None
-                                else bought_usd
-                            ),
-                            tx_hash=str(row.get("tx_hash") or tr.tx_hash or ""),
-                            block_number=int(
-                                row.get("block_number") or tr.block_number or 0
-                            ),
-                            bought_at=(
-                                float(row["bought_at"])
-                                if row.get("bought_at")
-                                else (tr.bought_at or None)
-                            ),
-                            notified=bool(row.get("notified")),
-                            created_at=float(row.get("created_at") or time.time()),
+                else:
+                    # Seed-miss past: close spray/wrong-seed wallets without
+                    # rewriting deal rows from an unrelated GMGN prefix.
+                    if verdict.past_max and verdict.reason == "gmgn_seed_miss_past":
+                        self._store.mark_wallet_done(
+                            tr.wallet, deal_count=int(cfg.max_deals or 5)
                         )
-                        break
-                if deal is None:
-                    # Token beyond capped GMGN prefix — not an alertable #2..N.
-                    skipped += 1
-                    continue
-                if deal.notified:
-                    skipped += 1
-                    continue
-                new_deals += 1
+                        self._append_log(
+                            "deal",
+                            f"GMGN seed-miss past max {tr.wallet[:10]}… "
+                            f"→ done [{label}]",
+                        )
+                        skipped += 1
+                        continue
+                    # Sync GMGN order (marks done when already ≥ max_deals uniques).
+                    include_tip = (
+                        not verdict.past_max
+                        and verdict.rank is not None
+                        and verdict.rank <= int(cfg.max_deals or 5)
+                    )
+                    inserted_rows = await self._sync_wallet_gmgn_order(
+                        tr.wallet,
+                        cfg,
+                        post_seed=list(verdict.post_seed),
+                        tip_token=tr.token if include_tip else None,
+                        tip_symbol=token_symbol,
+                        tip_tx=tr.tx_hash,
+                        tip_block=tr.block_number,
+                        tip_bought_at=tr.bought_at or None,
+                        tip_mcap=mcap,
+                        tip_bought_usd=bought_usd,
+                    )
+                    tip_newly_inserted = any(
+                        str(getattr(d, "token", "") or "").lower()
+                        == tr.token.lower()
+                        for d in (inserted_rows or [])
+                    )
+                    # Tip that fills max_deals flips wallet → done. Still alert
+                    # that tip (#max_deals) — do not treat "done" as skip.
+                    if not include_tip:
+                        _seen, deal_count_now, status_now = (
+                            self._store.get_wallet_scan_meta(tr.wallet)
+                        )
+                        if (
+                            status_now != "watching"
+                            or deal_count_now >= cfg.max_deals
+                        ):
+                            self._append_log(
+                                "deal",
+                                f"GMGN past window {tr.wallet[:10]}… "
+                                f"post={len(verdict.post_seed)} "
+                                f"status={status_now} [{label}]",
+                            )
+                            skipped += 1
+                            continue
+                    for row in self._store.list_deals_for_wallet(tr.wallet):
+                        if str(row.get("token") or "").lower() == tr.token.lower():
+                            deal = FollowupDealRow(
+                                wallet=tr.wallet.lower(),
+                                token=tr.token.lower(),
+                                token_symbol=str(
+                                    row.get("token_symbol")
+                                    or token_symbol
+                                    or ""
+                                ),
+                                token_name=token_name,
+                                deal_index=int(row.get("deal_index") or 0),
+                                mcap_at_buy=(
+                                    float(row["mcap_at_buy"])
+                                    if row.get("mcap_at_buy") is not None
+                                    else mcap
+                                ),
+                                bought_usd=(
+                                    float(row["bought_usd"])
+                                    if row.get("bought_usd") is not None
+                                    else bought_usd
+                                ),
+                                tx_hash=str(
+                                    row.get("tx_hash") or tr.tx_hash or ""
+                                ),
+                                block_number=int(
+                                    row.get("block_number")
+                                    or tr.block_number
+                                    or 0
+                                ),
+                                bought_at=(
+                                    float(row["bought_at"])
+                                    if row.get("bought_at")
+                                    else (tr.bought_at or None)
+                                ),
+                                notified=bool(row.get("notified")),
+                                created_at=float(
+                                    row.get("created_at") or time.time()
+                                ),
+                            )
+                            break
+                    if deal is None:
+                        if include_tip:
+                            self._append_log(
+                                "deal",
+                                f"tip missing after GMGN sync "
+                                f"{tr.wallet[:10]}… {tr.token[:10]}… [{label}]",
+                            )
+                        else:
+                            self._append_log(
+                                "deal",
+                                f"GMGN past window {tr.wallet[:10]}… "
+                                f"post={len(verdict.post_seed)} "
+                                f"(tip not in deal set) [{label}]",
+                            )
+                        skipped += 1
+                        continue
+                    if deal.notified:
+                        skipped += 1
+                        continue
+                    if tip_newly_inserted:
+                        new_deals += 1
             else:
                 deal = self._store.record_deal(
                     wallet=tr.wallet,
@@ -3536,6 +5263,19 @@ class FollowupRunner:
                 bought_usd=deal.bought_usd,
                 **gate,
             ):
+                why = alert_filter_skip_reason(
+                    deal.deal_index,
+                    deal.mcap_at_buy,
+                    bought_usd=deal.bought_usd,
+                    **gate,
+                )
+                if live_fast or why:
+                    self._append_log(
+                        "deal",
+                        f"skip filter #{deal.deal_index} "
+                        f"{deal.token_symbol or deal.token[:10]}… "
+                        f"({why or 'gate'}) [{label}]",
+                    )
                 if (
                     queue_mcap_retry
                     and deal.mcap_at_buy is None
@@ -3553,8 +5293,9 @@ class FollowupRunner:
                     getattr(cfg, "alert_max_buy_age_sec", 900) or 900
                 ),
                 max_block_lag=int(
-                    getattr(cfg, "alert_max_block_lag", 2_000) or 2_000
+                    getattr(cfg, "alert_max_block_lag", 4_000) or 4_000
                 ),
+                discovered_at=deal.created_at,
             ):
                 self._append_log(
                     "deal",
@@ -3566,12 +5307,27 @@ class FollowupRunner:
             if not tg_ok:
                 self._last_error = "Telegram не настроен"
                 continue
-            ok = await self._deliver_deal_alert(
-                chat,
-                deal=deal,
-                topic_id=topic_id,
-                honeypot_reason=hp_reason,
+            # Shield TG enqueue from live tip watchdog cancel — otherwise a
+            # deal can be recorded and never outboxed.
+            # Re-check honeypot when enrich timed out (hp_reason is None) so
+            # hard honeypots cannot ship as normal follow-up alerts.
+            recheck_hp = bool(
+                getattr(cfg, "alert_skip_honeypot", True) and hp_reason is None
             )
+            try:
+                ok = await asyncio.shield(
+                    self._deliver_deal_alert(
+                        chat,
+                        deal=deal,
+                        topic_id=topic_id,
+                        honeypot_reason=hp_reason,
+                        check_honeypot=recheck_hp,
+                        origin=self._alert_origin_from_label(label),
+                    )
+                )
+            except asyncio.CancelledError:
+                # Deliver task was shielded; still surface cancel to caller.
+                raise
             if ok:
                 alerts += 1
                 self._append_log(
@@ -3579,6 +5335,14 @@ class FollowupRunner:
                     f"Алерт deal #{deal.deal_index} · {deal.wallet[:10]}…"
                     + (" · HONEYPOT" if hp_reason else ""),
                 )
+
+        if unknown_buy_senders:
+            self._queue_skip_enrich_transfers(unknown_buy_senders)
+            self._append_log(
+                "logwatch",
+                f"buys_only: {len(unknown_buy_senders)} transfers queued "
+                f"(unknown tx.from) [{label}]",
+            )
 
         if not stopped_early:
             advance_to = to_block
@@ -3823,6 +5587,10 @@ class FollowupRunner:
                     deal=deal,
                     topic_id=topic_id,
                     honeypot_reason=hp_reason,
+                    check_honeypot=bool(
+                        getattr(cfg, "alert_skip_honeypot", True) and hp_reason is None
+                    ),
+                    origin="legacy",
                 )
                 if ok:
                     async with progress_lock:

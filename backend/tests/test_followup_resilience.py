@@ -123,14 +123,31 @@ async def test_deliver_deal_alert_enqueues_and_survives_tg_failure(tmp_path):
     assert deal is not None
     runner = FollowupRunner(store=store)
 
-    with patch(
-        "app.followup.send_followup_deal",
-        AsyncMock(side_effect=RuntimeError("tg down")),
+    with (
+        patch(
+            "app.followup.send_followup_deal",
+            AsyncMock(side_effect=RuntimeError("tg down")),
+        ),
+        patch.object(
+            runner,
+            "_gate_outbox_deal",
+            AsyncMock(
+                return_value=(
+                    "ok",
+                    {
+                        "deal_index": deal.deal_index,
+                        "wallet": deal.wallet,
+                        "token": deal.token,
+                    },
+                )
+            ),
+        ),
     ):
         ok = await runner._deliver_deal_alert(
             "-1001",
             deal=deal,
             topic_id=None,
+            origin="live",
         )
     # Enqueued (not lost) even though the immediate send failed.
     assert ok is True
@@ -144,7 +161,23 @@ async def test_deliver_deal_alert_enqueues_and_survives_tg_failure(tmp_path):
     import time as _t
 
     ok_send = AsyncMock(return_value=None)
-    with patch("app.followup.send_followup_deal", ok_send):
+    with (
+        patch("app.followup.send_followup_deal", ok_send),
+        patch.object(
+            runner,
+            "_gate_outbox_deal",
+            AsyncMock(
+                return_value=(
+                    "ok",
+                    {
+                        "deal_index": deal.deal_index,
+                        "wallet": deal.wallet,
+                        "token": deal.token,
+                    },
+                )
+            ),
+        ),
+    ):
         delivered = await runner._dispatch_outbox(
             store.load_config(), now=_t.time() + 10_000
         )
@@ -211,6 +244,16 @@ async def test_retry_pending_alerts_refills_mcap_and_sends(tmp_path):
         patch(
             "app.followup.estimate_token_quote",
             AsyncMock(return_value=(8_000.0, 0.01)),
+        ),
+        patch.object(
+            runner,
+            "_gate_outbox_deal",
+            AsyncMock(
+                return_value=(
+                    "ok",
+                    {"deal_index": 2, "wallet": wallet, "token": deal.token},
+                )
+            ),
         ),
     ):
         n = await runner._retry_pending_alerts(store.load_config(), rpc=None)

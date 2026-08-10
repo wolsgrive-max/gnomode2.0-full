@@ -175,7 +175,9 @@ def test_bot_chat_allowed_private_and_configured(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ws_mod, "watch_store", _FakeWatchStore())
     bot = bot_mod.FollowupBot()
-    assert bot._chat_allowed("999", chat_type="private") is True
+    # Private DMs are NOT open to strangers — only configured chat ids.
+    assert bot._chat_allowed("999", chat_type="private") is False
+    assert bot._chat_allowed("-100111", chat_type="private") is True
     assert bot._chat_allowed("-100111", chat_type="supergroup") is True
     assert bot._chat_allowed("-100222", chat_type="supergroup") is True
     assert bot._chat_allowed("-100333", chat_type="supergroup") is True
