@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -154,19 +155,36 @@ def format_followup_deal(
     deal_index: int,
     mcap_at_buy: float | None,
     bought_usd: float | None = None,
+    honeypot_reason: str | None = None,
 ) -> str:
     """HTML block for 2nd/3rd new-token buy @ low mcap."""
     sym = token_symbol or "TOKEN"
-    lines = [
-        f"<b>Follow-up · сделка #{deal_index}</b>",
-        f"<b>{sym}</b> · новый токен @ low mcap",
-        f"Token: <code>{token}</code>",
-        f"Wallet: <code>{wallet}</code>",
-        f"mcap@buy ${_fmt_num(mcap_at_buy)}"
-        + (f" · bought ${_fmt_num(bought_usd)}" if bought_usd is not None else ""),
-        f'<a href="https://gmgn.ai/robinhood/token/{token}">GMGN token</a> · '
-        f'<a href="https://gmgn.ai/robinhood/address/{wallet}">GMGN wallet</a>',
-    ]
+    lines: list[str] = []
+    if honeypot_reason:
+        # Telegram HTML has no color — red circles + bold math-caps for visibility.
+        lines.extend(
+            [
+                "🔴🔴🔴🔴🔴🔴🔴🔴",
+                "<b>‼️ 𝗛𝗢𝗡𝗘𝗬𝗣𝗢𝗧 ‼️</b>",
+                "<b>‼️ 𝗛𝗢𝗡𝗘𝗬𝗣𝗢𝗧 ‼️</b>",
+                "<b>‼️ 𝗛𝗢𝗡𝗘𝗬𝗣𝗢𝗧 ‼️</b>",
+                "🔴🔴🔴🔴🔴🔴🔴🔴",
+                f"<b>⚠️ HONEYPOT · {honeypot_reason}</b>",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            f"<b>Follow-up · сделка #{deal_index}</b>",
+            f"<b>{sym}</b> · новый токен @ low mcap",
+            f"Token: <code>{token}</code>",
+            f"Wallet: <code>{wallet}</code>",
+            f"mcap@buy ${_fmt_num(mcap_at_buy)}"
+            + (f" · bought ${_fmt_num(bought_usd)}" if bought_usd is not None else ""),
+            f'<a href="https://gmgn.ai/robinhood/token/{token}">GMGN token</a> · '
+            f'<a href="https://gmgn.ai/robinhood/address/{wallet}">GMGN wallet</a>',
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -180,7 +198,24 @@ async def send_followup_deal(
     mcap_at_buy: float | None,
     bought_usd: float | None = None,
     topic_id: int | None = None,
-) -> None:
+    honeypot_reason: str | None = None,
+    check_honeypot: bool = True,
+) -> str | None:
+    """Send deal alert: honeypot check first, then Telegram (banner if flagged).
+
+    Returns honeypot reason if flagged, else None.
+    """
+    reason = honeypot_reason
+    if check_honeypot and reason is None and token:
+        try:
+            from .security import honeypot_reason_for_token
+
+            reason = await asyncio.wait_for(
+                honeypot_reason_for_token(token),
+                timeout=8.0,
+            )
+        except Exception:  # noqa: BLE001
+            reason = None
     text = format_followup_deal(
         wallet=wallet,
         token=token,
@@ -188,8 +223,10 @@ async def send_followup_deal(
         deal_index=deal_index,
         mcap_at_buy=mcap_at_buy,
         bought_usd=bought_usd,
+        honeypot_reason=reason,
     )
     await send_message(chat_id, text, topic_id=topic_id)
+    return reason
 
 
 def chunk_buyers(buyers: list[BuyerRow], *, header: str = "Watch alert") -> list[tuple[list[BuyerRow], str]]:

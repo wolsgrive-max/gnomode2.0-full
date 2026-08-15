@@ -1,11 +1,11 @@
 """Wallet-level metrics for parsed buyers: native balance, token hold time,
-distinct tokens traded in the last 7 days — plus range filtering.
+distinct tokens bought in the lookback window — plus range filtering.
 
 Balance comes from batched ``eth_getBalance``; hold time is derived from the
 token's Transfer logs (first outgoing transfer after the first buy, or "still
-holding" up to the chain tip); 7d traded tokens are distinct non-quote token
-contracts from Blockscout token-transfers where the wallet sold (from=wallet)
-or bought via a contract (to=wallet, from.is_contract) — EOA airdrops ignored.
+holding" up to the chain tip); unique-token count is distinct non-quote tokens
+**bought** via contract (DEX/router/pool → wallet). Outbound sells/sends and
+EOA gifts («скинули») are ignored.
 
 Speed / completeness:
 - No stage budgets that abandon wallets mid-fetch.
@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
 from .blockscout import blockscout_api_base, blockscout_headers
+from .buy_gate import is_wallet_initiated_buy
 from .chain import RpcClient, checksum, http_client, topic_address
 from .config import settings
 from .constants import BLOCKS_PER_SECOND, QUOTE_TOKENS, TRANSFER_TOPIC
@@ -45,7 +46,7 @@ _BALANCE_TTL = 120.0
 _balance_cache: dict[str, tuple[float, float]] = {}
 
 _TOKENS7D_TTL = 600.0
-_TOKENS7D_CACHE_VER = "v3"
+_TOKENS7D_CACHE_VER = "v7"  # fail-open on unknown + sender retries / quote-spend
 _tokens7d_cache: dict[str, tuple[int, float]] = {}
 
 _HOLDING_TTL = 180.0
@@ -323,10 +324,20 @@ def _parse_ts(raw: object) -> datetime | None:
 
 
 async def _bs_get(url: str, params: dict[str, object]):
-    """Paced Blockscout GET with 429/5xx retries."""
+    """Paced Blockscout GET with 429/5xx retries; Pro 402 → public fallback."""
+    from .blockscout import (
+        blockscout_auth_params,
+        blockscout_headers,
+        disable_blockscout_pro,
+        _public_base,
+        _use_pro,
+    )
+
     global _bs_next_ok
     resp = None
     delay = 0.5
+    # Merge Pro apikey query when applicable.
+    req_params: dict[str, object] = {**blockscout_auth_params(), **params}
     for attempt in range(_MAX_METRIC_ATTEMPTS):
         async with _bs_sem:
             async with _bs_pace_lock:
@@ -337,13 +348,24 @@ async def _bs_get(url: str, params: dict[str, object]):
                 _bs_next_ok = time.time() + _BS_MIN_INTERVAL
             try:
                 resp = await http_client().get(
-                    url, params=params, headers=blockscout_headers()
+                    url, params=req_params, headers=blockscout_headers()
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Blockscout GET error attempt %s: %s", attempt + 1, exc)
                 await asyncio.sleep(delay)
                 delay = min(delay * 1.6, 12.0)
                 continue
+        if resp.status_code in (401, 402, 403) and _use_pro():
+            disable_blockscout_pro(f"HTTP {resp.status_code}")
+            # Rewrite Pro URL → public explorer and retry without burning attempts.
+            if "api.blockscout.com" in url:
+                # …/4663/api/v2/... → robinhoodchain.blockscout.com/api/v2/...
+                marker = "/api/v2"
+                idx = url.find(marker)
+                if idx >= 0:
+                    url = _public_base() + url[idx + len(marker) :]
+            req_params = dict(params)  # drop apikey
+            continue
         if resp.status_code in (429, 502, 503):
             ra = resp.headers.get("Retry-After")
             try:
@@ -374,7 +396,10 @@ async def _tokens_traded_7d_one(
     enough: int | None = None,
     too_many: int | None = None,
 ) -> tuple[int, bool] | None:
-    """Distinct non-quote tokens traded in 30d.
+    """Distinct non-quote tokens **bought by this wallet** since ``cutoff``.
+
+    A transfer counts only when ``tx.from == wallet`` (wallet-initiated swap).
+    Airdrops / third-party multicalls that credit the wallet are ignored.
 
     Returns ``(count, exact)``. May stop early when:
     - ``enough`` is met (min-only pass) → ``exact=False``
@@ -383,7 +408,8 @@ async def _tokens_traded_7d_one(
     """
     wallet_l = wallet.lower()
     url = f"{blockscout_api_base()}/addresses/{wallet}/token-transfers"
-    params: dict[str, object] = {}
+    # Inbound-only pages: sells/outbound noise must not fill the window.
+    params: dict[str, object] = {"filter": "to"}
     tokens: set[str] = set()
     try:
         for _ in range(_MAX_TRANSFER_PAGES):
@@ -402,24 +428,21 @@ async def _tokens_traded_7d_one(
                     break
                 tok = item.get("token") or {}
                 addr = str(tok.get("address") or tok.get("address_hash") or "").lower()
-                if not addr or addr in QUOTE_TOKENS:
+                if not addr or addr in QUOTE_TOKENS or addr in tokens:
                     continue
-                frm = item.get("from")
-                to = item.get("to")
-                frm_h = _addr_hash(frm)
-                to_h = _addr_hash(to)
-                if frm_h == wallet_l:
-                    tokens.add(addr)
-                elif to_h == wallet_l and _is_contract(frm):
-                    tokens.add(addr)
-                if enough is not None and len(tokens) >= enough:
+                if not await is_wallet_initiated_buy(item, wallet_l):
+                    continue
+                tokens.add(addr)
+                if enough is not None and too_many is None and len(tokens) >= enough:
                     return len(tokens), False
                 if too_many is not None and len(tokens) > too_many:
                     return len(tokens), False
             next_params = data.get("next_page_params")
             if reached_cutoff or not next_params or not items:
                 break
-            params = next_params
+            params = dict(next_params)
+            if "filter" not in params:
+                params["filter"] = "to"
     except Exception as exc:  # noqa: BLE001
         logger.warning("tokens-7d lookup failed for %s: %s", wallet, exc)
         return None
@@ -432,13 +455,16 @@ async def batch_tokens_traded_7d(
     *,
     enough: int | None = None,
     too_many: int | None = None,
+    lookback_hours: float = 168.0,
 ) -> dict[str, int | None]:
-    """Distinct ERC-20 tokens traded in 30d; paced + bounded retries."""
+    """Distinct ERC-20 tokens traded in ``lookback_hours``; paced + bounded retries."""
     now = time.time()
+    hours = max(float(lookback_hours or 168.0), 1.0)
+    cache_prefix = f"{_TOKENS7D_CACHE_VER}:h{int(hours)}:"
     out: dict[str, int | None] = {}
     misses: list[str] = []
     for w in dict.fromkeys(w.lower() for w in wallets):
-        cached = _tokens7d_cache.get(f"{_TOKENS7D_CACHE_VER}:{w}")
+        cached = _tokens7d_cache.get(f"{cache_prefix}{w}")
         if cached is not None and now - cached[1] < _TOKENS7D_TTL:
             out[w] = cached[0]
         else:
@@ -448,10 +474,11 @@ async def batch_tokens_traded_7d(
     if not misses:
         return out
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     done = 0
     total = len(misses)
     lock = asyncio.Lock()
+    label = f"{hours:g}h"
 
     async def one(wallet: str) -> None:
         nonlocal done
@@ -466,14 +493,14 @@ async def batch_tokens_traded_7d(
                 # Never cache early-exit lower/upper bounds — a later tighter
                 # filter would otherwise reuse an incomplete count.
                 if exact:
-                    _tokens7d_cache[f"{_TOKENS7D_CACHE_VER}:{wallet}"] = (
+                    _tokens7d_cache[f"{cache_prefix}{wallet}"] = (
                         count, time.time()
                     )
                 break
             if attempt + 1 < _MAX_METRIC_ATTEMPTS:
                 logger.warning(
-                    "tokens-7d retry %s/%s for %s in %.1fs",
-                    attempt + 1, _MAX_METRIC_ATTEMPTS, wallet[:12], delay,
+                    "tokens-%s retry %s/%s for %s in %.1fs",
+                    label, attempt + 1, _MAX_METRIC_ATTEMPTS, wallet[:12], delay,
                 )
                 await asyncio.sleep(delay)
                 delay = min(delay * 1.6, 10.0)
@@ -482,14 +509,16 @@ async def batch_tokens_traded_7d(
             if on_progress and (done == total or done % 5 == 0 or done <= 3):
                 await on_progress(
                     "wallets",
-                    f"Tokens 7d {done}/{total} wallets…",
+                    f"Tokens {label} {done}/{total} wallets…",
                     0.9 + 0.08 * done / max(total, 1),
                 )
 
     await asyncio.gather(*[one(w) for w in misses])
     unresolved = sum(1 for w in misses if out.get(w) is None)
     if unresolved:
-        logger.warning("tokens-7d unresolved for %d/%d after retries", unresolved, total)
+        logger.warning(
+            "tokens-%s unresolved for %d/%d after retries", label, unresolved, total
+        )
     _prune_cache(_tokens7d_cache, time.time())
     return out
 
@@ -584,7 +613,7 @@ async def enrich_and_filter_buyers(
         kept = survivors
         await prog("filter", f"Hold time: {before} → {len(kept)} kept", 0.91)
 
-    # 3) Tokens 7d — most expensive per wallet; run on the shortlist only.
+    # 3) Unique tokens in lookback — most expensive; run on the shortlist only.
     if want_t7 and kept:
         before = len(kept)
         enough: int | None = None
@@ -595,21 +624,40 @@ async def enrich_and_filter_buyers(
             enough = max(int(req.min_tokens_traded_7d), 0)
         if req.max_tokens_traded_7d is not None:
             too_many = max(int(req.max_tokens_traded_7d), 0)
-        await prog("filter", f"Tokens 7d: counting for {before} wallets…", 0.92)
+        from .models import tokens_unique_period_hours
+
+        lookback_h = tokens_unique_period_hours(
+            getattr(req, "tokens_unique_period", None)
+        )
+        period_label = getattr(
+            getattr(req, "tokens_unique_period", None),
+            "value",
+            None,
+        ) or f"{lookback_h:g}h"
+        await prog(
+            "filter",
+            f"Tokens {period_label}: counting for {before} wallets…",
+            0.92,
+        )
         tokens_7d = await batch_tokens_traded_7d(
             [b.wallet for b in kept],
             on_progress=on_progress,
             enough=enough,
             too_many=too_many,
+            lookback_hours=lookback_h,
         )
         survivors = []
         unknown = 0
         for row in kept:
             row.tokens_traded_7d = tokens_7d.get(row.wallet.lower())
             if row.tokens_traded_7d is None:
+                # Blockscout flake: keep candidate (fail-open) so one-trade wallets
+                # are not dropped when unique lookup temporarily fails.
                 unknown += 1
+                survivors.append(row)
+                continue
             if _passes(
-                None if row.tokens_traded_7d is None else float(row.tokens_traded_7d),
+                float(row.tokens_traded_7d),
                 req.min_tokens_traded_7d,
                 req.max_tokens_traded_7d,
             ):
@@ -618,7 +666,7 @@ async def enrich_and_filter_buyers(
         await prog(
             "filter",
             f"Tokens 7d: {before} → {len(kept)} kept"
-            + (f" ({unknown} unknown dropped)" if unknown else ""),
+            + (f" ({unknown} unknown kept)" if unknown else ""),
             0.96,
         )
 

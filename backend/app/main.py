@@ -17,6 +17,7 @@ from .jobs import jobs
 from .models import (
     FollowupConfig,
     FollowupStatus,
+    FollowupWalletFiltersUpdate,
     FollowupWalletRow,
     IndexStatus,
     JobResponse,
@@ -229,6 +230,57 @@ async def watch_clear_seen():
     return {"ok": True, "seen_count": 0}
 
 
+@app.get("/api/hvat/status")
+async def get_hvat_status():
+    from .hvat import hvat_status
+
+    return hvat_status()
+
+
+@app.post("/api/hvat/enable")
+async def hvat_enable():
+    """Enable Хвать profile: 1-trade wallets, first buy ≤20k, follow-up #2/#3."""
+    from .hvat import apply_hvat_profile
+
+    return apply_hvat_profile(enable=True)
+
+
+@app.put("/api/hvat/filters")
+async def hvat_save_filters(payload: dict):
+    """Save token + wallet filters for Хвать (stored in watch config)."""
+    from .hvat import save_hvat_filters
+
+    try:
+        return save_hvat_filters(
+            screen=payload.get("screen") or {},
+            wallet=payload.get("wallet") or {},
+            max_tokens_per_cycle=payload.get("max_tokens_per_cycle"),
+            interval_sec=payload.get("interval_sec"),
+            sync_followup_mcap=bool(payload.get("sync_followup_mcap", True)),
+            followup=payload.get("followup"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/hvat/disable")
+async def hvat_disable():
+    from .hvat import apply_hvat_profile
+
+    return apply_hvat_profile(enable=False)
+
+
+@app.post("/api/hvat/run")
+async def hvat_run_now():
+    """Kick both watch and follow-up cycles."""
+    from .hvat import apply_hvat_profile
+
+    apply_hvat_profile(enable=True)
+    watch_st = await watch_runner.run_now()
+    follow_st = await followup_runner.run_now()
+    return {"ok": True, "watch": watch_st, "followup": follow_st}
+
+
 @app.get("/api/followup", response_model=FollowupConfig)
 async def get_followup():
     return followup_store.load_config()
@@ -255,6 +307,29 @@ async def get_followup_wallets(
     return followup_store.list_wallets(
         status=status, limit=limit, offset=offset, include_deals=True
     )
+
+
+@app.put("/api/followup/wallets/filters")
+async def put_followup_wallet_filters(payload: FollowupWalletFiltersUpdate):
+    """Apply (or clear) per-wallet #2/#3 alert filters to one or many wallets."""
+    updated = followup_store.set_wallet_alert_filters(payload.addresses, payload.filters)
+    if not updated:
+        raise HTTPException(404, "no matching wallets")
+    return {
+        "ok": True,
+        "updated": updated,
+        "count": len(updated),
+        "filters": payload.filters,
+    }
+
+
+@app.delete("/api/followup/wallets/{address}")
+async def delete_followup_wallet(address: str):
+    """Remove a tracked wallet (and its deals/alerts) from follow-up."""
+    ok = followup_store.delete_wallet(address)
+    if not ok:
+        raise HTTPException(404, "wallet not found")
+    return {"ok": True, "address": address.strip().lower()}
 
 
 @app.post("/api/followup/run", response_model=FollowupStatus)
@@ -354,9 +429,19 @@ async def _handle_raybot_event(payload: dict, event_type: str) -> None:
                 mcap = price * supply
         except (TypeError, ValueError):
             mcap = None
+    tx = str(payload.get("id") or "")
+    # Prefer on-chain entry (fill / pre-swap) over live RayBot quote × supply.
+    if mint and tx.startswith("0x"):
+        try:
+            from .replay import estimate_entry_at_tx
+
+            entry = await estimate_entry_at_tx(mint, tx)
+            if entry.mcap and entry.mcap > 0:
+                mcap = entry.mcap
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).debug("raybot entry mcap failed: %s", exc)
     if mcap is None and mint:
         mcap = await estimate_token_mcap(mint)
-    tx = str(payload.get("id") or "")
     for w in followed:
         addr = str((w or {}).get("address") or "").lower()
         if not addr or not mint:

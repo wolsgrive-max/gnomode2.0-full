@@ -63,6 +63,34 @@ def test_format_buyer_block_contains_links():
     assert "12.5" in text or "12.50" in text
 
 
+def test_format_followup_deal_honeypot_banner():
+    from app.telegram import format_followup_deal
+
+    plain = format_followup_deal(
+        wallet="0xabc",
+        token="0xdef",
+        token_symbol="SAFE",
+        deal_index=2,
+        mcap_at_buy=5000,
+    )
+    assert "HONEYPOT" not in plain
+    assert "сделка #2" in plain
+
+    hp = format_followup_deal(
+        wallet="0xabc",
+        token="0xdef",
+        token_symbol="TRAP",
+        deal_index=3,
+        mcap_at_buy=8000,
+        bought_usd=100,
+        honeypot_reason="gmgn:honeypot",
+    )
+    assert hp.index("HONEYPOT") < hp.index("сделка #3")
+    assert "🔴" in hp
+    assert "gmgn:honeypot" in hp
+    assert hp.count("𝗛𝗢𝗡𝗘𝗬𝗣𝗢𝗧") >= 3
+
+
 def test_chunk_buyers_splits_large_batches():
     buyers = [
         BuyerRow(

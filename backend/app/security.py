@@ -132,13 +132,15 @@ async def assess_tokens_honeypot(
 
 
 async def honeypot_reason_for_token(address: str) -> str | None:
-    """Full check for a single token (GMGN + DexScreener fallback)."""
+    """Full check for a single token (GMGN first, DexScreener fallback)."""
+    # GMGN first — faster and avoids DexScreener 429 on the alert critical path.
+    sec = await check_token_security(address)
+    blocked = _gmgn_block_reason(sec)
+    if blocked:
+        return blocked
+    if sec.is_honeypot is False:
+        return None
     pairs = await fetch_dexscreener_pairs(address)
     pair = best_rh_pair(pairs, address)
     buys, sells = pair_txns_24h(pair)
-    return await assess_honeypot(
-        address,
-        buys_24h=buys,
-        sells_24h=sells,
-        pair=pair,
-    )
+    return dexscreener_honeypot_reason(buys_24h=buys, sells_24h=sells)

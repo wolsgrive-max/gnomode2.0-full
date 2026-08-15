@@ -28,6 +28,8 @@ TokensCb = Callable[[list[ScreenedToken]], Awaitable[None]]
 _DS_TIMEOUT = httpx.Timeout(12.0, connect=8.0)
 # RH meme mints are almost always 1e9; used when supply is unknown.
 _RH_DEFAULT_SUPPLY = 1_000_000_000.0
+# price×1e9 vs DexScreener mcap/fdv — beyond this, trust DS (low-supply tokens).
+_MCAP_SUPPLY_DIVERGENCE = 10.0
 
 
 def _f(v: Any) -> float:
@@ -37,16 +39,36 @@ def _f(v: Any) -> float:
         return 0.0
 
 
-def _dex_market_cap(pair: dict[str, Any], *, supply: float | None = None) -> float:
-    """Prefer ``priceUsd × supply`` — DS ``marketCap`` is often wrong on RH."""
-    price_usd = _f(pair.get("priceUsd"))
-    sup = float(supply) if supply and supply > 0 else _RH_DEFAULT_SUPPLY
-    if price_usd > 0:
-        return price_usd * sup
+def _ds_reported_mcap(pair: dict[str, Any]) -> float:
     raw = pair.get("marketCap")
-    if raw is None:
+    if raw is None or _f(raw) <= 0:
         raw = pair.get("fdv")
     return _f(raw)
+
+
+def _dex_market_cap(pair: dict[str, Any], *, supply: float | None = None) -> float:
+    """Market cap from DexScreener pair.
+
+    Prefer ``priceUsd × supply`` when supply is known. For the default 1e9 RH
+    assumption, reject the result when it diverges wildly from DS
+    ``marketCap``/``fdv`` — otherwise low-supply tokens (e.g. supply≈500)
+    inflate to billions and falsely pass the ATH≥50k gate.
+    """
+    price_usd = _f(pair.get("priceUsd"))
+    ds = _ds_reported_mcap(pair)
+    if supply is not None and float(supply) > 0:
+        if price_usd > 0:
+            return price_usd * float(supply)
+        return ds
+    if price_usd > 0:
+        assumed = price_usd * _RH_DEFAULT_SUPPLY
+        if ds > 0:
+            hi = max(assumed, ds)
+            lo = min(assumed, ds)
+            if lo > 0 and hi / lo > _MCAP_SUPPLY_DIVERGENCE:
+                return ds
+        return assumed
+    return ds
 
 
 def _in_range(value: float | None, lo: float | None, hi: float | None) -> bool:

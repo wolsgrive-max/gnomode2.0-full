@@ -52,6 +52,11 @@ def classify_for_parse(
         prev = hold.get(addr, {})
         prev_ath = float(prev.get("ath_mcap") or 0.0)
         already = float(ath_updates.get(addr, (0.0, ""))[0])
+        # Discard hold ATH inflated by price×1e9 on low-supply tokens.
+        if prev_ath >= 1_000_000_000.0 and ath > 0 and prev_ath > ath * 50:
+            prev_ath = 0.0
+        if already >= 1_000_000_000.0 and ath > 0 and already > ath * 50:
+            already = 0.0
         peak = max(prev_ath, already, ath)
         prev_sym = str(prev.get("symbol") or "")
         already_sym = ath_updates.get(addr, (0.0, ""))[1] if addr in ath_updates else ""
@@ -109,15 +114,25 @@ def classify_for_parse(
     )
 
 
-def should_mark_parsed(error: str | None) -> bool:
+def should_mark_parsed(
+    error: str | None,
+    *,
+    buyers_before_filters: int | None = None,
+    buyers_after_filters: int | None = None,
+) -> bool:
     """Whether a finished parse should permanently leave the hold queue.
 
-    Retry only hard discovery failures (no pool). Honeypot / empty buyers
-    are terminal for this token under the ATH gate.
+    Retry hard discovery failures (no pool). Also retry when early buyers
+    existed under mcap but wallet filters wiped everyone — unique/Blockscout
+    may recover on a later cycle.
     """
-    if not error:
+    if error:
+        low = error.lower()
+        if "no uniswap" in low or "no pool" in low:
+            return False
         return True
-    low = error.lower()
-    if "no uniswap" in low or "no pool" in low:
+    before = int(buyers_before_filters or 0)
+    after = int(buyers_after_filters or 0)
+    if before > 0 and after == 0:
         return False
     return True

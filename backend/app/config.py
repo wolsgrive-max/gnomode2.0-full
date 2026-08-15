@@ -22,7 +22,7 @@ class Settings(BaseSettings):
 
     rpc_url: str = "https://rpc.mainnet.chain.robinhood.com"
     blockscout_api_key: str = ""
-    mcap_threshold: float = 15_000.0
+    mcap_threshold: float = 20_000.0
     # Larger chunks = fewer round-trips (filtered getLogs stay small)
     log_chunk_size: int = 100_000
     # Public Robinhood RPC rate-limits aggressively; keep this low.

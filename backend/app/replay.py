@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -67,7 +68,6 @@ _ETH_CACHE: dict[str, float] = {"price": 0.0, "ts": 0.0}
 
 async def _eth_usd_price() -> float:
     """Spot ETH/USD via DexScreener, cached ~60s."""
-    import time
     now = time.time()
     if _ETH_CACHE["price"] > 0 and now - _ETH_CACHE["ts"] < 60:
         return _ETH_CACHE["price"]
@@ -153,6 +153,74 @@ def v2_price_token_in_quote(
     return r0 / r1 if r1 else 0.0
 
 
+def v2_reserves_before_swap(
+    reserve0_after: int,
+    reserve1_after: int,
+    amount0_in: int,
+    amount1_in: int,
+    amount0_out: int,
+    amount1_out: int,
+) -> tuple[int, int] | None:
+    """Recover pre-swap V2 reserves from post-Sync reserves + Swap amounts.
+
+    Sync emits *post*-trade reserves. When we have no prior Sync state (first
+    swap in a replay window / same-tx Sync), reverse the balance change.
+    """
+    r0 = int(reserve0_after) - int(amount0_in) + int(amount0_out)
+    r1 = int(reserve1_after) - int(amount1_in) + int(amount1_out)
+    if r0 <= 0 or r1 <= 0:
+        return None
+    return r0, r1
+
+
+def entry_mcap_usd(
+    *,
+    quote_in_raw: int,
+    token_out_raw: int,
+    quote_decimals: int,
+    token_decimals: int,
+    quote_usd: float,
+    supply_tokens: float,
+    spot_mcap: float = 0.0,
+) -> float:
+    """Mcap at buy: prefer execution (fill) price × supply, else pre-swap spot.
+
+    Fill matches GMGN-style entry on thin pools where a buy moves spot a lot.
+    Post-swap spot alone overstates entry; pre-swap alone understates paid price.
+    """
+    if (
+        quote_in_raw > 0
+        and token_out_raw > 0
+        and quote_usd > 0
+        and supply_tokens > 0
+        and token_decimals >= 0
+        and quote_decimals >= 0
+    ):
+        tokens = token_out_raw / (10**token_decimals)
+        usd = (quote_in_raw / (10**quote_decimals)) * quote_usd
+        if tokens > 0:
+            return usd / tokens * supply_tokens
+    return float(spot_mcap) if spot_mcap and spot_mcap > 0 else 0.0
+
+
+def _rpc_int(value: Any, default: int = 0) -> int:
+    """Parse RPC int that may be hex string, int, or bytes."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, bytes):
+        return int.from_bytes(value, "big")
+    s = str(value).strip()
+    if not s:
+        return default
+    if s.startswith(("0x", "0X")):
+        return int(s, 16)
+    return int(s)
+
+
 def v3_price_from_sqrt(
     sqrt_price_x96: int,
     token_is_token0: bool,
@@ -169,6 +237,325 @@ def v3_price_from_sqrt(
     # token is token1, quote is token0 → invert token1/token0
     t1_per_t0 = ((sqrt_price_x96 / (2**96)) ** 2) * (10 ** (quote_decimals - token_decimals))
     return (1.0 / t1_per_t0) if t1_per_t0 else 0.0
+
+
+_Q96 = 2**96
+
+
+def v3_sqrt_before_swap(
+    sqrt_after: int,
+    liquidity: int,
+    amount0: int,
+    amount1: int,
+) -> int | None:
+    """Recover pre-swap sqrtPriceX96 from a Uniswap V3 Swap event.
+
+    Swap emits the *post*-trade sqrtPriceX96. For early-buyer mcap we need the
+    price *before* the buy (GMGN-style entry mcap). Uses liquidity + amounts.
+    """
+    if sqrt_after <= 0 or liquidity <= 0:
+        return None
+    L = int(liquidity)
+    a = int(sqrt_after)
+    # zeroForOne: sell token0 for token1 (amount0>0, amount1<0) → sqrt decreases
+    if amount0 > 0 and amount1 < 0:
+        A = int(amount0)
+        denom = L * _Q96 - A * a
+        if denom <= 0:
+            return None
+        before = (L * _Q96 * a) // denom
+        return int(before) if before > 0 else None
+    # oneForZero: sell token1 for token0 (amount1>0, amount0<0) → sqrt increases
+    if amount1 > 0 and amount0 < 0:
+        A = int(amount1)
+        before = a - (A * _Q96) // L
+        return int(before) if before > 0 else None
+    return None
+
+
+def v3_mcap_from_swap(
+    *,
+    amount0: int,
+    amount1: int,
+    sqrt_after: int,
+    liquidity: int,
+    token_is_token0: bool,
+    decimals: int,
+    quote_decimals: int,
+    quote_usd: float,
+    supply_tokens: float,
+    prev_sqrt: int | None = None,
+) -> tuple[float, int]:
+    """Return (mcap_usd at entry, sqrt used). Prefer pre-swap sqrt."""
+    sqrt_before = v3_sqrt_before_swap(sqrt_after, liquidity, amount0, amount1)
+    sqrt_used = sqrt_before or prev_sqrt or sqrt_after
+    price = v3_price_from_sqrt(sqrt_used, token_is_token0, decimals, quote_decimals)
+    mcap = price * quote_usd * supply_tokens if price > 0 else 0.0
+    return mcap, int(sqrt_after)
+
+
+def _log_data_hex(log: dict[str, Any]) -> str:
+    data = log.get("data") or "0x"
+    if isinstance(data, bytes):
+        return "0x" + data.hex()
+    return str(data)
+
+
+def _log_addr(log: dict[str, Any]) -> str:
+    addr = log.get("address") or ""
+    if isinstance(addr, bytes):
+        return "0x" + addr.hex()
+    return str(addr).lower()
+
+
+def _log_topics(log: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    for t in log.get("topics") or []:
+        if isinstance(t, bytes):
+            out.append("0x" + t.hex())
+        else:
+            out.append(str(t).lower())
+    return out
+
+
+def _log_index(log: dict[str, Any]) -> int:
+    return _rpc_int(log.get("logIndex"), 0)
+
+
+def _log_block(log: dict[str, Any]) -> int:
+    return _rpc_int(log.get("blockNumber"), 0)
+
+
+@dataclass(frozen=True)
+class EntryAtTx:
+    mcap: float | None = None
+    bought_usd: float | None = None
+
+
+_ENTRY_AT_TX_CACHE: dict[str, tuple[float, EntryAtTx]] = {}
+_ENTRY_AT_TX_TTL_SEC = 600.0
+_ENTRY_AT_TX_EMPTY_TTL_SEC = 90.0
+
+
+def _entry_cache_key(token: str, tx_hash: str) -> str:
+    return f"{token.lower()}:{tx_hash.lower()}"
+
+
+async def estimate_entry_at_tx(
+    token: str,
+    tx_hash: str,
+    *,
+    rpc: RpcClient | None = None,
+) -> EntryAtTx:
+    """Best-effort entry mcap + USD spent for a buy tx (fill / pre-swap)."""
+    txh = (tx_hash or "").strip().lower()
+    if not txh.startswith("0x") or len(txh) < 66:
+        return EntryAtTx()
+    cache_key = _entry_cache_key(token, txh)
+    now = time.time()
+    hit = _ENTRY_AT_TX_CACHE.get(cache_key)
+    if hit:
+        cached_at, cached_val = hit
+        ttl = _ENTRY_AT_TX_TTL_SEC if cached_val.mcap is not None else _ENTRY_AT_TX_EMPTY_TTL_SEC
+        if now - cached_at < ttl:
+            return cached_val
+
+    rpc = rpc or RpcClient()
+    empty = EntryAtTx()
+
+    def _cache(val: EntryAtTx) -> EntryAtTx:
+        _ENTRY_AT_TX_CACHE[cache_key] = (now, val)
+        if len(_ENTRY_AT_TX_CACHE) > 2048:
+            ordered = sorted(_ENTRY_AT_TX_CACHE.items(), key=lambda kv: kv[1][0])
+            for k, _ in ordered[: len(ordered) // 2]:
+                _ENTRY_AT_TX_CACHE.pop(k, None)
+        return val
+
+    try:
+        receipts = await rpc.batch_get_receipts([txh])
+        receipt = receipts.get(txh)
+        if not receipt:
+            return _cache(empty)
+        logs = receipt.get("logs") or []
+        if not logs:
+            return _cache(empty)
+
+        pool = await pick_best_pool(rpc, token)
+        if not pool:
+            return _cache(empty)
+        meta = await rpc.token_meta(token)
+        decimals = int(meta.get("decimals") or 18)
+        supply_raw = int(meta.get("total_supply_raw") or 0)
+        supply_tokens = supply_raw / (10**decimals) if decimals >= 0 else 0.0
+        if supply_tokens <= 0:
+            return _cache(empty)
+        eth_usd = await _eth_usd_price()
+        quote_usd = quote_to_usd(pool.quote, eth_usd)
+        if quote_usd <= 0:
+            quote_usd = float(eth_usd or 0)
+        if quote_usd <= 0:
+            quote_usd = 2000.0
+            logger.warning("estimate_entry_at_tx: ETH/USD missing, fallback $%s", quote_usd)
+        quote_decimals = QUOTE_TOKENS.get(pool.quote.lower(), {}).get("decimals", 18)
+        token_is_token0 = pool.token0.lower() == token.lower()
+        pool_l = pool.address.lower()
+        manager_l = UNI_V4_POOL_MANAGER.lower()
+
+        reserve0 = reserve1 = 0
+        pre_reserves: tuple[int, int] | None = None
+        prev_sqrt: int | None = None
+        best_mcap: float | None = None
+        best_bought: float | None = None
+
+        def _consider(mcap: float, quote_in_raw: int) -> None:
+            nonlocal best_mcap, best_bought
+            if mcap <= 0:
+                return
+            best_mcap = mcap
+            if quote_in_raw > 0 and quote_usd > 0:
+                best_bought = (quote_in_raw / (10**quote_decimals)) * quote_usd
+
+        for log in sorted(logs, key=_log_index):
+            addr = _log_addr(log)
+            topics = _log_topics(log)
+            if not topics:
+                continue
+            topic0 = topics[0].lower()
+            data_hex = _log_data_hex(log)
+
+            if pool.dex == "uniswap_v2" and addr == pool_l:
+                if topic0 == SYNC_TOPIC.lower():
+                    new0 = decode_uint256(data_hex, 0)
+                    new1 = decode_uint256(data_hex, 1)
+                    if reserve0 or reserve1:
+                        pre_reserves = (reserve0, reserve1)
+                    reserve0, reserve1 = new0, new1
+                elif topic0 == V2_SWAP_TOPIC.lower():
+                    a0_in = decode_uint256(data_hex, 0)
+                    a1_in = decode_uint256(data_hex, 1)
+                    a0_out = decode_uint256(data_hex, 2)
+                    a1_out = decode_uint256(data_hex, 3)
+                    r0, r1 = pre_reserves if pre_reserves else (reserve0, reserve1)
+                    if not pre_reserves and (reserve0 or reserve1):
+                        reversed_r = v2_reserves_before_swap(
+                            reserve0, reserve1, a0_in, a1_in, a0_out, a1_out
+                        )
+                        if reversed_r:
+                            r0, r1 = reversed_r
+                    spot = 0.0
+                    if r0 and r1:
+                        price = v2_price_token_in_quote(
+                            r0, r1, token_is_token0, decimals, quote_decimals
+                        )
+                        spot = price * quote_usd * supply_tokens
+                    quote_in = a1_in if token_is_token0 else a0_in
+                    token_out = a0_out if token_is_token0 else a1_out
+                    mcap = entry_mcap_usd(
+                        quote_in_raw=quote_in,
+                        token_out_raw=token_out,
+                        quote_decimals=quote_decimals,
+                        token_decimals=decimals,
+                        quote_usd=quote_usd,
+                        supply_tokens=supply_tokens,
+                        spot_mcap=spot,
+                    )
+                    _consider(mcap, quote_in)
+                continue
+
+            if pool.dex == "uniswap_v3" and addr == pool_l and topic0 == V3_SWAP_TOPIC.lower():
+                amount0 = decode_int256(data_hex, 0)
+                amount1 = decode_int256(data_hex, 1)
+                sqrt_after = decode_uint256(data_hex, 2)
+                liquidity = decode_uint256(data_hex, 3)
+                spot, _ = v3_mcap_from_swap(
+                    amount0=amount0,
+                    amount1=amount1,
+                    sqrt_after=sqrt_after,
+                    liquidity=liquidity,
+                    token_is_token0=token_is_token0,
+                    decimals=decimals,
+                    quote_decimals=quote_decimals,
+                    quote_usd=quote_usd,
+                    supply_tokens=supply_tokens,
+                    prev_sqrt=prev_sqrt,
+                )
+                prev_sqrt = sqrt_after
+                if token_is_token0:
+                    quote_in = amount1 if amount1 > 0 else 0
+                    token_out = -amount0 if amount0 < 0 else 0
+                else:
+                    quote_in = amount0 if amount0 > 0 else 0
+                    token_out = -amount1 if amount1 < 0 else 0
+                mcap = entry_mcap_usd(
+                    quote_in_raw=quote_in,
+                    token_out_raw=token_out,
+                    quote_decimals=quote_decimals,
+                    token_decimals=decimals,
+                    quote_usd=quote_usd,
+                    supply_tokens=supply_tokens,
+                    spot_mcap=spot,
+                )
+                _consider(mcap, quote_in)
+                continue
+
+            if (
+                pool.dex == "uniswap_v4"
+                and addr == manager_l
+                and topic0 == V4_SWAP_TOPIC.lower()
+            ):
+                amount0 = decode_int256(data_hex, 0)
+                amount1 = decode_int256(data_hex, 1)
+                sqrt_after = decode_uint256(data_hex, 2)
+                liquidity = decode_uint256(data_hex, 3)
+                spot, _ = v3_mcap_from_swap(
+                    amount0=-amount0,
+                    amount1=-amount1,
+                    sqrt_after=sqrt_after,
+                    liquidity=liquidity,
+                    token_is_token0=token_is_token0,
+                    decimals=decimals,
+                    quote_decimals=quote_decimals,
+                    quote_usd=quote_usd,
+                    supply_tokens=supply_tokens,
+                    prev_sqrt=prev_sqrt,
+                )
+                prev_sqrt = sqrt_after
+                if token_is_token0:
+                    quote_in = -amount1 if amount1 < 0 else 0
+                    token_out = amount0 if amount0 > 0 else 0
+                else:
+                    quote_in = -amount0 if amount0 < 0 else 0
+                    token_out = amount1 if amount1 > 0 else 0
+                mcap = entry_mcap_usd(
+                    quote_in_raw=quote_in,
+                    token_out_raw=token_out,
+                    quote_decimals=quote_decimals,
+                    token_decimals=decimals,
+                    quote_usd=quote_usd,
+                    supply_tokens=supply_tokens,
+                    spot_mcap=spot,
+                )
+                _consider(mcap, quote_in)
+                continue
+
+        result = EntryAtTx(
+            mcap=best_mcap if best_mcap and best_mcap > 0 else None,
+            bought_usd=best_bought if best_bought and best_bought > 0 else None,
+        )
+        return _cache(result)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("estimate_entry_at_tx failed %s: %s", txh[:12], exc)
+        return _cache(empty)
+
+
+async def estimate_mcap_at_tx(
+    token: str,
+    tx_hash: str,
+    *,
+    rpc: RpcClient | None = None,
+) -> float | None:
+    """Best-effort entry mcap for a buy tx (fill / pre-swap), else None."""
+    return (await estimate_entry_at_tx(token, tx_hash, rpc=rpc)).mcap
 
 
 def is_excluded(addr: str, pool: str, extra: set[str] | None = None) -> bool:
@@ -432,11 +819,11 @@ async def _replay_v2(
     # Build timeline of all events sorted by (block, logIndex)
     events: list[tuple[int, int, str, Any]] = []
     for log in sync_logs:
-        events.append((int(log["blockNumber"]), int(log["logIndex"]), "sync", log))
+        events.append((_log_block(log), _log_index(log), "sync", log))
     for log in swap_logs:
-        events.append((int(log["blockNumber"]), int(log["logIndex"]), "swap", log))
+        events.append((_log_block(log), _log_index(log), "swap", log))
     for log in xfer_logs:
-        events.append((int(log["blockNumber"]), int(log["logIndex"]), "xfer", log))
+        events.append((_log_block(log), _log_index(log), "xfer", log))
     events.sort(key=lambda x: (x[0], x[1]))
 
     # Index transfers from pool by tx hash
@@ -452,12 +839,20 @@ async def _replay_v2(
     crossed = False
     aggs: dict[str, WalletAgg] = {}
     early_stop_block: int | None = None
+    # Uniswap V2 emits Sync *before* Swap in the same tx, with *post*-trade reserves.
+    # Stash pre-Sync reserves per tx so Swap mcap is entry (pre-buy), not post.
+    pre_reserves_by_tx: dict[str, tuple[int, int]] = {}
 
     for block, _idx, kind, log in events:
         if kind == "sync":
             data = log["data"]
-            reserve0 = decode_uint256(data, 0)
-            reserve1 = decode_uint256(data, 1)
+            new0 = decode_uint256(data, 0)
+            new1 = decode_uint256(data, 1)
+            tx = log["transactionHash"]
+            txh = (tx.hex() if isinstance(tx, bytes) else str(tx)).lower()
+            if reserve0 or reserve1:
+                pre_reserves_by_tx[txh] = (reserve0, reserve1)
+            reserve0, reserve1 = new0, new1
             price = v2_price_token_in_quote(
                 reserve0, reserve1, token_is_token0, decimals, quote_decimals
             )
@@ -470,23 +865,38 @@ async def _replay_v2(
         if kind != "swap":
             continue
 
-        # Use mcap BEFORE this swap's sync if sync comes after swap in ordering —
-        # on V2 Sync is emitted after reserves update, often after Swap in log order.
-        # Prefer last known mcap; if Sync follows Swap in same tx, we may use post-price.
-        # Recompute from current reserves (updated by prior Sync events).
-        price = v2_price_token_in_quote(
-            reserve0, reserve1, token_is_token0, decimals, quote_decimals
-        )
-        mcap_now = price * quote_usd * supply_tokens if reserve0 and reserve1 else mcap
+        tx = log["transactionHash"]
+        txh = (tx.hex() if isinstance(tx, bytes) else str(tx)).lower()
+        data = log["data"]
+        amount0_in = decode_uint256(data, 0)
+        amount1_in = decode_uint256(data, 1)
+        amount0_out = decode_uint256(data, 2)
+        amount1_out = decode_uint256(data, 3)
 
-        if reserve0 == 0 and reserve1 == 0:
+        r0, r1 = pre_reserves_by_tx.get(txh, (0, 0))
+        if not (r0 and r1) and (reserve0 or reserve1):
+            reversed_r = v2_reserves_before_swap(
+                reserve0, reserve1, amount0_in, amount1_in, amount0_out, amount1_out
+            )
+            if reversed_r:
+                r0, r1 = reversed_r
+            else:
+                r0, r1 = reserve0, reserve1
+        elif not (r0 and r1):
+            r0, r1 = reserve0, reserve1
+
+        price = v2_price_token_in_quote(
+            r0, r1, token_is_token0, decimals, quote_decimals
+        )
+        # Market level for threshold: pre-swap spot (not post-Sync).
+        mcap_now = price * quote_usd * supply_tokens if r0 and r1 else mcap
+
+        if r0 == 0 and r1 == 0:
             continue
         if mcap_now >= mcap_threshold:
             crossed = True
             continue
 
-        tx = log["transactionHash"]
-        txh = (tx.hex() if isinstance(tx, bytes) else str(tx)).lower()
         topics = log["topics"]
         # topics[2] = `to` indexed
         to_addr = topic_address(topics[2]) if len(topics) > 2 else ""
@@ -512,10 +922,6 @@ async def _replay_v2(
         if buyer is None:
             if is_excluded(to_addr, pool.address):
                 continue
-            # Decode amount out from swap data
-            data = log["data"]
-            amount0_out = decode_uint256(data, 2)
-            amount1_out = decode_uint256(data, 3)
             amount_raw = amount0_out if token_is_token0 else amount1_out
             if amount_raw == 0:
                 continue
@@ -525,19 +931,25 @@ async def _replay_v2(
             continue
 
         amount_tokens = amount_raw / (10**decimals)
-        # Approximate USD spent: quote amount in
-        data = log["data"]
-        amount0_in = decode_uint256(data, 0)
-        amount1_in = decode_uint256(data, 1)
         quote_in = amount1_in if token_is_token0 else amount0_in
+        token_out = amount0_out if token_is_token0 else amount1_out
         amount_usd = (quote_in / (10**quote_decimals)) * quote_usd
+        buy_mcap = entry_mcap_usd(
+            quote_in_raw=quote_in,
+            token_out_raw=token_out or amount_raw,
+            quote_decimals=quote_decimals,
+            token_decimals=decimals,
+            quote_usd=quote_usd,
+            supply_tokens=supply_tokens,
+            spot_mcap=mcap_now,
+        )
 
         _record_buy(
             aggs,
             wallet=buyer,
             amount_tokens=amount_tokens,
             amount_usd=amount_usd,
-            mcap=mcap_now,
+            mcap=buy_mcap,
             tx=txh,
             block=block,
         )
@@ -702,6 +1114,7 @@ async def _replay_v3(
     crossed = False
     cursor = start_block
     total = max(end_block - start_block + 1, 1)
+    prev_sqrt: int | None = None
 
     while cursor <= end_block and not crossed:
         end = min(cursor + chunk - 1, end_block)
@@ -727,29 +1140,41 @@ async def _replay_v3(
                 continue
             raise
 
-        part.sort(key=lambda lg: (int(lg["blockNumber"]), int(lg["logIndex"])))
+        part.sort(key=lambda lg: (_log_block(lg), _log_index(lg)))
         for log in part:
             data = log["data"]
             amount0 = decode_int256(data, 0)
             amount1 = decode_int256(data, 1)
             sqrt_price = decode_uint256(data, 2)
-            price = v3_price_from_sqrt(sqrt_price, token_is_token0, decimals, quote_decimals)
-            mcap_now = price * quote_usd * supply_tokens
+            liquidity = decode_uint256(data, 3)
+            mcap_now, _ = v3_mcap_from_swap(
+                amount0=amount0,
+                amount1=amount1,
+                sqrt_after=sqrt_price,
+                liquidity=liquidity,
+                token_is_token0=token_is_token0,
+                decimals=decimals,
+                quote_decimals=quote_decimals,
+                quote_usd=quote_usd,
+                supply_tokens=supply_tokens,
+                prev_sqrt=prev_sqrt,
+            )
+            prev_sqrt = sqrt_price
             token_delta = amount0 if token_is_token0 else amount1
             # V3 pool delta: negative token ⇒ tokens left the pool ⇒ buy
             is_buy = token_delta < 0
             if not is_buy:
                 if mcap_now >= mcap_threshold:
                     crossed = True
-                    stop_block = int(log["blockNumber"])
+                    stop_block = _log_block(log)
                     break
                 continue
             if mcap_now >= mcap_threshold:
                 crossed = True
-                stop_block = int(log["blockNumber"])
+                stop_block = _log_block(log)
                 break
             early_swaps.append(log)
-            stop_block = int(log["blockNumber"])
+            stop_block = _log_block(log)
 
         if crossed:
             break
@@ -783,21 +1208,37 @@ async def _replay_v3(
         xfers_by_tx=xfers_by_tx,
     )
     aggs: dict[str, WalletAgg] = {}
+    prev_sqrt: int | None = None
 
     for log in early_swaps:
         data = log["data"]
         amount0 = decode_int256(data, 0)
         amount1 = decode_int256(data, 1)
         sqrt_price = decode_uint256(data, 2)
-        price = v3_price_from_sqrt(sqrt_price, token_is_token0, decimals, quote_decimals)
-        mcap_now = price * quote_usd * supply_tokens
+        liquidity = decode_uint256(data, 3)
+        spot_mcap, _ = v3_mcap_from_swap(
+            amount0=amount0,
+            amount1=amount1,
+            sqrt_after=sqrt_price,
+            liquidity=liquidity,
+            token_is_token0=token_is_token0,
+            decimals=decimals,
+            quote_decimals=quote_decimals,
+            quote_usd=quote_usd,
+            supply_tokens=supply_tokens,
+            prev_sqrt=prev_sqrt,
+        )
+        prev_sqrt = sqrt_price
+        # Post-swap spot only for USD fill estimate when quote_in missing.
+        price_post = v3_price_from_sqrt(sqrt_price, token_is_token0, decimals, quote_decimals)
         if token_is_token0:
             token_delta, quote_delta = amount0, amount1
         else:
             token_delta, quote_delta = amount1, amount0
         amount_raw = abs(token_delta)
         quote_in = quote_delta if quote_delta > 0 else 0
-        block = int(log["blockNumber"])
+        token_out = -token_delta if token_delta < 0 else 0
+        block = _log_block(log)
         tx = log["transactionHash"]
         txh = (tx.hex() if isinstance(tx, bytes) else str(tx)).lower()
         resolved = buyers_map.get(txh)
@@ -806,19 +1247,29 @@ async def _replay_v3(
         buyer, amt = resolved
         if amt:
             amount_raw = amt
+            token_out = amt
 
         amount_tokens = amount_raw / (10**decimals)
         amount_usd = (
             (quote_in / (10**quote_decimals)) * quote_usd
             if quote_in
-            else amount_tokens * price * quote_usd
+            else amount_tokens * price_post * quote_usd
+        )
+        buy_mcap = entry_mcap_usd(
+            quote_in_raw=quote_in,
+            token_out_raw=token_out or amount_raw,
+            quote_decimals=quote_decimals,
+            token_decimals=decimals,
+            quote_usd=quote_usd,
+            supply_tokens=supply_tokens,
+            spot_mcap=spot_mcap,
         )
         _record_buy(
             aggs,
             wallet=buyer,
             amount_tokens=amount_tokens,
             amount_usd=amount_usd,
-            mcap=mcap_now,
+            mcap=buy_mcap,
             tx=txh,
             block=block,
         )
@@ -855,6 +1306,7 @@ async def _replay_v4(
     crossed = False
     cursor = start_block
     total = max(end_block - start_block + 1, 1)
+    prev_sqrt: int | None = None
 
     while cursor <= end_block and not crossed:
         end = min(cursor + chunk - 1, end_block)
@@ -880,14 +1332,28 @@ async def _replay_v4(
                 continue
             raise
 
-        part.sort(key=lambda lg: (int(lg["blockNumber"]), int(lg["logIndex"])))
+        part.sort(key=lambda lg: (_log_block(lg), _log_index(lg)))
         for log in part:
             data = log["data"]
+            # V4 amounts are swapper deltas (sign opposite of V3 pool deltas).
             amount0 = decode_int256(data, 0)
             amount1 = decode_int256(data, 1)
             sqrt_price = decode_uint256(data, 2)
-            price = v3_price_from_sqrt(sqrt_price, token_is_token0, decimals, quote_decimals)
-            mcap_now = price * quote_usd * supply_tokens
+            liquidity = decode_uint256(data, 3)
+            pool_amount0, pool_amount1 = -amount0, -amount1
+            mcap_now, _ = v3_mcap_from_swap(
+                amount0=pool_amount0,
+                amount1=pool_amount1,
+                sqrt_after=sqrt_price,
+                liquidity=liquidity,
+                token_is_token0=token_is_token0,
+                decimals=decimals,
+                quote_decimals=quote_decimals,
+                quote_usd=quote_usd,
+                supply_tokens=supply_tokens,
+                prev_sqrt=prev_sqrt,
+            )
+            prev_sqrt = sqrt_price
             # V4 Swap amounts on Robinhood match the *swapper* delta (verified via Transfer):
             # positive token amount ⇒ wallet received tokens ⇒ buy.
             token_delta = amount0 if token_is_token0 else amount1
@@ -895,15 +1361,15 @@ async def _replay_v4(
             if not is_buy:
                 if mcap_now >= mcap_threshold:
                     crossed = True
-                    stop_block = int(log["blockNumber"])
+                    stop_block = _log_block(log)
                     break
                 continue
             if mcap_now >= mcap_threshold:
                 crossed = True
-                stop_block = int(log["blockNumber"])
+                stop_block = _log_block(log)
                 break
             early_swaps.append(log)
-            stop_block = int(log["blockNumber"])
+            stop_block = _log_block(log)
 
         if crossed:
             break
@@ -950,14 +1416,29 @@ async def _replay_v4(
         xfers_by_tx=xfers_by_tx,
     )
     aggs: dict[str, WalletAgg] = {}
+    prev_sqrt: int | None = None
 
     for log in early_swaps:
         data = log["data"]
         amount0 = decode_int256(data, 0)
         amount1 = decode_int256(data, 1)
         sqrt_price = decode_uint256(data, 2)
-        price = v3_price_from_sqrt(sqrt_price, token_is_token0, decimals, quote_decimals)
-        mcap_now = price * quote_usd * supply_tokens
+        liquidity = decode_uint256(data, 3)
+        pool_amount0, pool_amount1 = -amount0, -amount1
+        spot_mcap, _ = v3_mcap_from_swap(
+            amount0=pool_amount0,
+            amount1=pool_amount1,
+            sqrt_after=sqrt_price,
+            liquidity=liquidity,
+            token_is_token0=token_is_token0,
+            decimals=decimals,
+            quote_decimals=quote_decimals,
+            quote_usd=quote_usd,
+            supply_tokens=supply_tokens,
+            prev_sqrt=prev_sqrt,
+        )
+        prev_sqrt = sqrt_price
+        price_post = v3_price_from_sqrt(sqrt_price, token_is_token0, decimals, quote_decimals)
 
         if token_is_token0:
             token_delta = amount0
@@ -967,8 +1448,10 @@ async def _replay_v4(
             quote_delta = amount0
 
         amount_raw = abs(token_delta)
-        quote_in = abs(quote_delta) if quote_delta < 0 else 0
-        block = int(log["blockNumber"])
+        # Swapper pays quote (negative quote delta) and receives token (positive).
+        quote_in = -quote_delta if quote_delta < 0 else 0
+        token_out = token_delta if token_delta > 0 else 0
+        block = _log_block(log)
         tx = log["transactionHash"]
         txh = (tx.hex() if isinstance(tx, bytes) else str(tx)).lower()
         resolved = buyers_map.get(txh)
@@ -977,19 +1460,29 @@ async def _replay_v4(
         buyer, amt = resolved
         if amt:
             amount_raw = amt
+            token_out = amt
 
         amount_tokens = amount_raw / (10**decimals)
         amount_usd = (
             (quote_in / (10**quote_decimals)) * quote_usd
             if quote_in
-            else amount_tokens * price * quote_usd
+            else amount_tokens * price_post * quote_usd
+        )
+        buy_mcap = entry_mcap_usd(
+            quote_in_raw=quote_in,
+            token_out_raw=token_out or amount_raw,
+            quote_decimals=quote_decimals,
+            token_decimals=decimals,
+            quote_usd=quote_usd,
+            supply_tokens=supply_tokens,
+            spot_mcap=spot_mcap,
         )
         _record_buy(
             aggs,
             wallet=buyer,
             amount_tokens=amount_tokens,
             amount_usd=amount_usd,
-            mcap=mcap_now,
+            mcap=buy_mcap,
             tx=txh,
             block=block,
         )
@@ -1057,8 +1550,28 @@ async def _fallback_blockscout(
     await on_progress("fallback", f"Analyzing {len(transfers)} transfers…", 0.7)
 
     aggs: dict[str, WalletAgg] = {}
-    # Linear mcap ramp heuristic from ~0 to current if current > threshold
+    # Prefer on-chain entry mcap from the buy receipt when possible; else concave
+    # ramp from ~0 to current (heuristic only).
     n = max(len(transfers), 1)
+    sem = asyncio.Semaphore(4)
+    mcap_cache: dict[str, float | None] = {}
+
+    async def _tx_mcap(txh: str) -> float | None:
+        key = txh.lower()
+        if key in mcap_cache:
+            return mcap_cache[key]
+        async with sem:
+            if key in mcap_cache:
+                return mcap_cache[key]
+            try:
+                val = await estimate_mcap_at_tx(token, key, rpc=rpc)
+            except Exception:  # noqa: BLE001
+                val = None
+            mcap_cache[key] = val
+            return val
+
+    # Pre-resolve mcap for the earliest pool→wallet transfers (cap RPC load).
+    early_candidates: list[tuple[int, str, str, int, int, float]] = []
     for i, item in enumerate(transfers):
         frm = ((item.get("from") or {}) if isinstance(item.get("from"), dict) else {})
         to = ((item.get("to") or {}) if isinstance(item.get("to"), dict) else {})
@@ -1074,12 +1587,10 @@ async def _fallback_blockscout(
         if is_excluded(str(to_addr), pool.address):
             continue
 
-        # Estimate mcap at this point in history
         frac = i / n
-        est_mcap = current_mcap * frac if current_mcap > 0 else 0.0
-        # If currently still under threshold, all historical buys qualify with est
+        est_mcap = current_mcap * (frac**1.6) if current_mcap > 0 else 0.0
         if current_mcap > 0 and current_mcap < mcap_threshold:
-            est_mcap = min(current_mcap, mcap_threshold * 0.99) * (0.1 + 0.9 * frac)
+            est_mcap = min(current_mcap, mcap_threshold * 0.99) * (0.05 + 0.95 * (frac**1.4))
         if est_mcap >= mcap_threshold:
             continue
 
@@ -1089,17 +1600,37 @@ async def _fallback_blockscout(
             amount_raw = int(value or 0)
         except (TypeError, ValueError):
             continue
+        tx = str(item.get("transaction_hash") or item.get("tx_hash") or "")
+        block = _rpc_int(item.get("block_number"), 0)
+        early_candidates.append((i, str(to_addr), tx, amount_raw, block, est_mcap))
+        if len(early_candidates) >= 120:
+            break
+
+    unique_txs = list({c[2].lower() for c in early_candidates if c[2].startswith("0x")})
+    if unique_txs:
+        await on_progress(
+            "fallback",
+            f"Resolving entry mcap for {len(unique_txs)} txs…",
+            0.78,
+        )
+        await asyncio.gather(*[_tx_mcap(t) for t in unique_txs[:80]])
+
+    for _i, to_addr, tx, amount_raw, block, est_mcap in early_candidates:
         amount_tokens = amount_raw / (10**decimals)
         amount_usd = amount_tokens * price * quote_usd
-        tx = item.get("transaction_hash") or item.get("tx_hash") or ""
-        block = int(item.get("block_number") or 0)
-
+        buy_mcap = est_mcap
+        if tx:
+            resolved = mcap_cache.get(tx.lower())
+            if resolved and resolved > 0:
+                buy_mcap = resolved
+        if buy_mcap >= mcap_threshold:
+            continue
         _record_buy(
             aggs,
             wallet=str(to_addr),
             amount_tokens=amount_tokens,
             amount_usd=amount_usd,
-            mcap=est_mcap,
+            mcap=buy_mcap,
             tx=str(tx),
             block=block,
         )

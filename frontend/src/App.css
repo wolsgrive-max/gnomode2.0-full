@@ -899,3 +899,122 @@ a.wallet-link.visited:hover {
     padding: 0 1rem;
   }
 }
+
+/* ——— Хвать ——— */
+
+.hvat-panel {
+  animation: rise 0.55s var(--ease-out) both;
+}
+
+.hvat-hero {
+  margin-bottom: 1.25rem;
+}
+
+.hvat-title {
+  font-family: var(--display);
+  font-weight: 800;
+  font-size: clamp(2rem, 5vw, 2.75rem);
+  letter-spacing: -0.04em;
+  margin: 0 0 0.4rem;
+  line-height: 1;
+}
+
+.hvat-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr));
+  gap: 0.75rem 1rem;
+  margin: 1.25rem 0;
+}
+
+.hvat-meta {
+  margin: 0 0 1.5rem;
+  line-height: 1.55;
+}
+
+.hvat-panel > .section-title {
+  font-family: var(--display);
+  font-size: 1.15rem;
+  margin: 1.5rem 0 0.65rem;
+}
+
+.hvat-filter-card .section-title {
+  font-family: var(--display);
+  font-size: 1.15rem;
+  margin: 0 0 0.75rem;
+}
+
+.hvat-filters {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+  align-items: stretch;
+  margin: 0.5rem 0 1.5rem;
+}
+
+.hvat-filter-card {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  padding: 1rem 1.05rem 1.1rem;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+}
+
+.hvat-card-note {
+  margin: -0.25rem 0 0.85rem;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.hvat-filter-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  flex: 1;
+  align-content: start;
+}
+
+.hvat-filter-card .checkbox-field {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 1100px) {
+  .hvat-filters {
+    grid-template-columns: 1fr;
+  }
+}
+
+.hvat-alert-actions {
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+
+.hvat-custom-check {
+  display: inline-flex;
+  gap: 0.45rem;
+  align-items: center;
+  margin: 0 0 0.85rem;
+  font-size: 0.88rem;
+}
+
+.hvat-wallet-toolbar {
+  margin: 0 0 0.65rem;
+  align-items: center;
+}
+
+button.linkish {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.hvat-row-focus {
+  background: color-mix(in srgb, var(--accent, #3d6b4f) 12%, transparent);
+}
+
+.hvat-row-sel {
+  background: color-mix(in srgb, var(--line) 55%, transparent);
+}

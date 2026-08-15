@@ -69,13 +69,13 @@ type FollowupWallet = {
 
 const DEFAULT_CFG: FollowupConfig = {
   enabled: false,
-  interval_sec: 300,
-  max_mcap_alert: 15000,
+  interval_sec: 5,
+  max_mcap_alert: 20000,
   min_mcap_alert: null,
   min_bought_usd: null,
   max_bought_usd: null,
-  alert_on_deals: [2, 3],
-  max_deals: 3,
+  alert_on_deals: [2, 3, 4, 5],
+  max_deals: 5,
   buys_only: true,
   track_transfers: false,
   telegram_chat_id: '',
@@ -108,7 +108,7 @@ function parseOptional(raw: string): number | null {
   return Number.isFinite(n) ? n : null
 }
 
-export default function FollowupPage() {
+export default function FollowupPage({ tabActive = true }: { tabActive?: boolean }) {
   const [cfg, setCfg] = useState<FollowupConfig>(DEFAULT_CFG)
   const [status, setStatus] = useState<FollowupStatus | null>(null)
   const [wallets, setWallets] = useState<FollowupWallet[]>([])
@@ -127,12 +127,34 @@ export default function FollowupPage() {
   }, [])
 
   useEffect(() => {
+    if (!tabActive) return
     void refresh().catch((e) => setFlash(String(e)))
-    const id = window.setInterval(() => {
-      void refresh().catch(() => undefined)
-    }, 4000)
-    return () => window.clearInterval(id)
-  }, [refresh])
+    const tick = () => {
+      if (document.visibilityState === 'hidden') return
+      // Status + wallets only — avoid clobbering in-progress config edits.
+      void (async () => {
+        try {
+          const [s, w] = await Promise.all([
+            fetch('/api/followup/status').then((r) => r.json()),
+            fetch('/api/followup/wallets?limit=200').then((r) => r.json()),
+          ])
+          setStatus(s)
+          setWallets(Array.isArray(w) ? w : [])
+        } catch {
+          /* ignore */
+        }
+      })()
+    }
+    const id = window.setInterval(tick, 8000)
+    const onVis = () => {
+      if (document.visibilityState === 'visible') tick()
+    }
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      window.clearInterval(id)
+      document.removeEventListener('visibilitychange', onVis)
+    }
+  }, [tabActive, refresh])
 
   const save = async () => {
     setSaving(true)
@@ -279,9 +301,9 @@ export default function FollowupPage() {
             <input
               type="number"
               value={cfg.interval_sec}
-              min={60}
+              min={5}
               onChange={(e) =>
-                setCfg({ ...cfg, interval_sec: Number(e.target.value) || 300 })
+                setCfg({ ...cfg, interval_sec: Number(e.target.value) || 5 })
               }
             />
           </label>
@@ -343,7 +365,7 @@ export default function FollowupPage() {
               min={1}
               max={20}
               onChange={(e) =>
-                setCfg({ ...cfg, max_deals: Number(e.target.value) || 3 })
+                setCfg({ ...cfg, max_deals: Number(e.target.value) || 5 })
               }
             />
           </label>
@@ -368,7 +390,7 @@ export default function FollowupPage() {
           </label>
         </div>
         <p className="muted tiny">
-          Алерт только на deal #2/#3 при mcap ≤ max (и ≥ min, если задан). Высокий
+          Алерт на deal #2–#5 при mcap ≤ max (и ≥ min, если задан). Высокий
           mcap — запись без уведомления. buys_only=on — только входящие с контракта
           (DEX). track_transfers учитывается при buys_only=off. В Telegram: /help
         </p>

@@ -46,6 +46,9 @@ _ENRICH_BATCH = 30
 # parser, so it runs on its own small connection pool and low concurrency and
 # never re-enriches the whole set in one burst.
 _ENRICH_CONCURRENCY = 3
+# Cold first-wave: slightly higher DS concurrency so watch/Хвать can start
+# before all ~18k 24h tokens are enriched.
+_COLD_ENRICH_CONCURRENCY = 6
 _INDEX_RPC_CONCURRENCY = 2
 _REFRESH_INTERVAL_S = 120
 _ENRICH_TTL_S = 15 * 60  # metrics considered fresh for 15 min
@@ -53,6 +56,9 @@ _ENRICH_TTL_S = 15 * 60  # metrics considered fresh for 15 min
 # enriched in full). ~30 batches keeps a steady, low background load while the
 # whole set still gets refreshed within a few cycles — no data is dropped.
 _REFRESH_SLICE = 30 * _ENRICH_BATCH
+# Newest never-enriched tokens to enrich before declaring cold_started.
+# Enough for screener max_results + ATH hold; rest continues in-background.
+_COLD_READY_NEW = 1_200
 # While a parse job is active, only enrich brand-new tokens (few) and skip the
 # stale-refresh so the parser gets the RPC/HTTP budget.
 _BUSY_SLICE = 0
@@ -111,6 +117,7 @@ class TokenIndex:
         self._hot_addresses: set[str] = set()
         self._hot_enriching: bool = False
         self.last_hot_enrich_ts: float = 0.0
+        self._cold_tail_task: asyncio.Task[None] | None = None
 
     # ---------------------------------------------------------------- helpers
 
@@ -183,7 +190,12 @@ class TokenIndex:
 
     def _apply_ath(self, entry: TokenEntry, row: ScreenedToken) -> ScreenedToken:
         """Bump entry ATH from current mcap and mirror it onto the screened row."""
-        peak = max(entry.ath_mcap, row.ath_mcap, row.market_cap)
+        # Drop absurd peaks from the old price×1e9 bug (billions on low-supply
+        # tokens); real RH meme ATH almost never reaches $1B.
+        prev = entry.ath_mcap
+        if prev >= 1_000_000_000.0 and row.market_cap > 0 and prev > row.market_cap * 50:
+            prev = 0.0
+        peak = max(prev, row.ath_mcap, row.market_cap)
         entry.ath_mcap = peak
         if row.ath_mcap != peak:
             return row.model_copy(update={"ath_mcap": peak})
@@ -330,7 +342,10 @@ class TokenIndex:
         self,
         *,
         stale_limit: int | None = None,
+        new_limit: int | None = None,
+        concurrency: int | None = None,
         on_progress: ProgressCb | None = None,
+        progress_label: str = "Enriching new tokens",
     ) -> None:
         # Lazy import avoids a circular dependency (screener imports token_index).
         from .screener import _best_pair_for_token, _fetch_dex_pairs, _pair_to_screened
@@ -347,6 +362,21 @@ class TokenIndex:
         ]
         new_tokens.sort(key=lambda e: -e.created_block)
         stale.sort(key=lambda e: e.enriched_at)  # oldest metrics first
+        if new_limit is not None and len(new_tokens) > new_limit:
+            # Cover the whole 24h window: newest half + stride across the rest.
+            # Pure newest-only misses older liquid ATH≥threshold tokens.
+            head_n = max(1, new_limit // 2)
+            head = new_tokens[:head_n]
+            rest = new_tokens[head_n:]
+            need = new_limit - len(head)
+            if need > 0 and rest:
+                step = max(1, len(rest) // need)
+                tail = rest[::step][:need]
+                new_tokens = head + tail
+            else:
+                new_tokens = head
+        elif new_limit is not None:
+            new_tokens = new_tokens[: max(0, new_limit)]
         if stale_limit is not None:
             stale = stale[:stale_limit]
 
@@ -358,7 +388,8 @@ class TokenIndex:
             pending[i : i + _ENRICH_BATCH]
             for i in range(0, len(pending), _ENRICH_BATCH)
         ]
-        sem = asyncio.Semaphore(_ENRICH_CONCURRENCY)
+        workers = max(1, concurrency or _ENRICH_CONCURRENCY)
+        sem = asyncio.Semaphore(workers)
         client = self._http_client()
         total = len(batches)
         done = 0
@@ -391,7 +422,7 @@ class TokenIndex:
             if on_progress and (done == total or done % 5 == 0):
                 await on_progress(
                     "enrich",
-                    f"Enriching new tokens {done}/{total} batches…",
+                    f"{progress_label} {done}/{total} batches…",
                     min(0.95, 0.1 + 0.85 * done / max(total, 1)),
                 )
 
@@ -496,38 +527,115 @@ class TokenIndex:
                 return
             await self.scan_new_pools(full=cold, on_progress=on_progress)
             self._prune()
-            if cold:
-                # One-time full enrichment — complete coverage.
-                stale_limit: int | None = None
-            else:
-                stale_limit = _REFRESH_SLICE
             # Collect keys that still need a first Gecko peak (new / never probed).
             gecko_candidates = [
                 k
                 for k, e in self._tokens.items()
                 if e.gecko_ath_at <= 0.0
             ]
-            await self.enrich_pending(stale_limit=stale_limit, on_progress=on_progress)
-            if gecko_candidates:
-                await self._apply_gecko_peaks(
-                    gecko_candidates,
-                    limit=_GECKO_BATCH_LIMIT if not cold else min(80, _GECKO_BATCH_LIMIT * 2),
+            if cold:
+                # Unblock watch/Хвать ASAP: newest slice first, then finish
+                # the rest in a background tail so ensure_ready can return.
+                await self.enrich_pending(
+                    stale_limit=0,
+                    new_limit=_COLD_READY_NEW,
+                    concurrency=_COLD_ENRICH_CONCURRENCY,
+                    on_progress=on_progress,
+                    progress_label="Cold first-wave enrich",
                 )
-            self.cold_started = True
-            self.building = False
-            self.last_refresh_ts = time.time()
+                enriched = sum(1 for e in self._tokens.values() if e.screened is not None)
+                self.cold_started = True
+                self.building = False
+                self.last_refresh_ts = time.time()
+                logger.info(
+                    "Cold index ready after first wave (%d/%d enriched)",
+                    enriched,
+                    len(self._tokens),
+                )
+                if on_progress:
+                    await on_progress(
+                        "index",
+                        f"Index ready ({enriched}/{len(self._tokens)}); finishing enrich…",
+                        0.55,
+                    )
+                self._schedule_cold_tail(gecko_candidates)
+            else:
+                await self.enrich_pending(
+                    stale_limit=_REFRESH_SLICE, on_progress=on_progress
+                )
+                if gecko_candidates:
+                    await self._apply_gecko_peaks(
+                        gecko_candidates,
+                        limit=_GECKO_BATCH_LIMIT,
+                    )
+                self.cold_started = True
+                self.building = False
+                self.last_refresh_ts = time.time()
         finally:
             self._refreshing = False
 
+    def _cold_tail_busy(self) -> bool:
+        t = self._cold_tail_task
+        return t is not None and not t.done()
+
+    def _schedule_cold_tail(self, gecko_candidates: list[str]) -> None:
+        if self._cold_tail_busy():
+            return
+        self._cold_tail_task = asyncio.create_task(
+            self._run_cold_tail(gecko_candidates),
+            name="token-index-cold-tail",
+        )
+
+    async def _run_cold_tail(self, gecko_candidates: list[str]) -> None:
+        try:
+            await self.enrich_pending(
+                stale_limit=0,
+                progress_label="Cold remaining enrich",
+            )
+            pending_gecko = [
+                k
+                for k in gecko_candidates
+                if (e := self._tokens.get(k)) is not None and e.gecko_ath_at <= 0.0
+            ]
+            if pending_gecko:
+                # Keep Gecko light: hot-enrich loop densifies ATH later.
+                await self._apply_gecko_peaks(
+                    pending_gecko,
+                    limit=min(20, _GECKO_BATCH_LIMIT),
+                )
+            self.last_refresh_ts = time.time()
+            logger.info(
+                "Cold index tail done (%d/%d enriched)",
+                sum(1 for e in self._tokens.values() if e.screened is not None),
+                len(self._tokens),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Cold index tail failed")
+
     async def ensure_ready(self, on_progress: ProgressCb | None = None) -> None:
-        """Block until the first cold build completes (used by a screen job)."""
+        """Block until the first cold wave completes (used by a screen job)."""
         if self.cold_started:
             return
-        if self._refreshing:
-            while self._refreshing and not self.cold_started:
-                await asyncio.sleep(0.5)
+        if not self._refreshing:
+            await self.refresh(full=True, on_progress=on_progress)
             return
-        await self.refresh(full=True, on_progress=on_progress)
+        # Background cold build in progress — wait, keep UI progress alive.
+        while not self.cold_started:
+            if not self._refreshing:
+                break
+            if on_progress:
+                enriched = sum(
+                    1 for e in self._tokens.values() if e.screened is not None
+                )
+                total = max(len(self._tokens), 1)
+                await on_progress(
+                    "index",
+                    f"Ждём индекс: {enriched}/{total} обогащено…",
+                    min(0.85, 0.05 + 0.8 * enriched / total),
+                )
+            await asyncio.sleep(1.0)
+        if not self.cold_started:
+            await self.refresh(full=True, on_progress=on_progress)
 
     async def run_refresh_loop(self) -> None:
         try:
@@ -614,7 +722,14 @@ class TokenIndex:
             entry.gecko_ath_at = time.time()
             if result.ath_mcap <= 0:
                 return
-            peak = max(entry.ath_mcap, result.ath_mcap)
+            prev = entry.ath_mcap
+            if (
+                prev >= 1_000_000_000.0
+                and result.ath_mcap > 0
+                and prev > result.ath_mcap * 50
+            ):
+                prev = 0.0
+            peak = max(prev, result.ath_mcap)
             entry.ath_mcap = peak
             if entry.screened is not None:
                 entry.screened = self._apply_ath(entry, entry.screened)
@@ -625,7 +740,13 @@ class TokenIndex:
 
     async def refresh_hot(self) -> int:
         """Force-enrich the hot-set for denser ATH sampling (DS + Gecko)."""
-        if self._hot_enriching or self._parse_active() or not self.cold_started:
+        if (
+            self._hot_enriching
+            or self._refreshing
+            or self._cold_tail_busy()
+            or self._parse_active()
+            or not self.cold_started
+        ):
             return 0
         addrs = self._hot_candidates()
         if not addrs:
@@ -702,6 +823,7 @@ class TokenIndex:
             "building": self.building,
             "cold_started": self.cold_started,
             "refreshing": self._refreshing,
+            "cold_tail": self._cold_tail_busy(),
             "last_tip": self.last_tip,
             "last_scan_ts": self.last_scan_ts,
             "last_refresh_ts": self.last_refresh_ts,

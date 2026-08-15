@@ -3,6 +3,7 @@ import './App.css'
 import ScreenerPage from './ScreenerPage'
 import WatchPage from './WatchPage'
 import FollowupPage from './FollowupPage'
+import HvatPage from './HvatPage'
 import SettingsPage from './SettingsPage'
 import MigrationsPage from './MigrationsPage'
 import { FilterPresets } from './FilterPresets'
@@ -86,7 +87,7 @@ type SortKey =
   | 'wallet_balance_eth'
   | 'hold_time_minutes'
   | 'tokens_traded_7d'
-type AppPage = 'buyers' | 'migrations' | 'screener' | 'watch' | 'followup' | 'settings'
+type AppPage = 'buyers' | 'migrations' | 'screener' | 'hvat' | 'watch' | 'followup' | 'settings'
 
 type WalletFilters = {
   min_wallet_balance_eth: string
@@ -830,6 +831,13 @@ export default function App() {
         </button>
         <button
           type="button"
+          className={page === 'hvat' ? 'nav-link active' : 'nav-link'}
+          onClick={() => setPage('hvat')}
+        >
+          Хвать
+        </button>
+        <button
+          type="button"
           className={page === 'watch' ? 'nav-link active' : 'nav-link'}
           onClick={() => setPage('watch')}
         >
@@ -861,11 +869,14 @@ export default function App() {
       <div hidden={page !== 'migrations'}>
         <MigrationsPage onParse={useInBuyers} />
       </div>
+      <div hidden={page !== 'hvat'}>
+        <HvatPage tabActive={page === 'hvat'} />
+      </div>
       <div hidden={page !== 'watch'}>
         <WatchPage />
       </div>
       <div hidden={page !== 'followup'}>
-        <FollowupPage />
+        <FollowupPage tabActive={page === 'followup'} />
       </div>
       <div hidden={page !== 'settings'}>
         <SettingsPage />

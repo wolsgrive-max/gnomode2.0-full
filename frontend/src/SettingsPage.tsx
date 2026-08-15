@@ -99,14 +99,14 @@ const DEFAULT_SCREEN: ScreenFiltersForm = {
 }
 
 const DEFAULT_WALLET: WalletFiltersForm = {
-  mcap_threshold: '15000',
+  mcap_threshold: '20000',
   exclude_honeypots: true,
   min_wallet_balance_eth: '',
   max_wallet_balance_eth: '',
   min_hold_time_minutes: '',
   max_hold_time_minutes: '',
-  min_tokens_traded_7d: '',
-  max_tokens_traded_7d: '',
+  min_tokens_traded_7d: '1',
+  max_tokens_traded_7d: '1',
 }
 
 function parseOpt(raw: string): number | null {
@@ -174,7 +174,7 @@ export default function SettingsPage() {
       })
       setWallet({
         ...DEFAULT_WALLET,
-        mcap_threshold: numToStr(cfg.wallet.mcap_threshold) || '15000',
+        mcap_threshold: numToStr(cfg.wallet.mcap_threshold) || '20000',
         exclude_honeypots: cfg.wallet.exclude_honeypots,
         min_wallet_balance_eth: numToStr(cfg.wallet.min_wallet_balance_eth),
         max_wallet_balance_eth: numToStr(cfg.wallet.max_wallet_balance_eth),
@@ -283,7 +283,7 @@ export default function SettingsPage() {
 
       if (syncFollowupMcap && baseFollowup) {
         const mcap =
-          parseOpt(wallet.mcap_threshold) ?? baseFollowup.max_mcap_alert ?? 15000
+          parseOpt(wallet.mcap_threshold) ?? baseFollowup.max_mcap_alert ?? 20000
         const fPayload = { ...baseFollowup, max_mcap_alert: mcap }
         const fRes = await fetch('/api/followup', {
           method: 'PUT',
