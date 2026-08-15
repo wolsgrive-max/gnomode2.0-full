@@ -1,0 +1,4 @@
+services:
+  gnomode:
+    extra_hosts:
+      - "host.docker.internal:172.18.0.3"

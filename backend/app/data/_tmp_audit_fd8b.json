@@ -1,0 +1,49 @@
+{
+  "ts": 1785884356.18312,
+  "wallet": "0xfd8bd978f198503a0ba9c5d7f7586e23fc4a4b40",
+  "followup": false,
+  "seen_hits": [],
+  "unique_30d": 1,
+  "bal": 0.029293108571537923,
+  "n_gmgn": 1,
+  "peak_nas": 244269.0,
+  "cur_mcap": 244269.0,
+  "nas_parsed": false,
+  "nas_in_index": false,
+  "buys": [
+    {
+      "token": "0x285ec8958774074cd924103d040fb92be9d2d42a",
+      "symbol": "MEATSPIN",
+      "ts": 1785849674,
+      "ts_fmt": "2026-08-04 13:21 UTC",
+      "cost": 129.90978,
+      "tx": "0x34b7547c88b9275828b6e87e340a10175c3b865c7004ab746536e0e5def556a6",
+      "method": null,
+      "price_usd": 1.651388881096517e-05,
+      "mcap_from_price": null,
+      "tx_mcap": 16682.81092725596,
+      "creator": false,
+      "launch": false,
+      "parsed": false,
+      "seen": false
+    }
+  ],
+  "reject": [
+    "unique_30d=1 PASS need [1.0,1.0]",
+    "bal=0.02929311 PASS (min=0.001)",
+    "tx_mcap=16683 vs th=30000.0 PASS",
+    "token MEATSPIN NEVER_PARSED"
+  ],
+  "raw": [
+    {
+      "method": null,
+      "ts": 1785849674,
+      "token": "0x285ec8958774074cd924103d040fb92be9d2d42a",
+      "symbol": "MEATSPIN",
+      "cost_usd": "129.90978",
+      "price_usd": "0.00001651388881096517",
+      "tx": "0x34b7547c88b9275828b6e87e340a10175c3b865c7004ab746536e0e5def556a6",
+      "is_open": 1
+    }
+  ]
+}

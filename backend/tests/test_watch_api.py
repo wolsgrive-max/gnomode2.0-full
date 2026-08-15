@@ -82,7 +82,7 @@ def test_get_put_watch(client):
     assert "last_tokens_qualified" in st
 
     res = c.get("/api/watch")
-    assert res.json()["screen"]["min_ath_mcap"] == 50_000.0
+    assert res.json()["screen"]["min_ath_mcap"] == 40_000.0
 
 
 def test_clear_seen(client):
@@ -93,6 +93,27 @@ def test_clear_seen(client):
     assert res.status_code == 200
     assert res.json()["ok"] is True
     assert store.seen_count() == 0
+
+
+def test_clear_pending(client):
+    c, store = client
+    store.apply_qualify_updates(
+        ath_updates={"0xabc": (55_000.0, "ABC"), "0xdef": (80_000.0, "DEF")},
+        held=[],
+        expired=[],
+        candidates=["0xabc", "0xdef"],
+        now=100.0,
+    )
+    assert len(store.load_pending_parse(min_ath_mcap=40_000)) == 2
+    res = c.post("/api/watch/clear-pending")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["ok"] is True
+    assert body["cleared"] == 2
+    assert body["pending_count"] == 0
+    hold = store.load_hold()
+    assert hold["0xabc"]["ath_mcap"] == 55_000.0
+    assert float(hold["0xabc"].get("queued_at") or 0) == 0.0
 
 
 def test_run_now_sets_force_flag(client):

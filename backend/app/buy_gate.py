@@ -28,14 +28,22 @@ _NON_BUY_METHODS = frozenset(
         "claim",
         "claimairdrop",
         "claimrewards",
+        "claimdividend",
+        "claimdividends",
+        "claimreward",
         "distribute",
         "distributetoken",
         "droptokens",
     }
 )
 
-# Launch-pad first acquisition (Pons ``launchToken``, etc.). GMGN labels these
-# as «Покупка»; product intent is the same as an early DEX buy @ low mcap.
+# 4-byte selectors for plain ERC-20 transfer / transferFrom (not DEX buys).
+_NON_BUY_SELECTORS = frozenset(
+    {
+        "0xa9059cbb",  # transfer(address,uint256)
+        "0x23b872dd",  # transferFrom(address,address,uint256)
+    }
+)
 # Do NOT include bare ``launch`` — that is token create + creator firstBuy
 # (selector 0x75154d70); GMGN does not list it as a buy (Хвать false positive).
 _LAUNCH_BUY_METHODS = frozenset(
@@ -140,7 +148,14 @@ def method_is_non_buy(method: object) -> bool:
     # Launch buys must never be treated as airdrops / mint noise.
     if method_is_launch_buy(m):
         return False
+    sel = _selector4(m)
+    if sel is not None and sel in _NON_BUY_SELECTORS:
+        return True
     if m.startswith("disperse") or m.startswith("airdrop") or m.startswith("distribute"):
+        return True
+    # Reflection / staking claims (claimDividend, claimRewards, …) are not buys.
+    # Bare prefix — avoids counting inbound claim credits toward unique-tokens.
+    if m.startswith("claim"):
         return True
     return m in {x.lower() for x in _NON_BUY_METHODS}
 
@@ -249,8 +264,13 @@ async def wallet_sent_quote_in_tx(wallet: str, tx_hash: str) -> bool | None:
     key = f"{tx}|{wl}"
     now = time.time()
     hit = _QUOTE_SPEND_CACHE.get(key)
-    if hit and now - hit[0] < (3600.0 if hit[1] is not None else 45.0):
-        return hit[1]
+    if hit:
+        age = now - hit[0]
+        # True: long TTL. False: short (indexer may still be catching up).
+        # None: short negative cache for transport blips.
+        ttl = 3600.0 if hit[1] is True else 45.0
+        if age < ttl:
+            return hit[1]
 
     from .blockscout import _get_json
 
@@ -264,8 +284,10 @@ async def wallet_sent_quote_in_tx(wallet: str, tx_hash: str) -> bool | None:
         if got and got[0] == 200:
             data = got[1]
             items = data.get("items") if isinstance(data, dict) else data
-            if not isinstance(items, list):
-                items = []
+            if not isinstance(items, list) or not items:
+                # Empty/odd 200 is often "not indexed yet", not confident False.
+                spent = None
+                break
             spent = False
             for tr in items:
                 tok = tr.get("token") or {}
@@ -285,6 +307,48 @@ async def wallet_sent_quote_in_tx(wallet: str, tx_hash: str) -> bool | None:
 
     _QUOTE_SPEND_CACHE[key] = (time.time(), spent)
     return spent
+
+
+def wallet_sent_quote_in_receipt(
+    wallet: str,
+    receipt: dict[str, Any] | None,
+) -> bool | None:
+    """On-chain quote spend from a tx receipt (no Blockscout).
+
+    ``True`` / ``False`` when receipt logs are present; ``None`` if receipt
+    missing/unusable. Prefer this over indexer for tip/pending classification.
+    """
+    if not isinstance(receipt, dict):
+        return None
+    logs = receipt.get("logs")
+    if not isinstance(logs, list) or not logs:
+        return None
+    from .constants import TRANSFER_TOPIC
+
+    wl = (wallet or "").strip().lower()
+    if not wl.startswith("0x"):
+        wl = "0x" + wl
+    wl_topic = "0x" + ("0" * 24) + wl[2:].zfill(40)[-40:]
+    xfer = TRANSFER_TOPIC.lower()
+    saw_any_transfer = False
+    for lg in logs:
+        if not isinstance(lg, dict):
+            continue
+        topics = lg.get("topics") or []
+        if not topics:
+            continue
+        t0 = str(topics[0] or "").lower()
+        if t0 != xfer or len(topics) < 3:
+            continue
+        saw_any_transfer = True
+        token = str(lg.get("address") or "").lower()
+        if token not in QUOTE_TOKENS:
+            continue
+        frm = str(topics[1] or "").lower()
+        if frm == wl_topic:
+            return True
+    # Receipt present with Transfer logs but wallet never sent quote.
+    return False if saw_any_transfer else None
 
 
 async def is_wallet_initiated_buy(item: dict[str, Any], wallet: str) -> bool:

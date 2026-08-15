@@ -63,18 +63,29 @@ def test_format_buyer_block_contains_links():
     assert "12.5" in text or "12.50" in text
 
 
-def test_format_followup_deal_honeypot_banner():
+def test_format_buyer_block_escapes_html():
+    buyer = _buyer()
+    buyer.token_symbol = "A<B>&C"
+    text = format_buyer_block(buyer)
+    assert "A&lt;B&gt;&amp;C" in text
+    assert "<B>" not in text
+
+
+def test_format_followup_deal_shows_name():
     from app.telegram import format_followup_deal
 
-    plain = format_followup_deal(
+    text = format_followup_deal(
         wallet="0xabc",
         token="0xdef",
-        token_symbol="SAFE",
+        token_symbol="CASHFROG",
+        token_name="Cash Frog",
         deal_index=2,
-        mcap_at_buy=5000,
+        mcap_at_buy=8000,
+        freshness="новое",
     )
-    assert "HONEYPOT" not in plain
-    assert "сделка #2" in plain
+    assert "CASHFROG · Cash Frog" in text
+    assert "сделка #2 · новое" in text
+    assert "TOKEN" not in text.replace("Token:", "")
 
     hp = format_followup_deal(
         wallet="0xabc",
@@ -84,11 +95,111 @@ def test_format_followup_deal_honeypot_banner():
         mcap_at_buy=8000,
         bought_usd=100,
         honeypot_reason="gmgn:honeypot",
+        freshness="из истории",
     )
     assert hp.index("HONEYPOT") < hp.index("сделка #3")
+    assert "сделка #3 · из истории" in hp
     assert "🔴" in hp
     assert "gmgn:honeypot" in hp
     assert hp.count("𝗛𝗢𝗡𝗘𝗬𝗣𝗢𝗧") >= 3
+
+
+def test_resolve_alert_freshness_live_vs_history():
+    from app.telegram import resolve_alert_freshness
+
+    now = 1_000_000.0
+    assert (
+        resolve_alert_freshness(
+            origin="live",
+            bought_at=now - 30,
+            block_number=100_000,
+            tip=100_010,
+            queued_at=now - 5,
+            now=now,
+        )
+        == "новое"
+    )
+    assert (
+        resolve_alert_freshness(
+            origin="live",
+            bought_at=now - 30,
+            block_number=100_000,
+            tip=100_010,
+            queued_at=now - 400,
+            now=now,
+        )
+        == "из истории"
+    )
+    assert (
+        resolve_alert_freshness(origin="pending_retry", now=now) == "из истории"
+    )
+    assert resolve_alert_freshness(origin=None, now=now) == "из истории"
+    # Tip-missed pending with a fresh buy must not force «из истории».
+    assert (
+        resolve_alert_freshness(
+            origin="pending",
+            bought_at=now - 60,
+            block_number=100_000,
+            tip=100_050,
+            queued_at=now - 10,
+            now=now,
+        )
+        == "новое"
+    )
+    assert (
+        resolve_alert_freshness(
+            origin="pending",
+            bought_at=now - 400,
+            block_number=100_000,
+            tip=100_050,
+            now=now,
+        )
+        == "из истории"
+    )
+    # Systemic catchup lag (~1k) must not relabel a seconds-old buy.
+    assert (
+        resolve_alert_freshness(
+            origin="pending",
+            bought_at=now - 30,
+            block_number=99_000,
+            tip=100_000,
+            now=now,
+        )
+        == "новое"
+    )
+    # Reconcile safety-net on a just-bought token → «новое», not «из истории».
+    assert (
+        resolve_alert_freshness(
+            origin="reconcile",
+            bought_at=now - 20,
+            block_number=100_000,
+            tip=100_100,
+            now=now,
+        )
+        == "новое"
+    )
+    # Even with multi-k catchup lag, fresh buy age still means «новое».
+    assert (
+        resolve_alert_freshness(
+            origin="reconcile",
+            bought_at=now - 20,
+            block_number=90_000,
+            tip=100_000,
+            now=now,
+        )
+        == "новое"
+    )
+    # Old buy via reconcile stays history.
+    assert (
+        resolve_alert_freshness(
+            origin="reconcile",
+            bought_at=now - 700,
+            block_number=90_000,
+            tip=100_000,
+            now=now,
+        )
+        == "из истории"
+    )
 
 
 def test_chunk_buyers_splits_large_batches():
@@ -116,6 +227,11 @@ def test_send_message_posts_telegram(monkeypatch):
 
     monkeypatch.setattr(settings, "telegram_bot_token", "bot-token")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot-token")
+    monkeypatch.setattr("app.synth_guard.refuse_telegram_if_unsafe", lambda: None)
+    # Reset shared client so FakeClient is used.
+    import app.telegram as tg
+
+    tg._tg_async_client = None
 
     calls: list[dict] = []
 
@@ -131,15 +247,16 @@ def test_send_message_posts_telegram(monkeypatch):
         def __init__(self, *a, **k):
             pass
 
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
+        @property
+        def is_closed(self):
             return False
 
         async def post(self, url, json=None):
             calls.append({"url": url, "json": json})
             return FakeResp()
+
+        async def aclose(self):
+            return None
 
     monkeypatch.setattr("app.telegram.httpx.AsyncClient", FakeClient)
     asyncio.run(send_message("12345", "<b>hi</b>", topic_id=7))
@@ -155,6 +272,10 @@ def test_send_buyers_returns_sent(monkeypatch):
 
     monkeypatch.setattr(settings, "telegram_bot_token", "bot-token")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot-token")
+    monkeypatch.setattr("app.synth_guard.refuse_telegram_if_unsafe", lambda: None)
+    import app.telegram as tg
+
+    tg._tg_async_client = None
 
     class FakeResp:
         status_code = 200
@@ -168,14 +289,15 @@ def test_send_buyers_returns_sent(monkeypatch):
         def __init__(self, *a, **k):
             pass
 
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
+        @property
+        def is_closed(self):
             return False
 
         async def post(self, url, json=None):
             return FakeResp()
+
+        async def aclose(self):
+            return None
 
     monkeypatch.setattr("app.telegram.httpx.AsyncClient", FakeClient)
     buyers = [_buyer(0), _buyer(1)]

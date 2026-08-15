@@ -1,0 +1,248 @@
+{
+  "ts": 1785879957.490546,
+  "filters": {
+    "wallet": {
+      "mcap_threshold": 30000.0,
+      "exclude_honeypots": false,
+      "min_wallet_balance_eth": 0.001,
+      "max_wallet_balance_eth": null,
+      "min_hold_time_minutes": null,
+      "max_hold_time_minutes": null,
+      "min_tokens_traded_7d": 1.0,
+      "max_tokens_traded_7d": 1.0,
+      "tokens_unique_period": "30d"
+    },
+    "screen": {
+      "min_ath_mcap": 50000.0,
+      "max_pair_age_hours": 24.0,
+      "exclude_honeypots": true,
+      "min_liq": 500.0
+    }
+  },
+  "shared_tokens": {
+    "0x51fb76be80ab6daaa345d818f4e06441816b4fea": [
+      "NASDANQ",
+      "NASDANQ"
+    ]
+  },
+  "wallets": [
+    {
+      "wallet": "0x7e84c2e64f77cafc7fd283c88d1bfb55b09be552",
+      "followup": null,
+      "deals": [],
+      "seen_hits": [],
+      "gmgn_ok": true,
+      "gmgn_rl": false,
+      "n_unique_gmgn": 1,
+      "n_unique_blockscout_period": 1,
+      "period": "30d",
+      "lookback_h": 720.0,
+      "balance_eth": 1.4853156000009e-05,
+      "reject_steps": [
+        "unique_30d=1 PASS",
+        "bal=0.000015<0.001 FAIL"
+      ],
+      "hypothesis": [
+        "NOT_in_followup",
+        "NOT_in_watch_seen",
+        "GMGN_unique_buys=1 ok for [1.0,1.0]",
+        "balance FAIL",
+        "token NASDANQ NOT_PARSED / no index peak"
+      ],
+      "buys": [
+        {
+          "token": "0x51fb76be80ab6daaa345d818f4e06441816b4fea",
+          "symbol": "NASDANQ",
+          "ts": 1785812024,
+          "ts_fmt": "2026-08-04 02:53 UTC",
+          "cost": 91.4717529,
+          "tx": "0xa3397fbe25ccdb715f6cee3059e8b9108c1e34232be0a30b00ff21875ddfa39c",
+          "method": null,
+          "creator_launch": false,
+          "flags": [],
+          "parsed": false,
+          "parsed_at": null,
+          "hold": false,
+          "seen": false,
+          "meta": {
+            "token": "0x51fb76be80ab6daaa345d818f4e06441816b4fea",
+            "index_err": "module 'app.token_index' has no attribute 'mcap_peaks'"
+          },
+          "ath_vs_min": {
+            "peak": null,
+            "min_ath": 50000.0,
+            "pass": null
+          },
+          "price_usd": 2.785053396276456e-05,
+          "mcap_threshold": 30000.0
+        }
+      ],
+      "raw_methods": {
+        "buy": null
+      },
+      "raw_sample": [
+        {
+          "et": "buy",
+          "method": null,
+          "ts": 1785812164,
+          "token": "0x51fb76be80ab6daaa345d818f4e06441816b4fea",
+          "symbol": "NASDANQ",
+          "cost_usd": "36.577332",
+          "price_usd": "0.00003135090030177778",
+          "tx": "0x83cceb43d477b139e3b53973a1ef537484cbda5f0f990b5679ef2181ad6d9ac7",
+          "from": "",
+          "to": "",
+          "launchpad": "pons"
+        },
+        {
+          "et": "buy",
+          "method": null,
+          "ts": 1785812164,
+          "token": "0x51fb76be80ab6daaa345d818f4e06441816b4fea",
+          "symbol": "NASDANQ",
+          "cost_usd": "36.577332",
+          "price_usd": "0.000031093893694434905",
+          "tx": "0x2b7ef011b6d8feb6f5088b3512ae67f7d554c85333470aa114e166142503aa86",
+          "from": "",
+          "to": "",
+          "launchpad": "pons"
+        },
+        {
+          "et": "buy",
+          "method": null,
+          "ts": 1785812024,
+          "token": "0x51fb76be80ab6daaa345d818f4e06441816b4fea",
+          "symbol": "NASDANQ",
+          "cost_usd": "91.4717529",
+          "price_usd": "0.00002785053396276456",
+          "tx": "0xa3397fbe25ccdb715f6cee3059e8b9108c1e34232be0a30b00ff21875ddfa39c",
+          "from": "",
+          "to": "",
+          "launchpad": "pons"
+        }
+      ]
+    },
+    {
+      "wallet": "0x6a7c99fab3b8008a5238e1280fee1ad75631e9ae",
+      "followup": null,
+      "deals": [],
+      "seen_hits": [],
+      "gmgn_ok": true,
+      "gmgn_rl": false,
+      "n_unique_gmgn": 1,
+      "n_unique_blockscout_period": 1,
+      "period": "30d",
+      "lookback_h": 720.0,
+      "balance_eth": 0.000124433998418895,
+      "reject_steps": [
+        "unique_30d=1 PASS",
+        "bal=0.000124<0.001 FAIL"
+      ],
+      "hypothesis": [
+        "NOT_in_followup",
+        "NOT_in_watch_seen",
+        "GMGN_unique_buys=1 ok for [1.0,1.0]",
+        "balance FAIL",
+        "token NASDANQ NOT_PARSED / no index peak"
+      ],
+      "buys": [
+        {
+          "token": "0x51fb76be80ab6daaa345d818f4e06441816b4fea",
+          "symbol": "NASDANQ",
+          "ts": 1785811994,
+          "ts_fmt": "2026-08-04 02:53 UTC",
+          "cost": 185.1104207957628,
+          "tx": "0x78c68d029ac10aea9bae3ebc4b4578e122b71f6eaed1de0d2a43c668d5234faa",
+          "method": null,
+          "creator_launch": false,
+          "flags": [],
+          "parsed": false,
+          "parsed_at": null,
+          "hold": false,
+          "seen": false,
+          "meta": {
+            "token": "0x51fb76be80ab6daaa345d818f4e06441816b4fea",
+            "index_err": "module 'app.token_index' has no attribute 'mcap_peaks'"
+          },
+          "ath_vs_min": {
+            "peak": null,
+            "min_ath": 50000.0,
+            "pass": null
+          },
+          "price_usd": 1.8525077963924883e-05,
+          "mcap_threshold": 30000.0
+        }
+      ],
+      "raw_methods": {
+        "buy": null
+      },
+      "raw_sample": [
+        {
+          "et": "buy",
+          "method": null,
+          "ts": 1785816145,
+          "token": "0x51fb76be80ab6daaa345d818f4e06441816b4fea",
+          "symbol": "NASDANQ",
+          "cost_usd": "95.4001719939114",
+          "price_usd": "0.00012361090000588667",
+          "tx": "0x26b068227599da0ac4873d40504a19a1d093e76285e21f8f5bc9d16a02ed72dc",
+          "from": "",
+          "to": "",
+          "launchpad": "pons"
+        },
+        {
+          "et": "buy",
+          "method": null,
+          "ts": 1785812160,
+          "token": "0x51fb76be80ab6daaa345d818f4e06441816b4fea",
+          "symbol": "NASDANQ",
+          "cost_usd": "36.577332",
+          "price_usd": "0.0000311642886447087",
+          "tx": "0xf993eb39bfc66e8297a61f18599f4924496c18d8d05c86aabd5a460e8fcb925d",
+          "from": "",
+          "to": "",
+          "launchpad": "pons"
+        },
+        {
+          "et": "buy",
+          "method": null,
+          "ts": 1785812160,
+          "token": "0x51fb76be80ab6daaa345d818f4e06441816b4fea",
+          "symbol": "NASDANQ",
+          "cost_usd": "36.577332",
+          "price_usd": "0.000030908049649321854",
+          "tx": "0x2de0a21f8d3eb99cbf0e32651dd7108c579600dfbcda7a2603e66eec4243db81",
+          "from": "",
+          "to": "",
+          "launchpad": "pons"
+        },
+        {
+          "et": "buy",
+          "method": null,
+          "ts": 1785812035,
+          "token": "0x51fb76be80ab6daaa345d818f4e06441816b4fea",
+          "symbol": "NASDANQ",
+          "cost_usd": "91.4609718",
+          "price_usd": "0.00003295661143706029",
+          "tx": "0x3adec9e06c6edb102e03ce9aa899f110dc24282dadf1c932e87fb22c2bcb5bac",
+          "from": "",
+          "to": "",
+          "launchpad": "pons"
+        },
+        {
+          "et": "buy",
+          "method": null,
+          "ts": 1785811994,
+          "token": "0x51fb76be80ab6daaa345d818f4e06441816b4fea",
+          "symbol": "NASDANQ",
+          "cost_usd": "185.1104207957628",
+          "price_usd": "0.000018525077963924883",
+          "tx": "0x78c68d029ac10aea9bae3ebc4b4578e122b71f6eaed1de0d2a43c668d5234faa",
+          "from": "",
+          "to": "",
+          "launchpad": "pons"
+        }
+      ]
+    }
+  ]
+}

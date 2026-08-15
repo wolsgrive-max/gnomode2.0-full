@@ -265,7 +265,13 @@ async def screen_tokens(
 
     await prog("index", "Preparing 24h token index…", 0.02)
     # Cold start blocks here (scan + enrich); warm starts return instantly.
-    await token_index.ensure_ready(on_progress=prog)
+    # Soft timeout: public RPC wall-timeouts must not crash Watch (Хвать).
+    try:
+        await asyncio.wait_for(token_index.ensure_ready(on_progress=prog), timeout=120.0)
+    except asyncio.TimeoutError:
+        logger.warning("token_index.ensure_ready timed out — screening warm pool")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("token_index.ensure_ready soft-fail: %s", exc)
 
     pool = token_index.get_tokens()
     await prog("filter", f"Filtering {len(pool)} tokens from last 24h…", 0.9)

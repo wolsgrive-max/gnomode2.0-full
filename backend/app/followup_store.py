@@ -958,12 +958,8 @@ class FollowupStore:
             return None
 
     def set_logwatch_cursor(self, block: int) -> None:
-        """Advance hist cursor monotonically — never regress under races."""
-        target = max(0, int(block))
-        cur = self.get_logwatch_cursor()
-        if cur is not None and target < int(cur):
-            return
-        self.set_meta("logwatch_cursor", str(target))
+        """Advance hist cursor monotonically (atomic MAX — no TOCTOU regress)."""
+        self._advance_meta_cursor("logwatch_cursor", block)
 
     def get_logwatch_live_cursor(self) -> int | None:
         """Tip-priority scan cursor (independent of historical catch-up)."""
@@ -976,12 +972,31 @@ class FollowupStore:
             return None
 
     def set_logwatch_live_cursor(self, block: int) -> None:
-        """Advance tip cursor monotonically — never regress under hist/live races."""
+        """Advance tip cursor monotonically (atomic MAX — no hist/live race)."""
+        self._advance_meta_cursor("logwatch_live_cursor", block)
+
+    def _advance_meta_cursor(self, key: str, block: int) -> None:
         target = max(0, int(block))
-        cur = self.get_logwatch_live_cursor()
-        if cur is not None and target < int(cur):
-            return
-        self.set_meta("logwatch_live_cursor", str(target))
+        self._ensure()
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE key=?", (key,)
+                ).fetchone()
+                cur = 0
+                if row is not None and row["value"] not in (None, ""):
+                    try:
+                        cur = max(0, int(row["value"]))
+                    except (TypeError, ValueError):
+                        cur = 0
+                if target < cur and row is not None:
+                    return
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, str(max(cur, target))),
+                )
+                conn.commit()
 
     def list_deals_needing_chain_backfill(self) -> list[dict[str, Any]]:
         """Deals with a tx_hash but missing block and/or bought_at."""

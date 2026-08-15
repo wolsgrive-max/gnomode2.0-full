@@ -159,8 +159,9 @@ async def test_fetch_screened_tokens_falls_back_local(
         return [ScreenedToken(address=ADDRESS, symbol="LOC")]
 
     monkeypatch.setattr(screener_feed, "screen_tokens_local", fake_local)
-    tokens = await screener_feed.fetch_screened_tokens(ScreenRequest())
-    assert tokens[0].symbol == "LOC"
+    feed = await screener_feed.fetch_screened_tokens(ScreenRequest())
+    assert feed.source == "local"
+    assert feed.tokens[0].symbol == "LOC"
 
 
 @pytest.mark.asyncio
@@ -171,20 +172,89 @@ async def test_fetch_screened_tokens_uses_remote(
         screener_feed.settings, "truegnomode_screener_url", "http://tg.test"
     )
 
-    async def boom(*args: Any, **kwargs: Any) -> list[ScreenedToken]:
-        del args, kwargs
-        raise AssertionError("local screener must not run")
+    async def fake_local(
+        req: ScreenRequest, on_progress=None
+    ) -> list[ScreenedToken]:
+        del req, on_progress
+        # Same token as remote — no extras; source stays truegnomode.
+        return [ScreenedToken(address=ADDRESS, symbol="LOC", liquidity_usd=100)]
 
     async def fake_remote(
         req: ScreenRequest, **kwargs: Any
     ) -> list[ScreenedToken]:
         del req, kwargs
-        return [ScreenedToken(address=ADDRESS, symbol="REM")]
+        return [ScreenedToken(address=ADDRESS, symbol="REM", liquidity_usd=8_000)]
 
-    monkeypatch.setattr(screener_feed, "screen_tokens_local", boom)
+    monkeypatch.setattr(screener_feed, "screen_tokens_local", fake_local)
     monkeypatch.setattr(screener_feed, "fetch_truegnomode_screen", fake_remote)
-    tokens = await screener_feed.fetch_screened_tokens(ScreenRequest())
-    assert tokens[0].symbol == "REM"
+    feed = await screener_feed.fetch_screened_tokens(ScreenRequest())
+    assert feed.source == "truegnomode"
+    assert feed.tokens[0].symbol == "REM"
+
+
+@pytest.mark.asyncio
+async def test_fetch_screened_tokens_remote_timeout_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        screener_feed.settings, "truegnomode_screener_url", "http://tg.test"
+    )
+
+    async def remote_timeout(*args: Any, **kwargs: Any) -> list[ScreenedToken]:
+        del args, kwargs
+        raise httpx.ConnectTimeout("donor down")
+
+    async def fake_local(
+        req: ScreenRequest, on_progress=None
+    ) -> list[ScreenedToken]:
+        del req, on_progress
+        return [ScreenedToken(address=ADDRESS, symbol="FALLBACK")]
+
+    monkeypatch.setattr(screener_feed, "fetch_truegnomode_screen", remote_timeout)
+    monkeypatch.setattr(screener_feed, "screen_tokens_local", fake_local)
+    feed = await screener_feed.fetch_screened_tokens(ScreenRequest())
+    assert feed.source == "local-fallback"
+    assert feed.tokens[0].symbol == "FALLBACK"
+
+
+@pytest.mark.asyncio
+async def test_fetch_screened_tokens_unions_local_on_remote_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Donor silent omission: local-only token still enters the feed."""
+    monkeypatch.setattr(
+        screener_feed.settings, "truegnomode_screener_url", "http://tg.test"
+    )
+    rem = "0x00000000000000000000000000000000000000b1"
+    loc = "0x00000000000000000000000000000000000000c1"
+
+    async def fake_remote(
+        req: ScreenRequest, **kwargs: Any
+    ) -> list[ScreenedToken]:
+        del req, kwargs
+        return [ScreenedToken(address=rem, symbol="REM", liquidity_usd=1_000)]
+
+    async def fake_local(
+        req: ScreenRequest, on_progress=None
+    ) -> list[ScreenedToken]:
+        del req, on_progress
+        return [
+            ScreenedToken(
+                address=loc,
+                symbol="FROGLET",
+                liquidity_usd=45_000,
+                market_cap=120_000,
+                ath_mcap=440_000,
+            )
+        ]
+
+    monkeypatch.setattr(screener_feed, "fetch_truegnomode_screen", fake_remote)
+    monkeypatch.setattr(screener_feed, "screen_tokens_local", fake_local)
+    feed = await screener_feed.fetch_screened_tokens(ScreenRequest())
+    assert feed.source == "truegnomode+local"
+    addrs = {t.address.lower() for t in feed.tokens}
+    assert rem.lower() in addrs
+    assert loc.lower() in addrs
 
 
 def test_using_remote_screener(monkeypatch: pytest.MonkeyPatch) -> None:

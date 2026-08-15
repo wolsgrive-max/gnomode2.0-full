@@ -35,6 +35,7 @@ from .constants import (
     V4_INITIALIZE_TOPIC,
     V4_SWAP_TOPIC,
     WETH,
+    WETH_USDG_V3_POOL,
     ZERO,
 )
 from .models import BuyerRow, ParseRequest, PoolInfo, TokenParseResult
@@ -50,6 +51,29 @@ ProgressCb = Callable[[str, str, float], Awaitable[None]]
 # permanently close the window — tokens often spike then dump (NASDANQ: ≥30k
 # for ~30s, then axiomTrade buys at ~18–28k ~1.6h later were missed).
 _MCAP_SUSTAINED_ABOVE_BLOCKS = 36_000  # ~1 hour continuous above threshold
+
+
+def _transfer_scan_bounds(
+    early_swaps: list,
+    *,
+    start_block: int,
+    end_block: int,
+    cushion: int = 5,
+) -> tuple[int, int]:
+    """Block range for Transfer logs needed to resolve ``early_swaps``.
+
+    Sticky mcap stop can sit ~36k blocks after the last under-threshold buy.
+    Transfers only exist in the early-buy txs — scanning the streak tail burns
+    RPC without adding wallets. Inclusive cushion covers same-tx edge ordering.
+    """
+    if not early_swaps:
+        return start_block, min(end_block, start_block)
+    blocks = [_log_block(lg) for lg in early_swaps]
+    lo = max(int(start_block), min(blocks))
+    hi = min(int(end_block), max(blocks) + max(0, int(cushion)))
+    if hi < lo:
+        hi = lo
+    return lo, hi
 
 
 def _mcap_above_streak(
@@ -97,11 +121,24 @@ _ETH_CACHE: dict[str, float] = {"price": 0.0, "ts": 0.0}
 _QUOTE_USD_CACHE: dict[str, dict[str, float]] = {}
 
 
-async def _eth_usd_price() -> float:
-    """Spot ETH/USD via DexScreener, cached ~60s."""
+async def _eth_usd_price(*, rpc: RpcClient | None = None) -> float:
+    """Spot ETH/USD from chain first, external APIs only as fallback."""
     now = time.time()
     if _ETH_CACHE["price"] > 0 and now - _ETH_CACHE["ts"] < 60:
         return _ETH_CACHE["price"]
+    try:
+        # New V4 launch alerts cannot wait for DexScreener indexing/rate-limit
+        # backoff. The canonical WETH/USDG V3 pool is available immediately via
+        # the same RPC and gives an indexer-free ETH/USD quote.
+        price_rpc = rpc or RpcClient()
+        c = price_rpc.v3_pool(WETH_USDG_V3_POOL)
+        slot0 = await price_rpc._call(lambda: c.functions.slot0().call())
+        eth = v3_price_from_sqrt(int(slot0[0]), True, 18, 6)
+        if 100 < eth < 100_000:
+            _ETH_CACHE.update(price=eth, ts=now)
+            return eth
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("On-chain ETH/USD lookup failed: %s", exc)
     try:
         from .chain import http_client
         url = f"{DEXSCREENER_API}/latest/dex/tokens/{WETH}"
@@ -160,9 +197,8 @@ async def _eth_usd_price() -> float:
 def quote_to_usd(quote_addr: str, eth_usd: float) -> float:
     """Return a quote's static USD multiplier.
 
-    Stablecoins and native/WETH can be resolved synchronously. Other routing
-    quotes (currently SPCX) require their own market price and intentionally
-    return zero here rather than being mispriced as ETH.
+    Stablecoins and native/WETH resolve synchronously. Unknown quotes return
+    zero rather than being mispriced as ETH.
     """
     meta = QUOTE_TOKENS.get(quote_addr.lower())
     if not meta:
@@ -410,11 +446,74 @@ def _log_block(log: dict[str, Any]) -> int:
     return _rpc_int(log.get("blockNumber"), 0)
 
 
+def _topic_currency(topic: str) -> str:
+    raw = str(topic or "").lower().removeprefix("0x")
+    addr = "0x" + raw[-40:]
+    return ZERO if int(addr, 16) == 0 else checksum(addr)
+
+
+def _v4_pool_from_receipt(
+    token: str,
+    logs: list[dict[str, Any]],
+) -> PoolInfo | None:
+    """Resolve a newly initialized V4 pool from the buy receipt itself.
+
+    Launch buys commonly initialize and swap in one transaction. Reading the
+    indexed Initialize topics avoids waiting for DexScreener or scanning any
+    historical range, and gives us currencies + poolId immediately.
+    """
+    token_l = token.lower()
+    swapped_ids: set[str] = set()
+    for log in logs:
+        if _log_addr(log) != UNI_V4_POOL_MANAGER.lower():
+            continue
+        topics = _log_topics(log)
+        if len(topics) > 1 and topics[0].lower() == V4_SWAP_TOPIC.lower():
+            swapped_ids.add(topics[1].lower())
+
+    candidates: list[PoolInfo] = []
+    for log in logs:
+        if _log_addr(log) != UNI_V4_POOL_MANAGER.lower():
+            continue
+        topics = _log_topics(log)
+        if len(topics) < 4 or topics[0].lower() != V4_INITIALIZE_TOPIC.lower():
+            continue
+        pool_id = topics[1].lower()
+        currency0 = _topic_currency(topics[2])
+        currency1 = _topic_currency(topics[3])
+        if token_l not in (currency0.lower(), currency1.lower()):
+            continue
+        quote = currency1 if currency0.lower() == token_l else currency0
+        q_meta = QUOTE_TOKENS.get(quote.lower())
+        if not q_meta:
+            continue
+        candidates.append(
+            PoolInfo(
+                address=checksum(UNI_V4_POOL_MANAGER),
+                dex="uniswap_v4",
+                quote=quote,
+                quote_symbol=str(q_meta.get("symbol") or "?"),
+                token0=currency0,
+                token1=currency1,
+                pool_id=pool_id,
+                created_block=_log_block(log),
+            )
+        )
+    if not candidates:
+        return None
+    return next(
+        (pool for pool in candidates if (pool.pool_id or "").lower() in swapped_ids),
+        candidates[0],
+    )
+
+
 @dataclass(frozen=True)
 class EntryAtTx:
     mcap: float | None = None
     bought_usd: float | None = None
     block: int = 0
+    token_symbol: str = ""
+    token_name: str = ""
 
 
 _ENTRY_AT_TX_CACHE: dict[str, tuple[float, EntryAtTx]] = {}
@@ -457,32 +556,48 @@ async def estimate_entry_at_tx(
         return val
 
     try:
-        receipts = await rpc.batch_get_receipts([txh])
+        # Receipt, ERC-20 metadata and ETH/USD are independent RPC reads.
+        # Starting them together removes ~8-12s of serial latency on a cold
+        # process, which is critical for same-block V4 launch alerts.
+        receipts, meta, eth_usd = await asyncio.gather(
+            rpc.batch_get_receipts([txh]),
+            rpc.token_meta(token),
+            _eth_usd_price(rpc=rpc),
+        )
         receipt = receipts.get(txh)
+        symbol = str(meta.get("symbol") or "").strip()
+        name = str(meta.get("name") or "").strip()
         if not receipt:
-            return _cache(empty)
+            return _cache(EntryAtTx(token_symbol=symbol, token_name=name))
         block = _rpc_int(receipt.get("blockNumber"), 0)
+        known = EntryAtTx(
+            block=block,
+            token_symbol=symbol,
+            token_name=name,
+        )
         logs = receipt.get("logs") or []
         if not logs:
-            return _cache(EntryAtTx(block=block) if block > 0 else empty)
+            return _cache(known)
 
-        pool = await pick_best_pool(rpc, token)
+        # New V4 pools are often initialized in this exact buy transaction.
+        # Resolve them from receipt topics before touching any external indexer.
+        pool = _v4_pool_from_receipt(token, logs)
+        if pool is None:
+            pool = await pick_best_pool(rpc, token)
         if not pool:
-            return _cache(EntryAtTx(block=block) if block > 0 else empty)
-        meta = await rpc.token_meta(token)
+            return _cache(known)
         decimals = int(meta.get("decimals") or 18)
         supply_raw = int(meta.get("total_supply_raw") or 0)
         supply_tokens = supply_raw / (10**decimals) if decimals >= 0 else 0.0
         if supply_tokens <= 0:
-            return _cache(EntryAtTx(block=block) if block > 0 else empty)
-        eth_usd = await _eth_usd_price()
+            return _cache(known)
         quote_usd = await _quote_usd_price(pool.quote, eth_usd)
         if quote_usd <= 0:
             logger.warning(
                 "estimate_entry_at_tx: %s/USD unavailable",
                 pool.quote_symbol or pool.quote,
             )
-            return _cache(EntryAtTx(block=block) if block > 0 else empty)
+            return _cache(known)
         quote_decimals = QUOTE_TOKENS.get(pool.quote.lower(), {}).get("decimals", 18)
         token_is_token0 = pool.token0.lower() == token.lower()
         pool_l = pool.address.lower()
@@ -629,6 +744,8 @@ async def estimate_entry_at_tx(
             mcap=best_mcap if best_mcap and best_mcap > 0 else None,
             bought_usd=best_bought if best_bought and best_bought > 0 else None,
             block=block,
+            token_symbol=symbol,
+            token_name=name,
         )
         return _cache(result)
     except Exception as exc:  # noqa: BLE001
@@ -646,6 +763,112 @@ async def estimate_mcap_at_tx(
     return (await estimate_entry_at_tx(token, tx_hash, rpc=rpc)).mcap
 
 
+_SPOT_MCAP_CACHE: dict[str, tuple[float, float | None]] = {}
+_SPOT_MCAP_TTL_SEC = 30.0
+# No supported pool discoverable (launch pad / not created yet). Pool
+# discovery costs ~5s, so cache the miss long enough that a per-cycle pending
+# retry does not re-run discovery for the same dead token every loop.
+_SPOT_MCAP_EMPTY_TTL_SEC = 300.0
+
+
+async def _resolve_quote_usd(
+    pool: PoolInfo,
+    *,
+    rpc: RpcClient | None = None,
+) -> float:
+    """USD per quote unit with WETH/USDG fallbacks (DexScreener may be cold)."""
+    eth_usd = await _eth_usd_price(rpc=rpc)
+    quote_usd = await _quote_usd_price(pool.quote, eth_usd)
+    if quote_usd > 0:
+        return quote_usd
+    q = pool.quote.lower()
+    if q in (WETH.lower(), ZERO.lower()) and eth_usd > 0:
+        return eth_usd
+    if q == USDG.lower():
+        return 1.0
+    return 0.0
+
+
+async def estimate_onchain_spot_mcap(
+    token: str,
+    *,
+    rpc: RpcClient | None = None,
+) -> float | None:
+    """Live mcap straight from chain state: pool reserves × supply × quote_usd.
+
+    Fallback for brand-new tokens DexScreener has not indexed yet and whose buy
+    tx replay yielded nothing. Reads current V2 ``getReserves``, V3 ``slot0``,
+    or V4 ``StateView.getSlot0`` over RPC (Alchemy), so it needs no third-party
+    price indexer. Spot ≈ entry for a deal recorded seconds after the buy, which
+    is enough to clear the alert gate.
+    """
+    tkey = (token or "").strip().lower()
+    if not tkey.startswith("0x"):
+        return None
+    now = time.time()
+    hit = _SPOT_MCAP_CACHE.get(tkey)
+    if hit:
+        cached_at, val = hit
+        ttl = _SPOT_MCAP_TTL_SEC if val is not None else _SPOT_MCAP_EMPTY_TTL_SEC
+        if now - cached_at < ttl:
+            return val
+
+    rpc = rpc or RpcClient()
+
+    def _cache(val: float | None) -> float | None:
+        _SPOT_MCAP_CACHE[tkey] = (now, val)
+        if len(_SPOT_MCAP_CACHE) > 2048:
+            ordered = sorted(_SPOT_MCAP_CACHE.items(), key=lambda kv: kv[1][0])
+            for k, _ in ordered[: len(ordered) // 2]:
+                _SPOT_MCAP_CACHE.pop(k, None)
+        return val
+
+    try:
+        pool, meta = await asyncio.gather(
+            pick_best_pool(rpc, token),
+            rpc.token_meta(token),
+        )
+        if not pool or pool.dex not in ("uniswap_v2", "uniswap_v3", "uniswap_v4"):
+            return _cache(None)
+        decimals = int(meta.get("decimals") or 18)
+        supply_raw = int(meta.get("total_supply_raw") or 0)
+        supply_tokens = supply_raw / (10**decimals) if decimals >= 0 else 0.0
+        if supply_tokens <= 0:
+            return _cache(None)
+        quote_usd = await _resolve_quote_usd(pool, rpc=rpc)
+        if quote_usd <= 0:
+            return _cache(None)
+        quote_decimals = QUOTE_TOKENS.get(pool.quote.lower(), {}).get("decimals", 18)
+        if pool.quote.lower() == ZERO.lower():
+            quote_decimals = 18
+        token_is_token0 = pool.token0.lower() == token.lower()
+
+        if pool.dex == "uniswap_v2":
+            c = rpc.v2_pair(pool.address)
+            r = await rpc._call(lambda: c.functions.getReserves().call())
+            price = v2_price_token_in_quote(
+                int(r[0]), int(r[1]), token_is_token0, decimals, quote_decimals
+            )
+        elif pool.dex == "uniswap_v3":
+            c = rpc.v3_pool(pool.address)
+            slot0 = await rpc._call(lambda: c.functions.slot0().call())
+            price = v3_price_from_sqrt(
+                int(slot0[0]), token_is_token0, decimals, quote_decimals
+            )
+        else:
+            if not pool.pool_id:
+                return _cache(None)
+            slot0 = await rpc.get_v4_slot0(pool.pool_id)
+            price = v3_price_from_sqrt(
+                int(slot0[0]), token_is_token0, decimals, quote_decimals
+            )
+        mcap = price * quote_usd * supply_tokens
+        return _cache(mcap if mcap and mcap > 0 else None)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("estimate_onchain_spot_mcap %s: %s", tkey[:12], exc)
+        return _cache(None)
+
+
 def is_excluded(addr: str, pool: str, extra: set[str] | None = None) -> bool:
     a = addr.lower()
     if a in KNOWN_ROUTERS or a == pool.lower():
@@ -653,6 +876,33 @@ def is_excluded(addr: str, pool: str, extra: set[str] | None = None) -> bool:
     if extra and a in extra:
         return True
     return False
+
+
+def _norm_tx_hash(tx: Any) -> str:
+    """Canonical ``0x`` + lowercase tx hash.
+
+    ``HexBytes.hex()`` omits the ``0x`` prefix; Alchemy rejects receipts without
+    it, which silently broke V4 Universal-Router buyer fallback.
+    """
+    if hasattr(tx, "hex") and not isinstance(tx, str):
+        s = tx.hex()
+    else:
+        s = str(tx)
+    s = s.lower()
+    if not s.startswith("0x"):
+        s = "0x" + s
+    return s
+
+
+def _transfer_from_ok(frm: str, pool_or_manager: str) -> bool:
+    """True if Transfer.from is the pool/manager or a known router hop.
+
+    V4 via Universal Router credits: PoolManager → UniversalRouter → EOA.
+    Matching only ``from==PoolManager`` keeps the intermediate hop and drops
+    the wallet credit.
+    """
+    a = frm.lower()
+    return a == pool_or_manager.lower() or a in KNOWN_ROUTERS
 
 
 async def parse_token(
@@ -663,7 +913,15 @@ async def parse_token(
     *,
     exclude_honeypots: bool = True,
     wallet_filters: ParseRequest | None = None,
+    apply_wallet_filters: bool = True,
+    include_launch: bool = True,
 ) -> TokenParseResult:
+    """Parse early buyers for one token.
+
+    ``apply_wallet_filters=False`` / ``include_launch=False`` let watch release
+    the parse slot before unique enrich / launch-pad scan so getLogs keeps
+    flowing on sibling workers (same completeness when the caller attaches them).
+    """
     async def prog(stage: str, message: str, percent: float) -> None:
         if on_progress:
             await on_progress(stage, message, percent)
@@ -671,29 +929,33 @@ async def parse_token(
     token = rpc.w3.to_checksum_address(token)
     await prog("meta", f"Loading token {token[:10]}…", 0.02)
 
+    # Parallel: honeypot (optional) + token meta + pool + ETH + tip.
+    # Honeypot latency often dominates bootstrap; overlapping saves a round-trip.
     if exclude_honeypots:
         await prog("security", "Checking honeypot (GMGN)…", 0.03)
-        reason = await honeypot_reason_for_token(token)
-        if reason:
-            meta = await rpc.token_meta(token)
-            return TokenParseResult(
-                token=token,
-                symbol=meta.get("symbol") or "",
-                name=meta.get("name") or "",
-                decimals=int(meta.get("decimals") or 18),
-                total_supply=0.0,
-                error=f"Honeypot skipped ({reason})",
-                stats={"honeypot": True, "honeypot_reason": reason},
-            )
 
-    # Parallel: token meta + pool discovery + ETH price + tip block
-    meta_task = asyncio.create_task(rpc.token_meta(token))
-    pool_task = asyncio.create_task(pick_best_pool(rpc, token))
-    eth_task = asyncio.create_task(_eth_usd_price())
-    tip_task = asyncio.create_task(rpc.block_number())
-    meta, pool, eth_usd, latest = await asyncio.gather(
-        meta_task, pool_task, eth_task, tip_task
+    async def _honeypot() -> str | None:
+        if not exclude_honeypots:
+            return None
+        return await honeypot_reason_for_token(token)
+
+    hp_reason, meta, pool, eth_usd, latest = await asyncio.gather(
+        _honeypot(),
+        rpc.token_meta(token),
+        pick_best_pool(rpc, token),
+        _eth_usd_price(rpc=rpc),
+        rpc.block_number(),
     )
+    if hp_reason:
+        return TokenParseResult(
+            token=token,
+            symbol=meta.get("symbol") or "",
+            name=meta.get("name") or "",
+            decimals=int(meta.get("decimals") or 18),
+            total_supply=0.0,
+            error=f"Honeypot skipped ({hp_reason})",
+            stats={"honeypot": True, "honeypot_reason": hp_reason},
+        )
 
     if not meta["symbol"]:
         bs = await fetch_token_info(token)
@@ -828,14 +1090,15 @@ async def parse_token(
     # Swap events — GMGN still labels them «Покупка». Merge under the same
     # mcap gate. Creator pad ``launch`` (create + firstBuy) is excluded — GMGN
     # does not treat those as buys.
-    # When Uniswap already yielded early buyers, skip the slow Blockscout
-    # launch supplement (RPC genesis window still runs).
-    try:
-        await prog("launch", "Scanning launch-pad acquisitions…", 0.82)
-        launch_buyers = await _discover_launch_buyers(
+    # When Uniswap already yielded enough early buyers, skip the slow Blockscout
+    # launch supplement (RPC genesis window still runs). Few Uniswap hits still
+    # allow BS so pad-only wallets are not missed.
+    if include_launch:
+        buyers = await attach_launch_buyers(
             rpc,
             token=token,
             pool=pool,
+            buyers=buyers,
             decimals=decimals,
             supply_tokens=supply_tokens,
             eth_usd=eth_usd,
@@ -843,26 +1106,18 @@ async def parse_token(
             start_block=start_block,
             end_block=latest,
             on_progress=prog,
-            skip_blockscout=bool(buyers),
         )
-        if launch_buyers:
-            before = len(buyers)
-            buyers = _merge_buyer_rows(buyers, launch_buyers)
-            await prog(
-                "launch",
-                f"Launch buyers +{len(buyers) - before} "
-                f"(total early {len(buyers)}; launch raw {len(launch_buyers)})",
-                0.84,
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Launch-buyer scan failed for %s: %s", token[:10], exc)
 
     for b in buyers:
         b.token_symbol = result.symbol
 
     buyers_found = len(buyers)
     await prog("replay", f"Early buyers under mcap: {buyers_found}", 0.85)
-    if wallet_filters is not None and buyers:
+    if (
+        apply_wallet_filters
+        and wallet_filters is not None
+        and buyers
+    ):
         buyers = await enrich_and_filter_buyers(
             rpc,
             token=token,
@@ -886,6 +1141,12 @@ async def parse_token(
         "buyers": len(buyers),
         "buyers_before_wallet_filters": buyers_found,
         "eth_usd": eth_usd,
+        "wallet_filters_pending": bool(
+            not apply_wallet_filters and wallet_filters is not None and buyers_found > 0
+        ),
+        "launch_pending": bool(not include_launch and not result.error),
+        "supply_tokens": supply_tokens,
+        "decimals": decimals,
     }
     if buyers_found != len(buyers):
         await prog(
@@ -913,147 +1174,217 @@ async def _replay_v2(
     mcap_threshold: float,
     on_progress: ProgressCb,
 ) -> list[BuyerRow]:
-    async def log_prog(frac: float, _a: int, _b: int) -> None:
-        await on_progress("logs", "Fetching Sync/Swap/Transfer logs…", 0.12 + 0.55 * frac)
+    """Stream V2 Sync+Swap until sticky mcap stop; Transfer only over early buys."""
+    import asyncio
 
-    # Fetch Sync, Swap, Transfer in parallel topic batches to reduce payload
-    sync_logs, swap_logs, xfer_logs = await _gather_three(
-        rpc.get_logs_chunked(
-            address=pool.address,
-            topics=[SYNC_TOPIC],
-            from_block=start_block,
-            to_block=end_block,
-            on_progress=log_prog,
-        ),
-        rpc.get_logs_chunked(
-            address=pool.address,
-            topics=[V2_SWAP_TOPIC],
-            from_block=start_block,
-            to_block=end_block,
-        ),
-        rpc.get_logs_chunked(
-            address=token,
-            topics=[TRANSFER_TOPIC, "0x" + "0" * 24 + pool.address.lower().replace("0x", "")],
-            from_block=start_block,
-            to_block=end_block,
-        ),
-    )
-
-    await on_progress("replay", "Replaying mcap timeline…", 0.72)
-
-    # Map block+tx → reserves after Sync (Sync usually before Swap in same tx)
-    # Build timeline of all events sorted by (block, logIndex)
-    events: list[tuple[int, int, str, Any]] = []
-    for log in sync_logs:
-        events.append((_log_block(log), _log_index(log), "sync", log))
-    for log in swap_logs:
-        events.append((_log_block(log), _log_index(log), "swap", log))
-    for log in xfer_logs:
-        events.append((_log_block(log), _log_index(log), "xfer", log))
-    events.sort(key=lambda x: (x[0], x[1]))
-
-    # Index transfers from pool by tx hash
-    xfers_by_tx: dict[str, list[Any]] = defaultdict(list)
-    for log in xfer_logs:
-        tx = log["transactionHash"]
-        txh = tx.hex() if isinstance(tx, bytes) else str(tx)
-        xfers_by_tx[txh.lower()].append(log)
-
+    target_chunk = min(max(settings.log_chunk_size, 40_000), 50_000)
+    chunk = target_chunk
+    ok_streak = 0
+    early_swaps: list[Any] = []
+    early_meta: dict[str, tuple[int, int, int, int, int, int, float]] = {}
+    pre_reserves_by_tx: dict[str, tuple[int, int]] = {}
     reserve0 = 0
     reserve1 = 0
     mcap = 0.0
     crossed = False
-    aggs: dict[str, WalletAgg] = {}
-    early_stop_block: int | None = None
-    # Uniswap V2 emits Sync *before* Swap in the same tx, with *post*-trade reserves.
-    # Stash pre-Sync reserves per tx so Swap mcap is entry (pre-buy), not post.
-    pre_reserves_by_tx: dict[str, tuple[int, int]] = {}
+    above_since: int | None = None
+    cursor = start_block
+    total = max(end_block - start_block + 1, 1)
 
-    for block, _idx, kind, log in events:
-        if kind == "sync":
-            data = log["data"]
-            new0 = decode_uint256(data, 0)
-            new1 = decode_uint256(data, 1)
-            tx = log["transactionHash"]
-            txh = (tx.hex() if isinstance(tx, bytes) else str(tx)).lower()
-            if reserve0 or reserve1:
-                pre_reserves_by_tx[txh] = (reserve0, reserve1)
-            reserve0, reserve1 = new0, new1
-            price = v2_price_token_in_quote(
-                reserve0, reserve1, token_is_token0, decimals, quote_decimals
-            )
-            mcap = price * quote_usd * supply_tokens
-            if mcap >= mcap_threshold and not crossed:
-                crossed = True
-                early_stop_block = block
-            continue
-
-        if kind != "swap":
-            continue
-
-        tx = log["transactionHash"]
-        txh = (tx.hex() if isinstance(tx, bytes) else str(tx)).lower()
-        data = log["data"]
-        amount0_in = decode_uint256(data, 0)
-        amount1_in = decode_uint256(data, 1)
-        amount0_out = decode_uint256(data, 2)
-        amount1_out = decode_uint256(data, 3)
-
-        r0, r1 = pre_reserves_by_tx.get(txh, (0, 0))
-        if not (r0 and r1) and (reserve0 or reserve1):
-            reversed_r = v2_reserves_before_swap(
-                reserve0, reserve1, amount0_in, amount1_in, amount0_out, amount1_out
-            )
-            if reversed_r:
-                r0, r1 = reversed_r
-            else:
-                r0, r1 = reserve0, reserve1
-        elif not (r0 and r1):
-            r0, r1 = reserve0, reserve1
-
-        price = v2_price_token_in_quote(
-            r0, r1, token_is_token0, decimals, quote_decimals
+    while cursor <= end_block and not crossed:
+        end = min(cursor + chunk - 1, end_block)
+        await on_progress(
+            "logs",
+            f"V2 Sync/Swap {cursor}–{end}…",
+            0.12 + 0.5 * ((cursor - start_block) / total),
         )
-        # Market level for threshold: pre-swap spot (not post-Sync).
-        mcap_now = price * quote_usd * supply_tokens if r0 and r1 else mcap
-
-        if r0 == 0 and r1 == 0:
-            continue
-        if mcap_now >= mcap_threshold:
-            crossed = True
-            continue
-
-        topics = log["topics"]
-        # topics[2] = `to` indexed
-        to_addr = topic_address(topics[2]) if len(topics) > 2 else ""
-
-        # Prefer Transfer from pool → real wallet
-        buyer = None
-        amount_raw = 0
-        for xfer in xfers_by_tx.get(txh, []):
-            xtopics = xfer["topics"]
-            if len(xtopics) < 3:
+        try:
+            sync_part, swap_part = await asyncio.gather(
+                rpc.get_logs(
+                    address=pool.address,
+                    topics=[SYNC_TOPIC],
+                    from_block=cursor,
+                    to_block=end,
+                ),
+                rpc.get_logs(
+                    address=pool.address,
+                    topics=[V2_SWAP_TOPIC],
+                    from_block=cursor,
+                    to_block=end,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            if chunk > 2_000 and any(
+                x in msg
+                for x in (
+                    "limit",
+                    "range",
+                    "too large",
+                    "response",
+                    "timed out",
+                    "timeout",
+                    "query",
+                )
+            ):
+                chunk = max(chunk // 2, 2_000)
+                ok_streak = 0
                 continue
-            frm = topic_address(xtopics[1])
-            to = topic_address(xtopics[2])
-            if frm.lower() != pool.address.lower():
+            raise
+
+        ok_streak += 1
+        if chunk < target_chunk and ok_streak >= 2:
+            chunk = min(target_chunk, max(chunk * 2, chunk + 2_000))
+            ok_streak = 0
+
+        events: list[tuple[int, int, str, Any]] = []
+        for log in sync_part or []:
+            events.append((_log_block(log), _log_index(log), "sync", log))
+        for log in swap_part or []:
+            events.append((_log_block(log), _log_index(log), "swap", log))
+        events.sort(key=lambda x: (x[0], x[1]))
+
+        for block, _idx, kind, log in events:
+            if kind == "sync":
+                data = log["data"]
+                new0 = decode_uint256(data, 0)
+                new1 = decode_uint256(data, 1)
+                txh = _norm_tx_hash(log["transactionHash"])
+                if reserve0 or reserve1:
+                    pre_reserves_by_tx[txh] = (reserve0, reserve1)
+                reserve0, reserve1 = new0, new1
+                price = v2_price_token_in_quote(
+                    reserve0, reserve1, token_is_token0, decimals, quote_decimals
+                )
+                mcap = price * quote_usd * supply_tokens
+                stop, above_since = _mcap_above_streak(
+                    mcap_now=mcap,
+                    threshold=mcap_threshold,
+                    block=block,
+                    above_since=above_since,
+                )
+                if stop:
+                    crossed = True
+                    break
                 continue
-            if is_excluded(to, pool.address):
-                # might be router — look for further hop? for v1 take swap `to` if EOA-like
+
+            tx = log["transactionHash"]
+            txh = _norm_tx_hash(tx)
+            data = log["data"]
+            amount0_in = decode_uint256(data, 0)
+            amount1_in = decode_uint256(data, 1)
+            amount0_out = decode_uint256(data, 2)
+            amount1_out = decode_uint256(data, 3)
+
+            r0, r1 = pre_reserves_by_tx.get(txh, (0, 0))
+            if not (r0 and r1) and (reserve0 or reserve1):
+                reversed_r = v2_reserves_before_swap(
+                    reserve0,
+                    reserve1,
+                    amount0_in,
+                    amount1_in,
+                    amount0_out,
+                    amount1_out,
+                )
+                if reversed_r:
+                    r0, r1 = reversed_r
+                    pre_reserves_by_tx[txh] = (r0, r1)
+                else:
+                    r0, r1 = reserve0, reserve1
+            elif not (r0 and r1):
+                r0, r1 = reserve0, reserve1
+
+            if r0 == 0 and r1 == 0:
                 continue
-            buyer = to
-            amount_raw = decode_uint256(xfer["data"], 0)
+            price = v2_price_token_in_quote(
+                r0, r1, token_is_token0, decimals, quote_decimals
+            )
+            mcap_now = price * quote_usd * supply_tokens
+            stop, above_since = _mcap_above_streak(
+                mcap_now=mcap_now,
+                threshold=mcap_threshold,
+                block=block,
+                above_since=above_since,
+            )
+            if stop:
+                crossed = True
+                break
+            if mcap_now >= mcap_threshold:
+                continue
+            early_meta[txh] = (
+                amount0_in,
+                amount1_in,
+                amount0_out,
+                amount1_out,
+                r0,
+                r1,
+                mcap_now,
+            )
+            early_swaps.append(log)
+
+        if crossed:
             break
+        cursor = end + 1
 
-        if buyer is None:
-            if is_excluded(to_addr, pool.address):
-                continue
+    if not early_swaps:
+        await on_progress("replay", "No buys under mcap threshold", 0.9)
+        return []
+
+    xfer_from, xfer_to = _transfer_scan_bounds(
+        early_swaps, start_block=start_block, end_block=end_block
+    )
+    await on_progress(
+        "logs",
+        f"Fetching transfers {xfer_from}–{xfer_to}…",
+        0.7,
+    )
+    xfer_logs = await rpc.get_logs_chunked(
+        address=token,
+        topics=[
+            TRANSFER_TOPIC,
+            "0x" + "0" * 24 + pool.address.lower().replace("0x", ""),
+        ],
+        from_block=xfer_from,
+        to_block=xfer_to,
+        chunk_size=chunk,
+    )
+    xfers_by_tx: dict[str, list[Any]] = defaultdict(list)
+    for log in xfer_logs:
+        txh = _norm_tx_hash(log["transactionHash"])
+        xfers_by_tx[txh].append(log)
+
+    await on_progress("replay", f"Resolving {len(early_swaps)} buyers…", 0.85)
+    # Same EOA hop-walk as V3/V4: pool→helper-contract→EOA must not attribute
+    # the intermediate contract (Хвать false positive on relay wallets).
+    buyers_map = await _resolve_buyers_batch(
+        rpc,
+        token=token,
+        pool_or_manager=pool.address,
+        early_swaps=early_swaps,
+        xfers_by_tx=xfers_by_tx,
+    )
+    aggs: dict[str, WalletAgg] = {}
+    for log in early_swaps:
+        txh = _norm_tx_hash(log["transactionHash"])
+        packed = early_meta.get(txh)
+        if not packed:
+            continue
+        (
+            amount0_in,
+            amount1_in,
+            amount0_out,
+            amount1_out,
+            r0,
+            r1,
+            mcap_now,
+        ) = packed
+        resolved = buyers_map.get(txh)
+        if not resolved:
+            continue
+        buyer, amount_raw = resolved
+        if amount_raw <= 0:
             amount_raw = amount0_out if token_is_token0 else amount1_out
-            if amount_raw == 0:
-                continue
-            buyer = to_addr
-
-        if amount_raw == 0:
+        if amount_raw <= 0:
             continue
 
         amount_tokens = amount_raw / (10**decimals)
@@ -1069,7 +1400,6 @@ async def _replay_v2(
             supply_tokens=supply_tokens,
             spot_mcap=mcap_now,
         )
-
         _record_buy(
             aggs,
             wallet=buyer,
@@ -1077,11 +1407,9 @@ async def _replay_v2(
             amount_usd=amount_usd,
             mcap=buy_mcap,
             tx=txh,
-            block=block,
+            block=_log_block(log),
         )
 
-    # Optional early stop note
-    _ = early_stop_block
     if aggs:
         skip = await _creator_launch_tx_hashes(
             rpc, [a.first_tx for a in aggs.values() if a.first_tx]
@@ -1095,18 +1423,14 @@ async def _replay_v2(
     return _aggs_to_rows(aggs, token, "")
 
 
-async def _gather_three(a, b, c):
-    import asyncio
-
-    return await asyncio.gather(a, b, c)
-
-
 async def _creator_launch_tx_hashes(
     rpc: RpcClient, tx_hashes: list[str]
 ) -> set[str]:
     """Return hashes whose outer call is pad ``launch`` (create, not a buy)."""
     out: set[str] = set()
-    uniq = [h for h in dict.fromkeys(str(x).lower() for x in tx_hashes if x)]
+    uniq = list(
+        dict.fromkeys(_norm_tx_hash(x) for x in tx_hashes if x)
+    )
     if not uniq:
         return out
     calls = [("eth_getTransactionByHash", [h]) for h in uniq]
@@ -1145,22 +1469,24 @@ async def _resolve_buyers_batch(
     addrs_to_check: list[str] = []
 
     for log in early_swaps:
-        tx = log["transactionHash"]
-        txh = (tx.hex() if isinstance(tx, bytes) else str(tx)).lower()
+        txh = _norm_tx_hash(log["transactionHash"])
         cands: list[tuple[int, str, int]] = []
-        for xfer in xfers_by_tx.get(txh, []):
+        # Look up both normalized and legacy (no-0x) keys — callers may still
+        # build the map before migrating to ``_norm_tx_hash``.
+        xfer_rows = xfers_by_tx.get(txh) or xfers_by_tx.get(txh[2:]) or []
+        for xfer in xfer_rows:
             xt = xfer["topics"]
             if len(xt) < 3:
                 continue
             frm = topic_address(xt[1])
             to = topic_address(xt[2])
-            if frm.lower() != pool_or_manager.lower():
+            if not _transfer_from_ok(frm, pool_or_manager):
                 continue
             if is_excluded(to, pool_or_manager):
                 continue
             cands.append((int(xfer["logIndex"]), to, decode_uint256(xfer["data"], 0)))
             addrs_to_check.append(to)
-        # swap recipient (V3 topics[2])
+        # swap recipient (V3 topics[2]); V4 topics[2] is usually Universal Router
         if len(log.get("topics") or []) > 2:
             recip = topic_address(log["topics"][2])
             if not is_excluded(recip, pool_or_manager):
@@ -1209,10 +1535,13 @@ async def _resolve_buyers_batch(
                 if is_excluded(to, pool_or_manager):
                     continue
                 amt = decode_uint256(lg.get("data") or "0x0", 0)
-                idx = int(lg.get("logIndex") or lg.get("log_index") or 0)
-                # logIndex may be hex string from raw JSON-RPC
-                if isinstance(lg.get("logIndex"), str):
-                    idx = int(lg["logIndex"], 16)
+                raw_idx = lg.get("logIndex")
+                if raw_idx is None:
+                    raw_idx = lg.get("log_index") or 0
+                if isinstance(raw_idx, str):
+                    idx = int(raw_idx, 16) if raw_idx.startswith(("0x", "0X")) else int(raw_idx)
+                else:
+                    idx = int(raw_idx or 0)
                 chain.append((idx, to, amt))
                 more_addrs.append(to)
             chains[txh] = chain
@@ -1279,7 +1608,11 @@ async def _replay_v3(
     """Stream V3 swaps until mcap crosses threshold; record EOA buyers only."""
     # Start with a modest window: the RPC caps ~10k logs/query and times out on
     # very large ranges. Smaller windows avoid the slow Blockscout fallback.
-    chunk = min(max(settings.log_chunk_size, 40_000), 50_000)
+    # After timeouts we shrink; after consecutive OK windows we grow back so a
+    # single bad range does not permanently crawl at 2k for the rest of the scan.
+    target_chunk = min(max(settings.log_chunk_size, 40_000), 50_000)
+    chunk = target_chunk
+    ok_streak = 0
     early_swaps: list[Any] = []
     stop_block = start_block
     crossed = False
@@ -1309,8 +1642,14 @@ async def _replay_v3(
                 for x in ("limit", "range", "too large", "response", "timed out", "timeout", "query")
             ):
                 chunk = max(chunk // 2, 2_000)
+                ok_streak = 0
                 continue
             raise
+
+        ok_streak += 1
+        if chunk < target_chunk and ok_streak >= 2:
+            chunk = min(target_chunk, max(chunk * 2, chunk + 2_000))
+            ok_streak = 0
 
         part.sort(key=lambda lg: (_log_block(lg), _log_index(lg)))
         for log in part:
@@ -1361,19 +1700,25 @@ async def _replay_v3(
         await on_progress("replay", "No buys under mcap threshold", 0.9)
         return []
 
-    xfer_to = min(end_block, stop_block + 5)
-    await on_progress("logs", f"Fetching transfers ≤ block {xfer_to}…", 0.7)
+    xfer_from, xfer_to = _transfer_scan_bounds(
+        early_swaps, start_block=start_block, end_block=end_block
+    )
+    await on_progress(
+        "logs",
+        f"Fetching transfers {xfer_from}–{xfer_to}…",
+        0.7,
+    )
     xfer_logs = await rpc.get_logs_chunked(
         address=token,
         topics=[TRANSFER_TOPIC, "0x" + "0" * 24 + pool.address.lower().replace("0x", "")],
-        from_block=start_block,
+        from_block=xfer_from,
         to_block=xfer_to,
         chunk_size=chunk,
     )
     xfers_by_tx: dict[str, list[Any]] = defaultdict(list)
     for log in xfer_logs:
         tx = log["transactionHash"]
-        txh = (tx.hex() if isinstance(tx, bytes) else str(tx)).lower()
+        txh = _norm_tx_hash(tx)
         xfers_by_tx[txh].append(log)
 
     await on_progress("replay", f"Resolving {len(early_swaps)} buyers…", 0.85)
@@ -1417,7 +1762,7 @@ async def _replay_v3(
         token_out = -token_delta if token_delta < 0 else 0
         block = _log_block(log)
         tx = log["transactionHash"]
-        txh = (tx.hex() if isinstance(tx, bytes) else str(tx)).lower()
+        txh = _norm_tx_hash(tx)
         resolved = buyers_map.get(txh)
         if not resolved:
             continue
@@ -1476,7 +1821,11 @@ async def _replay_v4(
     manager = checksum(UNI_V4_POOL_MANAGER)
     # Start with a modest window: the RPC caps ~10k logs/query and times out on
     # very large ranges. Smaller windows avoid the slow Blockscout fallback.
-    chunk = min(max(settings.log_chunk_size, 40_000), 50_000)
+    # Grow back after consecutive OK windows (same as V3) so one timeout does
+    # not crawl the rest of the pump at min chunk.
+    target_chunk = min(max(settings.log_chunk_size, 40_000), 50_000)
+    chunk = target_chunk
+    ok_streak = 0
 
     early_swaps: list[Any] = []
     stop_block = start_block
@@ -1507,8 +1856,14 @@ async def _replay_v4(
                 for x in ("limit", "range", "too large", "response", "timed out", "timeout", "query")
             ):
                 chunk = max(chunk // 2, 2_000)
+                ok_streak = 0
                 continue
             raise
+
+        ok_streak += 1
+        if chunk < target_chunk and ok_streak >= 2:
+            chunk = min(target_chunk, max(chunk * 2, chunk + 2_000))
+            ok_streak = 0
 
         part.sort(key=lambda lg: (_log_block(lg), _log_index(lg)))
         for log in part:
@@ -1562,8 +1917,14 @@ async def _replay_v4(
         await on_progress("replay", "No buys under mcap threshold", 0.9)
         return []
 
-    xfer_to = min(end_block, stop_block + 5)
-    await on_progress("logs", f"Fetching transfers ≤ block {xfer_to}…", 0.7)
+    xfer_from, xfer_to = _transfer_scan_bounds(
+        early_swaps, start_block=start_block, end_block=end_block
+    )
+    await on_progress(
+        "logs",
+        f"Fetching transfers {xfer_from}–{xfer_to}…",
+        0.7,
+    )
     router_froms = [
         manager,
         checksum(UNIVERSAL_ROUTER),
@@ -1577,7 +1938,7 @@ async def _replay_v4(
         return await rpc.get_logs_chunked(
             address=token,
             topics=[TRANSFER_TOPIC, "0x" + "0" * 24 + frm.lower().replace("0x", "")],
-            from_block=start_block,
+            from_block=xfer_from,
             to_block=xfer_to,
             chunk_size=chunk,
         )
@@ -1587,7 +1948,7 @@ async def _replay_v4(
     for batch in xfer_batches:
         for log in batch:
             tx = log["transactionHash"]
-            txh = (tx.hex() if isinstance(tx, bytes) else str(tx)).lower()
+            txh = _norm_tx_hash(tx)
             xfers_by_tx[txh].append(log)
 
     await on_progress("replay", f"Resolving {len(early_swaps)} buyers…", 0.85)
@@ -1636,7 +1997,7 @@ async def _replay_v4(
         token_out = token_delta if token_delta > 0 else 0
         block = _log_block(log)
         tx = log["transactionHash"]
-        txh = (tx.hex() if isinstance(tx, bytes) else str(tx)).lower()
+        txh = _norm_tx_hash(tx)
         resolved = buyers_map.get(txh)
         if not resolved:
             continue
@@ -1784,6 +2145,61 @@ async def _tx_native_value_wei(
         return int(got[1].get("value") or 0)
     except (TypeError, ValueError):
         return None
+
+
+async def attach_launch_buyers(
+    rpc: RpcClient,
+    *,
+    token: str,
+    pool: PoolInfo,
+    buyers: list[BuyerRow],
+    decimals: int,
+    supply_tokens: float,
+    eth_usd: float,
+    mcap_threshold: float,
+    start_block: int,
+    end_block: int,
+    on_progress: ProgressCb | None = None,
+) -> list[BuyerRow]:
+    """Merge launch-pad early buyers into an Uniswap early-buyer list.
+
+    Safe to run outside the watch parse semaphore — same merge / BS-skip rules
+    as the in-``parse_token`` path.
+    """
+    async def prog(stage: str, message: str, percent: float) -> None:
+        if on_progress:
+            await on_progress(stage, message, percent)
+
+    try:
+        await prog("launch", "Scanning launch-pad acquisitions…", 0.82)
+        from .watch_qualify import LAUNCH_BS_SKIP_MIN_UNISWAP_BUYERS
+
+        skip_bs = len(buyers) >= max(1, int(LAUNCH_BS_SKIP_MIN_UNISWAP_BUYERS))
+        launch_buyers = await _discover_launch_buyers(
+            rpc,
+            token=token,
+            pool=pool,
+            decimals=decimals,
+            supply_tokens=supply_tokens,
+            eth_usd=eth_usd,
+            mcap_threshold=mcap_threshold,
+            start_block=start_block,
+            end_block=end_block,
+            on_progress=prog,
+            skip_blockscout=skip_bs,
+        )
+        if launch_buyers:
+            before = len(buyers)
+            buyers = _merge_buyer_rows(buyers, launch_buyers)
+            await prog(
+                "launch",
+                f"Launch buyers +{len(buyers) - before} "
+                f"(total early {len(buyers)}; launch raw {len(launch_buyers)})",
+                0.84,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Launch-buyer scan failed for %s: %s", token[:10], exc)
+    return buyers
 
 
 async def _discover_launch_buyers(

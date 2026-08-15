@@ -124,14 +124,18 @@ def reset_rpc_semaphores(*, scope: str | None = None) -> int:
     return len(keys)
 
 
-def reset_followup_rpc_pressure() -> int:
-    """Clear followup + live + shared sems after hung getLogs/block_number.
+def reset_followup_rpc_pressure(*, include_shared: bool = False) -> int:
+    """Clear followup (+ optional shared) sems after hung getLogs/block_number.
 
-    Hist/live often starve while ``shared`` (token_index etc.) holds slots;
-    resetting only ``followup`` left the process wedged on shared wall-timeouts.
+    Default: only ``followup`` / ``followup_live`` so a hist soft-fail does not
+    kick watch mid-parse. Pass ``include_shared=True`` on watchdog hang when
+    shared slots are known wedged.
     """
     cleared = 0
-    for scope in ("followup", "followup_live", "shared"):
+    scopes = ("followup", "followup_live")
+    if include_shared:
+        scopes = ("followup", "followup_live", "shared")
+    for scope in scopes:
         cleared += reset_rpc_semaphores(scope=scope)
     return cleared
 
@@ -244,6 +248,13 @@ class CallRevert(Exception):
     def __init__(self, message: str, data: str | None = None):
         super().__init__(message)
         self.data = data
+
+
+class RpcSemBusy(TimeoutError):
+    """Scoped RPC semaphore acquire timed out (contended pool)."""
+
+    def __init__(self, message: str = "RPC semaphore busy"):
+        super().__init__(message)
 
 
 def http_client() -> httpx.AsyncClient:
@@ -369,13 +380,12 @@ class RpcClient:
                 delay = 0.5
                 try:
                     await asyncio.wait_for(self._sem.acquire(), timeout=8.0)
-                except TimeoutError as exc:
-                    last_exc = exc
-                    logger.warning(
-                        "RPC sem busy on %s scope=%s — failover/retry",
-                        self.active_rpc_label(),
-                        self._sem_scope,
+                except TimeoutError:
+                    last_exc = RpcSemBusy(
+                        f"RPC sem busy on {self.active_rpc_label()} "
+                        f"scope={self._sem_scope} (acquire>8s)"
                     )
+                    logger.warning("%s — failover/retry", last_exc)
                     break
                 try:
                     try:
@@ -383,13 +393,12 @@ class RpcClient:
                             coro_factory(), timeout=call_timeout
                         )
                     except TimeoutError as exc:
-                        last_exc = exc
-                        logger.warning(
-                            "RPC wall-timeout %.0fs on %s scope=%s",
-                            call_timeout,
-                            self.active_rpc_label(),
-                            self._sem_scope,
+                        last_exc = TimeoutError(
+                            f"RPC wall-timeout {call_timeout:.0f}s on "
+                            f"{self.active_rpc_label()} scope={self._sem_scope}"
                         )
+                        last_exc.__cause__ = exc
+                        logger.warning("%s", last_exc)
                         break
                     except CallRevert:
                         raise
@@ -420,7 +429,12 @@ class RpcClient:
         raise last_exc
 
     async def _jsonrpc_batch(self, calls: list[tuple[str, list[Any]]]) -> list[Any]:
-        """Fire a JSON-RPC batch; returns results in order (None on per-item error)."""
+        """Fire a JSON-RPC batch; returns results in order (None on per-item error).
+
+        Uses ``_call_light`` — must not wait behind eth_getLogs slots.
+        ``tx_from_and_input`` / buys_only classification hangs otherwise and
+        tip alerts starve in the pending requeue loop (unknown tx.from).
+        """
         if not calls:
             return []
 
@@ -438,8 +452,6 @@ class RpcClient:
                 )
             start_id = payload[0]["id"]
 
-            # Sem is already held by _call — do NOT acquire again (deadlock
-            # when concurrency slots are saturated by concurrent batch calls).
             r = await http_client().post(self.rpc_url, json=payload)
             r.raise_for_status()
             data = r.json()
@@ -458,10 +470,67 @@ class RpcClient:
                     out.append(item.get("result"))
             return out
 
-        return await self._call(do_post, retries=6)
+        # Batches are small (≤40) but latency-sensitive for tip alerts.
+        return await self._call_light(do_post, timeout=12.0, retries=3)
 
     async def block_number(self) -> int:
-        return await self._call(lambda: self.w3.eth.block_number)
+        """Tip health must not wait behind eth_getLogs / wedged web3 sessions.
+
+        ``_call`` shares the scoped semaphore with getLogs — under a 500+
+        wallet soft_partial wave those slots stay held for 8–15s and
+        ``eth_blockNumber`` times out → tip declared dead for hours while
+        getLogs itself still runs. Direct httpx JSON-RPC also bypasses the
+        shared AsyncHTTPProvider pool that getLogs saturates.
+        """
+
+        async def _eth_block_number() -> int:
+            self._rpc_id += 1
+            payload = {
+                "jsonrpc": "2.0",
+                "id": self._rpc_id,
+                "method": "eth_blockNumber",
+                "params": [],
+            }
+            r = await http_client().post(self.rpc_url, json=payload)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) and data.get("error"):
+                raise RuntimeError(str(data["error"]))
+            raw = data.get("result") if isinstance(data, dict) else None
+            if raw is None:
+                raise RuntimeError("eth_blockNumber empty result")
+            return int(raw, 0) if isinstance(raw, str) else int(raw)
+
+        return await self._call_light(_eth_block_number, timeout=4.0, retries=2)
+
+    async def _call_light(self, coro_factory, *, timeout: float = 6.0, retries: int = 3):
+        """RPC without the getLogs concurrency semaphore (block_number etc.)."""
+        last_exc: Exception | None = None
+        urls_tried = 0
+        max_url_rounds = max(1, len(self._urls))
+        call_timeout = max(2.0, float(timeout))
+        while urls_tried < max_url_rounds:
+            urls_tried += 1
+            for attempt in range(max(1, int(retries))):
+                try:
+                    return await asyncio.wait_for(
+                        coro_factory(), timeout=call_timeout
+                    )
+                except CallRevert:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    if not _is_retryable(exc):
+                        raise
+                    if _should_failover(exc):
+                        break
+                    if attempt >= retries - 1:
+                        break
+                    await asyncio.sleep(_retry_delay(exc, attempt, base=0.2))
+            if not self._rotate_url(last_exc or RuntimeError("rpc light failed")):
+                break
+        assert last_exc
+        raise last_exc
 
     def erc20(self, address: str) -> AsyncContract:
         return self.w3.eth.contract(address=checksum(address), abi=ERC20_ABI)
@@ -564,13 +633,18 @@ class RpcClient:
             params["address"] = checksum(address)
 
         # Isolated per-URL attempts (do NOT mutate self.rpc_url / self.w3).
-        # Alchemy frequently returns HTTP 400 for eth_getLogs (especially
-        # address-less or large windows); try non-Alchemy endpoints first.
+        # Address-less / wide Transfer OR topics: Alchemy often 400s → public
+        # first. Addressed factory PairCreated/PoolCreated: Alchemy is faster
+        # and more reliable than public Robinhood RPC (100k windows timed out).
         # Parallel token_index / logwatch callers share this client — mutating
         # the active URL under them caused public↔Alchemy oscillation.
+        addressed = bool(address)
         urls = sorted(
             self._urls,
-            key=lambda u: (1 if self._is_alchemy_url(u) else 0, u),
+            key=lambda u: (
+                (0 if self._is_alchemy_url(u) else 1) if addressed else (1 if self._is_alchemy_url(u) else 0),
+                u,
+            ),
         )
         last_exc: Exception | None = None
         for url in urls:
@@ -681,11 +755,31 @@ class RpcClient:
                     cur = end + 1
                 except Exception as exc:  # noqa: BLE001
                     msg = str(exc).lower()
-                    if local_chunk > 500 and any(
-                        x in msg
-                        for x in ("limit", "range", "too large", "response size", "query")
-                    ):
+                    shrinkable = local_chunk > 500 and (
+                        isinstance(exc, TimeoutError)
+                        or any(
+                            x in msg
+                            for x in (
+                                "limit",
+                                "range",
+                                "too large",
+                                "response size",
+                                "query",
+                                "wall-timeout",
+                                "timeout",
+                                "sem busy",
+                            )
+                        )
+                    )
+                    if shrinkable:
                         local_chunk = max(local_chunk // 2, 500)
+                        logger.warning(
+                            "get_logs_chunked shrink → %s on [%s,%s]: %s",
+                            local_chunk,
+                            cur,
+                            end,
+                            type(exc).__name__,
+                        )
                         continue
                     raise
             return out

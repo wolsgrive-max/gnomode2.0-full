@@ -9,7 +9,8 @@ import pytest
 
 from app.followup import FollowupRunner
 from app.followup_store import FollowupStore
-from app.models import FollowupConfig
+from app.gmgn_portfolio import GmgnBuy
+from app.models import BuyerRow, FollowupConfig
 
 
 @pytest.mark.asyncio
@@ -47,6 +48,7 @@ async def test_live_tip_pass_scans_and_advances_only_on_success(tmp_path):
         enrich_budget_sec=None,
         queue_mcap_retry=False,
         soft_partial=False,
+        tip_deadline_mono=None,
     ):
         scanned.append((from_block, to_block, label, skip_enrich))
         return {
@@ -164,8 +166,10 @@ async def test_tip_estimates_forward_when_block_number_times_out(tmp_path):
         await runner._live_tip_pass(cfg, rpc=rpc)
     assert scanned
     _frm, to_b = scanned[0]
-    # Estimated tip ≈ verified + 30*2 = 100060
+    # Estimated tip ≈ verified + 30*2 = 100060 — may scan ahead…
     assert to_b > verified
+    # …but durable cursor must not advance past last verified tip.
+    assert int(store.get_logwatch_live_cursor() or 0) <= verified
     # Verified tip/ts must not be overwritten by the estimate.
     assert runner._last_known_tip == verified
     assert time.time() - runner._last_tip_ts >= 25.0
@@ -210,6 +214,7 @@ async def test_hist_pass_skips_enrich_and_does_not_embed_live(tmp_path):
         enrich_budget_sec=None,
         queue_mcap_retry=False,
         soft_partial=False,
+        tip_deadline_mono=None,
     ):
         scanned.append((label, skip_enrich, from_block, to_block))
         return {
@@ -246,6 +251,7 @@ async def test_hist_pass_skips_enrich_and_does_not_embed_live(tmp_path):
 
 @pytest.mark.asyncio
 async def test_live_gap_backfill_when_cursor_far_behind(tmp_path):
+    """Far-behind watermark jump lives on catchup — not the tip tick."""
     store = FollowupStore(
         db_path=str(tmp_path / "followup.db"),
         config_path=str(tmp_path / "followup.json"),
@@ -265,41 +271,34 @@ async def test_live_gap_backfill_when_cursor_far_behind(tmp_path):
     runner = FollowupRunner(store=store)
     labels: list[str] = []
 
-    async def fake_scan(
-        cfg,
-        *,
-        rpc,
-        watching,
-        from_block,
-        to_block,
-        fetch_timeout,
-        label,
-        cursor_floor=None,
-        skip_enrich=False,
-        enrich_budget_sec=None,
-        queue_mcap_retry=False,
-        soft_partial=False,
-    ):
-        labels.append(label)
+    async def fake_scan(*_a, **k):
+        labels.append(k.get("label") or "")
         return {
             "new_deals": 0,
             "alerts": 0,
             "skipped": 0,
             "advanced": True,
-            "advance_to": to_block,
+            "advance_to": k["to_block"],
         }
 
     rpc = MagicMock()
     rpc.block_number = AsyncMock(return_value=tip)
+    rpc._prefer_non_alchemy = MagicMock()
     with patch.object(runner, "_logwatch_scan_window", side_effect=fake_scan):
         with patch.object(
             store,
             "list_watching",
             return_value=["0xaaa0000000000000000000000000000000000001"],
         ):
+            # Tip tick must NOT jump — only scan tip window.
             await runner._live_tip_pass(cfg, rpc=rpc)
+            tip_cursor = int(store.get_logwatch_live_cursor() or 0)
+            assert tip_cursor == 50_000
+            assert "live" in labels
+            assert "burst_jump" not in labels and "live_jump" not in labels
+            # Catchup owns the watermark jump.
+            await runner._live_catchup_pass(cfg, rpc=rpc)
     live_now = int(store.get_logwatch_live_cursor() or 0)
-    # Far behind → watermark jump to enrich window (not +200 crawl).
     assert live_now >= tip - 2_100
     assert live_now <= tip
 
@@ -401,7 +400,7 @@ async def test_hist_fail_does_not_degrade_when_live_near_tip(tmp_path):
 
 @pytest.mark.asyncio
 async def test_live_near_tip_only_enriches_tip_window(tmp_path):
-    """Live tick is tip-only — no gap/burst work on the alert critical path."""
+    """Live tip tick is tip-window only — gap park deferred to catchup."""
     store = FollowupStore(
         db_path=str(tmp_path / "followup.db"),
         config_path=str(tmp_path / "followup.json"),
@@ -419,28 +418,14 @@ async def test_live_near_tip_only_enriches_tip_window(tmp_path):
     runner = FollowupRunner(store=store)
     labels: list[str] = []
 
-    async def fake_scan(
-        cfg,
-        *,
-        rpc,
-        watching,
-        from_block,
-        to_block,
-        fetch_timeout,
-        label,
-        cursor_floor=None,
-        skip_enrich=False,
-        enrich_budget_sec=None,
-        queue_mcap_retry=False,
-        soft_partial=False,
-    ):
-        labels.append(label)
+    async def fake_scan(*_a, **k):
+        labels.append(k.get("label") or "")
         return {
             "new_deals": 0,
             "alerts": 0,
             "skipped": 0,
             "advanced": True,
-            "advance_to": to_block,
+            "advance_to": k["to_block"],
         }
 
     rpc = MagicMock()
@@ -454,6 +439,91 @@ async def test_live_near_tip_only_enriches_tip_window(tmp_path):
             await runner._live_tip_pass(cfg, rpc=rpc)
     assert labels == ["live"]
     assert not any(lab.startswith("live_burst") or lab == "live_gap" for lab in labels)
+    # Tip does not park over the gap — cursor stays until catchup.
+    assert int(store.get_logwatch_live_cursor() or 0) == 99_200
+
+
+@pytest.mark.asyncio
+async def test_tip_success_stamps_healthy_despite_catchup_lag(tmp_path):
+    """Tip-window ok must stamp success even when watermark is tip-only-lagged."""
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    tip = 100_000
+    store.set_logwatch_live_cursor(95_500)  # behind=4500 → tip-only
+    cfg = FollowupConfig(
+        enabled=True,
+        logwatch_confirmations=0,
+        logwatch_live_span=300,
+        live_gap_enrich_max_blocks=2_000,
+        buys_only=False,
+    )
+    store.save_config(cfg)
+    runner = FollowupRunner(store=store)
+    runner._last_live_success_ts = 0.0
+
+    async def tip_ok(*_a, **k):
+        return {
+            "new_deals": 0,
+            "alerts": 0,
+            "skipped": 0,
+            "advanced": True,
+            "advance_to": k["to_block"],
+            "incomplete": False,
+            "fetched": 0,
+        }
+
+    rpc = MagicMock()
+    rpc.block_number = AsyncMock(return_value=tip)
+    with patch.object(runner, "_logwatch_scan_window", side_effect=tip_ok):
+        with patch.object(
+            store,
+            "list_watching",
+            return_value=["0xaaa0000000000000000000000000000000000001"],
+        ):
+            await runner._live_tip_pass(cfg, rpc=rpc)
+    assert runner._last_live_success_ts > 0
+    ok, behind = runner._live_tip_healthy(tip=tip)
+    assert ok is True
+    assert behind == 4_500
+
+
+@pytest.mark.asyncio
+async def test_hist_fail_streak_capped(tmp_path):
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    tip = 100_000
+    store.set_logwatch_cursor(50_000)
+    store.set_logwatch_live_cursor(50_000)  # extreme behind, tip not recent
+    cfg = FollowupConfig(
+        enabled=True,
+        logwatch_enabled=True,
+        logwatch_fail_threshold=8,
+        interval_sec=0,
+        buys_only=False,
+    )
+    store.save_config(cfg)
+    runner = FollowupRunner(store=store)
+    runner._last_known_tip = tip
+    runner._last_live_success_ts = 0.0
+    runner._logwatch_fail_streak = 47
+
+    async def hard_fail_pass(_cfg, *, rpc):
+        return False
+
+    rpc_mod = MagicMock()
+    rpc_mod.active_rpc_label = MagicMock(return_value="https://rpc…")
+    with patch.object(runner, "_logwatch_pass", side_effect=hard_fail_pass):
+        with patch.object(runner, "_ops_alert", new_callable=AsyncMock):
+            with patch("app.chain.RpcClient", return_value=rpc_mod):
+                with patch.object(
+                    runner, "_maybe_alert_cursor_lag", new_callable=AsyncMock
+                ):
+                    await runner._cycle_body(cfg, force_all_due=False)
+    assert runner._logwatch_fail_streak == 48
 
 
 @pytest.mark.asyncio
@@ -771,6 +841,7 @@ async def test_live_tip_enriches_even_when_behind_enrich_cap(tmp_path):
         enrich_budget_sec=None,
         queue_mcap_retry=False,
         soft_partial=False,
+        tip_deadline_mono=None,
     ):
         labels.append(label)
         return {
@@ -815,7 +886,8 @@ async def test_skip_enrich_queues_transfers_for_live_drain(tmp_path):
     assert len(runner._pending_skip_transfers) == 1
 
 
-def test_live_tip_healthy_rejects_far_behind_despite_success_ts(tmp_path):
+def test_live_tip_healthy_rejects_extreme_behind_despite_success_ts(tmp_path):
+    """Extreme watermark lag (>> catch-up) stays unhealthy even with a tip stamp."""
     store = FollowupStore(
         db_path=str(tmp_path / "followup.db"),
         config_path=str(tmp_path / "followup.json"),
@@ -828,6 +900,22 @@ def test_live_tip_healthy_rejects_far_behind_despite_success_ts(tmp_path):
     ok, behind = runner._live_tip_healthy(tip=tip)
     assert ok is False
     assert behind == 50_000
+
+
+def test_live_tip_healthy_ok_with_catchup_lag_when_tip_recent(tmp_path):
+    """Tip-only catch-up lag (~4–8k) must not false-flag DEGRADED when tip scans."""
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    tip = 100_000
+    store.set_logwatch_live_cursor(95_500)  # behind=4500
+    runner = FollowupRunner(store=store)
+    runner._last_known_tip = tip
+    runner._last_live_success_ts = __import__("time").time()
+    ok, behind = runner._live_tip_healthy(tip=tip)
+    assert ok is True
+    assert behind == 4_500
 
 
 @pytest.mark.asyncio
@@ -867,6 +955,7 @@ async def test_live_dead_zone_2k_to_8k_bursts_not_bare_skip(tmp_path):
         enrich_budget_sec=None,
         queue_mcap_retry=False,
         soft_partial=False,
+        tip_deadline_mono=None,
     ):
         labels.append((label, skip_enrich))
         return {
@@ -879,6 +968,7 @@ async def test_live_dead_zone_2k_to_8k_bursts_not_bare_skip(tmp_path):
 
     rpc = MagicMock()
     rpc.block_number = AsyncMock(return_value=tip)
+    rpc._prefer_non_alchemy = MagicMock()
     with patch.object(runner, "_logwatch_scan_window", side_effect=fake_scan):
         with patch.object(
             store,
@@ -886,10 +976,336 @@ async def test_live_dead_zone_2k_to_8k_bursts_not_bare_skip(tmp_path):
             return_value=["0xaaa0000000000000000000000000000000000001"],
         ):
             await runner._live_tip_pass(cfg, rpc=rpc)
-    # Tip-only critical path: enrich tip; burst moved to maintenance.
-    assert any(lab == "live" and not skip for lab, skip in labels)
-    assert not any(lab.startswith("live_burst") for lab, _skip in labels)
+            # Tip-only: still enriches tip; no burst on tip tick.
+            assert any(lab == "live" and not skip for lab, skip in labels)
+            assert not any(lab.startswith("live_burst") for lab, _skip in labels)
+            assert int(store.get_logwatch_live_cursor() or 0) == tip - 3_000
+            await runner._live_catchup_pass(cfg, rpc=rpc)
     live_now = int(store.get_logwatch_live_cursor() or 0)
     assert live_now >= tip - 2_100
-    # Must not stall at tip-3000 (old dead zone bare tip-skip).
+    # Catchup must not stall at tip-3000 (old dead zone bare tip-skip).
     assert store.get_logwatch_live_cursor() > tip - 3_000
+
+
+@pytest.mark.asyncio
+async def test_catchup_advances_watermark_even_when_tip_soft_fail(tmp_path):
+    """Tip soft-fail must NOT pause skip-enrich watermark catch-up (death spiral)."""
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    tip = 100_000
+    store.set_logwatch_live_cursor(tip - 5_000)
+    cfg = FollowupConfig(
+        enabled=True,
+        logwatch_confirmations=0,
+        logwatch_live_span=300,
+        live_gap_enrich_max_blocks=2_000,
+        logwatch_burst_catchup_span=5_000,
+        logwatch_catchup_chunks_per_pass=4,
+        buys_only=False,
+    )
+    store.save_config(cfg)
+    runner = FollowupRunner(store=store)
+    runner._live_timeout_streak = 3
+    labels: list[str] = []
+
+    async def fake_scan(*_a, **k):
+        labels.append(str(k.get("label") or ""))
+        return {
+            "new_deals": 0,
+            "alerts": 0,
+            "skipped": 0,
+            "advanced": True,
+            "advance_to": k["to_block"],
+        }
+
+    rpc = MagicMock()
+    rpc.block_number = AsyncMock(return_value=tip)
+    rpc._prefer_non_alchemy = MagicMock()
+    with patch.object(runner, "_logwatch_scan_window", side_effect=fake_scan):
+        with patch.object(
+            store,
+            "list_watching",
+            return_value=["0xaaa0000000000000000000000000000000000001"],
+        ):
+            await runner._live_catchup_pass(cfg, rpc=rpc)
+    assert int(store.get_logwatch_live_cursor() or 0) > tip - 5_000
+    assert any("burst" in lab or lab == "live_burst" or "burst" in lab for lab in labels) or (
+        int(store.get_logwatch_live_cursor() or 0) >= tip - 2_100
+    )
+
+
+def test_purge_stale_pending_tip_transfers(tmp_path):
+    import time as _t
+
+    from app.followup_logwatch import InboundTransfer
+
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    cfg = FollowupConfig(
+        enabled=True,
+        alert_max_buy_age_sec=900,
+        alert_max_block_lag=4_000,
+    )
+    store.save_config(cfg)
+    runner = FollowupRunner(store=store)
+    tip = 100_000
+    runner._last_known_tip = tip
+    now = _t.time()
+    stale = InboundTransfer(
+        wallet="0xaaa0000000000000000000000000000000000001",
+        token="0xbbb0000000000000000000000000000000000001",
+        sender="0xccc0000000000000000000000000000000000001",
+        tx_hash="0xdead",
+        block_number=tip - 50_000,
+        bought_at=now - 7_200,
+    )
+    fresh = InboundTransfer(
+        wallet="0xaaa0000000000000000000000000000000000001",
+        token="0xddd0000000000000000000000000000000000001",
+        sender="0xccc0000000000000000000000000000000000001",
+        tx_hash="0xbeef",
+        block_number=tip - 100,
+        bought_at=now - 30,
+    )
+    runner._pending_skip_transfers = [(stale, now - 60), (fresh, now - 10)]
+    with patch("app.gmgn_portfolio.gmgn_circuit_open", return_value=False):
+        n = runner._purge_stale_pending_transfers(cfg=cfg)
+    assert n == 1
+    assert len(runner._pending_skip_transfers) == 1
+    assert runner._pending_skip_transfers[0][0].token == fresh.token
+
+
+def test_purge_skips_buy_age_while_gmgn_circuit_open(tmp_path):
+    """Circuit freeze must not let buy-age purge kill tip waits."""
+    import time as _t
+
+    from app.followup_logwatch import InboundTransfer
+
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    cfg = FollowupConfig(enabled=True, alert_max_buy_age_sec=900)
+    store.save_config(cfg)
+    runner = FollowupRunner(store=store)
+    tip = 100_000
+    runner._last_known_tip = tip
+    now = _t.time()
+    waiting = InboundTransfer(
+        wallet="0xaaa0000000000000000000000000000000000001",
+        token="0xbbb0000000000000000000000000000000000001",
+        sender="0xccc0000000000000000000000000000000000001",
+        tx_hash="0xdead",
+        block_number=tip - 50,
+        bought_at=now - 1_200,  # past max_age, would purge if circuit closed
+    )
+    runner._pending_skip_transfers = [(waiting, now - 10)]
+    with patch("app.gmgn_portfolio.gmgn_circuit_open", return_value=True):
+        n = runner._purge_stale_pending_transfers(cfg=cfg)
+    assert n == 0
+    assert len(runner._pending_skip_transfers) == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_gmgn_overlays_tip_chain_block(tmp_path):
+    """Tip token already in GMGN post_seed must keep chain block_number."""
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    wallet = "0xaaa0000000000000000000000000000000000001"
+    seed = "0xbbb0000000000000000000000000000000000001"
+    tip_tok = "0xccc0000000000000000000000000000000000001"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token=seed,
+                token_symbol="SEED",
+                bought_tokens=1.0,
+                bought_usd=10.0,
+                mcap_at_first_buy=5_000.0,
+                buys_count=1,
+                first_tx="0xseed",
+            )
+        ],
+        max_deals=5,
+    )
+    cfg = FollowupConfig(enabled=True, max_deals=5)
+    runner = FollowupRunner(store=store)
+    post = [
+        GmgnBuy(tip_tok, "TIP", "0xgmgn", 1_700_000_000),
+    ]
+    inserted = await runner._sync_wallet_gmgn_order(
+        wallet,
+        cfg,
+        post_seed=post,
+        tip_token=tip_tok,
+        tip_symbol="TIP",
+        tip_tx="0xchain",
+        tip_block=99_999,
+        tip_bought_at=1_700_000_050.0,
+        tip_mcap=8_000.0,
+        tip_bought_usd=40.0,
+    )
+    rows = {d["token"]: d for d in store.list_deals_for_wallet(wallet)}
+    assert tip_tok in rows
+    assert int(rows[tip_tok]["block_number"] or 0) == 99_999
+    assert str(rows[tip_tok]["tx_hash"] or "") == "0xchain"
+    assert inserted  # newly inserted tip
+
+
+@pytest.mark.asyncio
+async def test_live_tick_micro_drains_pending(tmp_path):
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    cfg = FollowupConfig(enabled=True, logwatch_enabled=True, buys_only=False)
+    store.save_config(cfg)
+    runner = FollowupRunner(store=store)
+    from app.followup_logwatch import InboundTransfer
+
+    now = time.time()
+    runner._pending_skip_transfers = [
+        (
+            InboundTransfer(
+                wallet="0xaaa0000000000000000000000000000000000001",
+                token="0xbbb0000000000000000000000000000000000002",
+                sender="0xccc0000000000000000000000000000000000003",
+                tx_hash="0xabc",
+                block_number=99_900,
+                bought_at=now - 10,
+            ),
+            now - 5,
+        )
+    ]
+    drained: list[dict] = []
+
+    async def fake_drain(*_a, **kwargs):
+        drained.append(kwargs)
+        return {"new_deals": 0, "alerts": 0}
+
+    with patch.object(runner, "_live_tip_pass", new=AsyncMock()):
+        with patch.object(
+            runner, "_drain_pending_skip_transfers", side_effect=fake_drain
+        ):
+            with patch.object(
+                runner, "_micro_retry_pending_mcap", new=AsyncMock()
+            ):
+                with patch.object(
+                    runner, "_dispatch_outbox", new=AsyncMock(return_value=0)
+                ):
+                    await runner._live_tick(cfg)
+    assert len(drained) == 1
+    assert drained[0].get("max_batch") == 3
+    assert float(drained[0].get("enrich_budget_sec") or 0) >= 2.0
+    assert float(drained[0].get("enrich_budget_sec") or 0) <= 4.0
+
+
+def test_queue_skip_enrich_drops_known_tokens(tmp_path):
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    wallet = "0xaaa0000000000000000000000000000000000001"
+    known_tok = "0xbbb0000000000000000000000000000000000002"
+    fresh_tok = "0xddd0000000000000000000000000000000000004"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token=known_tok,
+                token_symbol="KNOWN",
+                bought_tokens=1.0,
+                bought_usd=10.0,
+                mcap_at_first_buy=5_000.0,
+                buys_count=1,
+                first_tx="0xseed",
+            )
+        ],
+        max_deals=5,
+    )
+    runner = FollowupRunner(store=store)
+    runner._last_known_tip = 100_000
+    from app.followup_logwatch import InboundTransfer
+
+    now = time.time()
+    known_tr = InboundTransfer(
+        wallet=wallet,
+        token=known_tok,
+        sender="0xccc0000000000000000000000000000000000003",
+        tx_hash="0xknown",
+        block_number=99_900,
+        bought_at=now - 10,
+    )
+    fresh_tr = InboundTransfer(
+        wallet=wallet,
+        token=fresh_tok,
+        sender="0xccc0000000000000000000000000000000000003",
+        tx_hash="0xfresh",
+        block_number=99_950,
+        bought_at=now - 5,
+    )
+    runner._pending_skip_transfers = [(known_tr, now - 20)]
+    runner._queue_skip_enrich_transfers([known_tr, fresh_tr])
+    tokens = {t.token.lower() for t, _ in runner._pending_skip_transfers}
+    assert known_tok not in tokens
+    assert fresh_tok in tokens
+
+
+@pytest.mark.asyncio
+async def test_drain_prioritizes_tip_proximal_over_fifo(tmp_path):
+    store = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    cfg = FollowupConfig(enabled=True, buys_only=False)
+    store.save_config(cfg)
+    runner = FollowupRunner(store=store)
+    tip = 100_000
+    runner._last_known_tip = tip
+    from app.followup_logwatch import InboundTransfer
+
+    now = time.time()
+    old_hist = InboundTransfer(
+        wallet="0xaaa0000000000000000000000000000000000001",
+        token="0xbbb0000000000000000000000000000000000001",
+        sender="0xccc0000000000000000000000000000000000001",
+        tx_hash="0xold",
+        block_number=tip - 2_000,
+        bought_at=now - 500,
+    )
+    tip_miss = InboundTransfer(
+        wallet="0xaaa0000000000000000000000000000000000001",
+        token="0xddd0000000000000000000000000000000000002",
+        sender="0xccc0000000000000000000000000000000000001",
+        tx_hash="0xtip",
+        block_number=tip - 20,
+        bought_at=now - 15,
+    )
+    # Hist ghost queued earlier (would win pure FIFO).
+    runner._pending_skip_transfers = [
+        (old_hist, now - 200),
+        (tip_miss, now - 5),
+    ]
+    seen: list[str] = []
+
+    async def fake_process(batch, **_kwargs):
+        seen.extend(t.token for t in batch)
+        return {"new_deals": 0, "alerts": 0, "skipped": 0, "advanced": True}
+
+    with patch(
+        "app.gmgn_portfolio.gmgn_circuit_open", return_value=False
+    ):
+        with patch.object(
+            runner, "_process_logwatch_transfers", side_effect=fake_process
+        ):
+            await runner._drain_pending_skip_transfers(
+                cfg, rpc=MagicMock(), max_batch=1
+            )
+    assert seen == [tip_miss.token]

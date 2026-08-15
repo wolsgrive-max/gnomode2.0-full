@@ -174,8 +174,10 @@ class FollowupBot:
         except Exception:  # noqa: BLE001
             pass
         allowed = {c for c in allowed if c}
+        # Fail closed: without a configured chat, ignore all commands so a
+        # misconfigured bot cannot be driven by arbitrary Telegram users.
         if not allowed:
-            return True
+            return False
         return chat_id in allowed
 
     async def _handle(self, cmd: str, args: list[str]) -> str:

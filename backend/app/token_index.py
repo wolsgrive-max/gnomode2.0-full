@@ -49,6 +49,10 @@ _ENRICH_CONCURRENCY = 2
 # Cold first-wave: keep low — DexScreener + Gecko share public rate limits.
 _COLD_ENRICH_CONCURRENCY = 2
 _INDEX_RPC_CONCURRENCY = 2
+# Factory PairCreated/PoolCreated scans: 100k default chunks wall-time out on
+# public Robinhood RPC and saturate the scoped sem (Watch cycle crashes).
+_INDEX_LOG_CHUNK = 8_000
+_INDEX_LOG_PARALLEL = 1
 _REFRESH_INTERVAL_S = 120
 _ENRICH_TTL_S = 15 * 60  # metrics considered fresh for 15 min
 # Max stale tokens re-enriched per incremental cycle (new tokens are always
@@ -190,7 +194,9 @@ class TokenIndex:
         # Own client with low concurrency so background scans stay polite and
         # don't trigger RPC 429s that would starve the wallet parser.
         if self._rpc is None:
-            self._rpc = RpcClient(concurrency=_INDEX_RPC_CONCURRENCY)
+            self._rpc = RpcClient(
+                concurrency=_INDEX_RPC_CONCURRENCY, sem_scope="token_index"
+            )
         return self._rpc
 
     def _http_client(self) -> httpx.AsyncClient:
@@ -302,26 +308,32 @@ class TokenIndex:
                 0.05,
             )
 
-        v2_logs, v3_logs, v4_logs = await asyncio.gather(
-            rpc.get_logs_chunked(
-                address=UNI_V2_FACTORY,
-                topics=[PAIR_CREATED_TOPIC],
-                from_block=from_block,
-                to_block=tip,
-            ),
-            rpc.get_logs_chunked(
-                address=UNI_V3_FACTORY,
-                topics=[V3_POOL_CREATED_TOPIC],
-                from_block=from_block,
-                to_block=tip,
-            ),
-            rpc.get_logs_chunked(
-                address=UNI_V4_POOL_MANAGER,
-                topics=[V4_INITIALIZE_TOPIC],
-                from_block=from_block,
-                to_block=tip,
-            ),
-        )
+        # Sequential factories + small chunks: a 3-way gather × parallel=2
+        # against concurrency=2 caused sem-busy + 15s/20s wall-timeouts that
+        # crashed Watch via ensure_ready.
+        async def _factory_logs(address: str, topic: str) -> list[Any]:
+            try:
+                return await rpc.get_logs_chunked(
+                    address=address,
+                    topics=[topic],
+                    from_block=from_block,
+                    to_block=tip,
+                    chunk_size=_INDEX_LOG_CHUNK,
+                    parallel=_INDEX_LOG_PARALLEL,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "token_index factory scan soft-fail %s…%s %s: %s",
+                    from_block,
+                    tip,
+                    address[:10],
+                    type(exc).__name__,
+                )
+                return []
+
+        v2_logs = await _factory_logs(UNI_V2_FACTORY, PAIR_CREATED_TOPIC)
+        v3_logs = await _factory_logs(UNI_V3_FACTORY, V3_POOL_CREATED_TOPIC)
+        v4_logs = await _factory_logs(UNI_V4_POOL_MANAGER, V4_INITIALIZE_TOPIC)
 
         new_keys: list[str] = []
         for log in v2_logs:

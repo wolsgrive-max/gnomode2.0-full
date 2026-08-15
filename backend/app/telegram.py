@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import os
 from pathlib import Path
@@ -24,11 +25,38 @@ _ENV_PATHS = (
     Path(__file__).resolve().parents[1] / ".env",  # backend/
 )
 _env_mtime: float | None = None
+_tg_async_client: httpx.AsyncClient | None = None
+_tg_client_lock: asyncio.Lock | None = None
+
+
+def _async_client_lock() -> asyncio.Lock:
+    global _tg_client_lock
+    if _tg_client_lock is None:
+        _tg_client_lock = asyncio.Lock()
+    return _tg_client_lock
+
+
+async def _shared_tg_client() -> httpx.AsyncClient:
+    """Reuse one AsyncClient across alert storms (connection keep-alive)."""
+    global _tg_async_client
+    async with _async_client_lock():
+        client = _tg_async_client
+        if client is None or client.is_closed:
+            _tg_async_client = httpx.AsyncClient(**_TG_CLIENT_KW)
+            client = _tg_async_client
+        return client
 
 
 def _reload_env_files() -> None:
-    """Re-read .env into os.environ when the file changes (no full process restart)."""
+    """Re-read .env into os.environ when the file changes (no full process restart).
+
+    Under pytest we never reload from disk: ``load_dotenv(override=True)`` would
+    clobber test isolation and re-inject live TELEGRAM_* into unit tests
+    (this previously sent a real follow-up alert with fixture addresses).
+    """
     global _env_mtime
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
     mtimes = [p.stat().st_mtime for p in _ENV_PATHS if p.is_file()]
     latest = max(mtimes) if mtimes else 0.0
     if _env_mtime is not None and latest == _env_mtime:
@@ -128,7 +156,7 @@ def _fmt_hold(minutes: float | None) -> str:
 
 
 def format_buyer_block(buyer: BuyerRow) -> str:
-    sym = buyer.token_symbol or "TOKEN"
+    sym = html.escape(buyer.token_symbol or "TOKEN")
     token = buyer.token
     wallet = buyer.wallet
     lines = [
@@ -139,7 +167,7 @@ def format_buyer_block(buyer: BuyerRow) -> str:
         (
             f"Bal {_fmt_num(buyer.wallet_balance_eth)} ETH · "
             f"hold {_fmt_hold(buyer.hold_time_minutes)} · "
-            f"30d tokens {buyer.tokens_traded_7d if buyer.tokens_traded_7d is not None else '—'}"
+            f"unique {buyer.tokens_traded_7d if buyer.tokens_traded_7d is not None else '—'}"
         ),
         f'<a href="https://gmgn.ai/robinhood/token/{token}">GMGN token</a> · '
         f'<a href="https://gmgn.ai/robinhood/address/{wallet}">GMGN wallet</a>',
@@ -147,18 +175,100 @@ def format_buyer_block(buyer: BuyerRow) -> str:
     return "\n".join(lines)
 
 
+def resolve_alert_freshness(
+    *,
+    origin: str | None = None,
+    bought_at: float | None = None,
+    block_number: int | None = None,
+    tip: int | None = None,
+    queued_at: float | None = None,
+    now: float | None = None,
+) -> str:
+    """Human label: ``новое`` (tip/live) vs ``из истории`` (catch-up/stale queue)."""
+    import time as _time
+
+    ts = float(now if now is not None else _time.time())
+    origin_l = (origin or "").strip().lower()
+    # Catch-up/reconcile/pending often carry tip-missed buys that are still
+    # seconds old — label by buy age first so Telegram does not say
+    # «из истории» on a just-bought token.
+    recovery_origins = {
+        "pending",
+        "drain",
+        "reconcile",
+        "retry",
+        "pending_retry",
+        "micro_retry",
+        "legacy",
+        "history",
+        "hist",
+        "catchup",
+    }
+    history_origins = recovery_origins
+
+    def _buy_fresh() -> bool:
+        return (
+            bought_at is not None
+            and float(bought_at) > 0
+            and (ts - float(bought_at)) <= 180.0
+        )
+
+    def _queue_stale() -> bool:
+        return (
+            queued_at is not None
+            and float(queued_at) > 0
+            and (ts - float(queued_at)) > 180.0
+        )
+
+    def _block_stale() -> bool:
+        # Only force history on extreme lag. Systemic catchup lag (~1–4k) must
+        # not relabel a seconds-old buy as «из истории».
+        return (
+            tip is not None
+            and block_number is not None
+            and int(block_number) > 0
+            and int(tip) - int(block_number) > 2_000
+        )
+
+    if _buy_fresh() and not _queue_stale():
+        # Buy clock wins: systemic catchup lag (thousands of blocks) must not
+        # stamp «из истории» on a just-bought token found via reconcile/pending.
+        return "новое"
+    if origin_l in history_origins:
+        return "из истории"
+    if bought_at is not None and float(bought_at) > 0:
+        if (ts - float(bought_at)) > 600.0:
+            return "из истории"
+    if _queue_stale():
+        return "из истории"
+    if _block_stale():
+        return "из истории"
+    if origin_l in ("live", "tip", "raybot", "logwatch"):
+        return "новое"
+    # Missing origin (legacy outbox) — treat as history so revived junk is obvious.
+    if not origin_l:
+        return "из истории"
+    return "новое"
+
+
 def format_followup_deal(
     *,
     wallet: str,
     token: str,
     token_symbol: str,
+    token_name: str = "",
     deal_index: int,
     mcap_at_buy: float | None,
     bought_usd: float | None = None,
     honeypot_reason: str | None = None,
+    freshness: str | None = None,
 ) -> str:
     """HTML block for 2nd/3rd new-token buy @ low mcap."""
-    sym = token_symbol or "TOKEN"
+    sym = html.escape(token_symbol or token_name or "TOKEN")
+    name = html.escape(token_name or "")
+    label = f"{sym} · {name}" if name and name.lower() != sym.lower() else sym
+    fresh = (freshness or "").strip() or "из истории"
+    fresh_esc = html.escape(fresh)
     lines: list[str] = []
     if honeypot_reason:
         # Telegram HTML has no color — red circles + bold math-caps for visibility.
@@ -169,14 +279,14 @@ def format_followup_deal(
                 "<b>‼️ 𝗛𝗢𝗡𝗘𝗬𝗣𝗢𝗧 ‼️</b>",
                 "<b>‼️ 𝗛𝗢𝗡𝗘𝗬𝗣𝗢𝗧 ‼️</b>",
                 "🔴🔴🔴🔴🔴🔴🔴🔴",
-                f"<b>⚠️ HONEYPOT · {honeypot_reason}</b>",
+                f"<b>⚠️ HONEYPOT · {html.escape(str(honeypot_reason))}</b>",
                 "",
             ]
         )
     lines.extend(
         [
-            f"<b>Follow-up · сделка #{deal_index}</b>",
-            f"<b>{sym}</b> · новый токен @ low mcap",
+            f"<b>Follow-up · сделка #{deal_index} · {fresh_esc}</b>",
+            f"<b>{label}</b> · новый токен @ low mcap",
             f"Token: <code>{token}</code>",
             f"Wallet: <code>{wallet}</code>",
             f"mcap@buy ${_fmt_num(mcap_at_buy)}"
@@ -194,17 +304,29 @@ async def send_followup_deal(
     wallet: str,
     token: str,
     token_symbol: str,
+    token_name: str = "",
     deal_index: int,
     mcap_at_buy: float | None,
     bought_usd: float | None = None,
     topic_id: int | None = None,
     honeypot_reason: str | None = None,
     check_honeypot: bool = True,
+    skip_honeypot: bool = True,
+    allow_honeypot_banner: bool = False,
+    freshness: str | None = None,
 ) -> str | None:
-    """Send deal alert: honeypot check first, then Telegram (banner if flagged).
+    """Send deal alert: honeypot check first, then Telegram.
 
-    Returns honeypot reason if flagged, else None.
+    When ``skip_honeypot`` is on and a hard honeypot is found, raises
+    ``RuntimeError("honeypot_suppress:…")`` instead of shipping a banner —
+    outbox treats that as suppress. Soft heuristics still get a banner only
+    if ``allow_honeypot_banner`` is set (default off; outbox defers soft HP).
+
+    Returns honeypot reason if flagged and still sent, else None.
     """
+    from .synth_guard import refuse_telegram_if_unsafe
+
+    refuse_telegram_if_unsafe(wallet=wallet, token=token)
     reason = honeypot_reason
     if check_honeypot and reason is None and token:
         try:
@@ -216,14 +338,22 @@ async def send_followup_deal(
             )
         except Exception:  # noqa: BLE001
             reason = None
+    if reason and skip_honeypot:
+        soft_hp = str(reason).startswith("no_sells") or str(reason).startswith(
+            "buy_sell_asymmetry"
+        )
+        if not soft_hp or not allow_honeypot_banner:
+            raise RuntimeError(f"honeypot_suppress:{reason}")
     text = format_followup_deal(
         wallet=wallet,
         token=token,
         token_symbol=token_symbol,
+        token_name=token_name,
         deal_index=deal_index,
         mcap_at_buy=mcap_at_buy,
         bought_usd=bought_usd,
-        honeypot_reason=reason,
+        honeypot_reason=reason if allow_honeypot_banner else None,
+        freshness=freshness,
     )
     await send_message(chat_id, text, topic_id=topic_id)
     return reason
@@ -298,10 +428,13 @@ async def send_message(
     *,
     topic_id: int | None = None,
 ) -> None:
+    from .synth_guard import refuse_telegram_if_unsafe
+
+    refuse_telegram_if_unsafe()
     url, payload = _message_payload(chat_id, text, topic_id=topic_id)
-    async with httpx.AsyncClient(**_TG_CLIENT_KW) as client:
-        resp = await client.post(url, json=payload)
-        _raise_for_telegram_response(resp)
+    client = await _shared_tg_client()
+    resp = await client.post(url, json=payload)
+    _raise_for_telegram_response(resp)
 
 
 def send_message_sync(
@@ -311,6 +444,9 @@ def send_message_sync(
     topic_id: int | None = None,
 ) -> None:
     """Blocking send for shutdown / signal / excepthook paths."""
+    from .synth_guard import refuse_telegram_if_unsafe
+
+    refuse_telegram_if_unsafe()
     url, payload = _message_payload(chat_id, text, topic_id=topic_id)
     with httpx.Client(timeout=httpx.Timeout(8.0, connect=4.0), trust_env=False) as client:
         resp = client.post(url, json=payload)
@@ -320,9 +456,9 @@ def send_message_sync(
 async def get_me() -> dict:
     """Call Telegram getMe — verifies bot token reaches the API."""
     url = _bot_api_url("getMe")
-    async with httpx.AsyncClient(**_TG_CLIENT_KW) as client:
-        resp = await client.get(url)
-        data = _raise_for_telegram_response(resp)
+    client = await _shared_tg_client()
+    resp = await client.get(url)
+    data = _raise_for_telegram_response(resp)
     return data.get("result") or {}
 
 

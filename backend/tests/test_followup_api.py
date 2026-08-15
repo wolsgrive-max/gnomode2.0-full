@@ -182,3 +182,28 @@ def test_bot_chat_allowed_private_and_configured(tmp_path, monkeypatch):
     assert bot._chat_allowed("-100222", chat_type="supergroup") is True
     assert bot._chat_allowed("-100333", chat_type="supergroup") is True
     assert bot._chat_allowed("-100999", chat_type="supergroup") is False
+
+
+def test_bot_chat_denied_when_no_chats_configured(tmp_path, monkeypatch):
+    """Fail closed — empty allowlist must not open the bot to the world."""
+    store = FollowupStore(
+        db_path=str(tmp_path / "f.db"),
+        config_path=str(tmp_path / "f.json"),
+    )
+    store.save_config(FollowupConfig(telegram_chat_id="", bot_commands_enabled=True))
+    import app.followup_bot as bot_mod
+
+    class _FakeWatchStore:
+        def load_config(self):
+            from app.models import WatchConfig
+
+            return WatchConfig(telegram_chat_id="")
+
+    monkeypatch.setattr(bot_mod, "followup_store", store)
+    monkeypatch.setattr(bot_mod, "resolve_chat_id", lambda override=None: "")
+    import app.watch_store as ws_mod
+
+    monkeypatch.setattr(ws_mod, "watch_store", _FakeWatchStore())
+    bot = bot_mod.FollowupBot()
+    assert bot._chat_allowed("999", chat_type="private") is False
+    assert bot._chat_allowed("-100111", chat_type="supergroup") is False

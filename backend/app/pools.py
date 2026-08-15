@@ -14,6 +14,7 @@ from .constants import (
     QUOTE_TOKENS,
     UNI_V4_POOL_MANAGER,
     USDG,
+    V4_INITIALIZE_TOPIC,
     V3_FEE_TIERS,
     WETH,
     ZERO,
@@ -36,6 +37,96 @@ def _is_bytes32(value: str | None) -> bool:
 
 def _norm_hex(value: str) -> str:
     return value if value.startswith("0x") else f"0x{value}"
+
+
+def _topic_address(value: str) -> str:
+    raw = (value or ZERO).lower().removeprefix("0x")
+    return "0x" + raw.zfill(64)[-64:]
+
+
+def _address_from_topic(value: Any) -> str:
+    raw = value.hex() if isinstance(value, (bytes, bytearray)) else str(value)
+    raw = raw.removeprefix("0x")
+    addr = "0x" + raw[-40:]
+    return ZERO if int(addr, 16) == 0 else checksum(addr)
+
+
+def _rpc_int(value: Any) -> int:
+    if isinstance(value, int):
+        return value
+    return int(str(value), 0)
+
+
+async def discover_v4_pools_onchain(
+    rpc: RpcClient,
+    token: str,
+    *,
+    lookback_blocks: int = 50_000,
+) -> list[PoolInfo]:
+    """Find recent V4 pools by indexed Initialize currencies, no indexer.
+
+    ``Initialize`` indexes both currencies, so two address-filtered getLogs
+    calls cover token-as-currency0 and token-as-currency1. This is primarily a
+    cold-index fallback for brand-new pools; the receipt path in replay is even
+    faster when the buy initializes the pool in the same transaction.
+    """
+    token = checksum(token)
+    tip = int(await rpc.block_number())
+    start = max(1, tip - max(1, int(lookback_blocks)))
+    topic = _topic_address(token)
+    by_currency0, by_currency1 = await asyncio.gather(
+        rpc.get_logs_chunked(
+            address=UNI_V4_POOL_MANAGER,
+            topics=[V4_INITIALIZE_TOPIC, None, topic],
+            from_block=start,
+            to_block=tip,
+            chunk_size=50_000,
+            parallel=2,
+        ),
+        rpc.get_logs_chunked(
+            address=UNI_V4_POOL_MANAGER,
+            topics=[V4_INITIALIZE_TOPIC, None, None, topic],
+            from_block=start,
+            to_block=tip,
+            chunk_size=50_000,
+            parallel=2,
+        ),
+    )
+    out: list[PoolInfo] = []
+    seen: set[str] = set()
+    for log in [*by_currency0, *by_currency1]:
+        topics = list(log.get("topics") or [])
+        if len(topics) < 4:
+            continue
+        pool_id = _norm_hex(
+            topics[1].hex()
+            if isinstance(topics[1], (bytes, bytearray))
+            else str(topics[1])
+        ).lower()
+        if pool_id in seen:
+            continue
+        currency0 = _address_from_topic(topics[2])
+        currency1 = _address_from_topic(topics[3])
+        if token.lower() not in (currency0.lower(), currency1.lower()):
+            continue
+        quote = currency1 if currency0.lower() == token.lower() else currency0
+        q_meta = QUOTE_TOKENS.get(quote.lower(), {})
+        if quote.lower() not in QUOTE_TOKENS:
+            continue
+        out.append(
+            PoolInfo(
+                address=checksum(UNI_V4_POOL_MANAGER),
+                dex="uniswap_v4",
+                quote=quote,
+                quote_symbol=str(q_meta.get("symbol") or "?"),
+                token0=currency0,
+                token1=currency1,
+                pool_id=pool_id,
+                created_block=_rpc_int(log.get("blockNumber") or 0),
+            )
+        )
+        seen.add(pool_id)
+    return out
 
 
 async def fetch_dexscreener_pairs(token: str) -> list[dict[str, Any]]:
@@ -236,11 +327,27 @@ async def discover_pools(rpc: RpcClient, token: str, *, deep: bool = False) -> l
                 return None
             return None
 
-        found = await asyncio.gather(*[lookup(k, q, f) for k, q, f in tasks])
+        async def lookup_v4() -> list[PoolInfo]:
+            try:
+                return await discover_v4_pools_onchain(rpc, token)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("V4 Initialize lookup failed for %s: %s", token, exc)
+                return []
+
+        found_raw, v4_found = await asyncio.gather(
+            asyncio.gather(*[lookup(k, q, f) for k, q, f in tasks]),
+            lookup_v4(),
+        )
+        found = list(found_raw)
         for p in found:
             if p:
                 pools.append(p)
                 seen.add(p.address.lower())
+        for p in v4_found:
+            key = (p.pool_id or p.address).lower()
+            if key not in seen:
+                pools.append(p)
+                seen.add(key)
         to_enrich = [p for p in pools if p.dex in ("uniswap_v2", "uniswap_v3")]
         enriched = await asyncio.gather(*[_enrich_v2v3(rpc, p, token) for p in to_enrich])
         v4 = [p for p in pools if p.dex == "uniswap_v4"]
@@ -284,7 +391,7 @@ async def estimate_start_block(rpc: RpcClient, pool: PoolInfo) -> int:
             created_ts = pool.pair_created_at_ms // 1000
             elapsed = max(0, latest_ts - created_ts)
             # ~10 blocks/sec on Robinhood Chain; small cushion
-            blocks_ago = int(elapsed * 10) + 3_000
+            blocks_ago = int(elapsed * 10) + 2_000
             return max(1, latest - blocks_ago)
         except Exception as exc:  # noqa: BLE001
             logger.debug("timestamp estimate failed: %s", exc)
@@ -309,6 +416,8 @@ async def estimate_start_block(rpc: RpcClient, pool: PoolInfo) -> int:
                     pass
 
     del lookup
+    # Blind lookback covers watch max_pair_age (~24h @ 10 blk/s) when DS/BS
+    # creation metadata is missing — do not shrink below ~24h of blocks.
     return max(1, latest - 300_000)
 
 

@@ -569,7 +569,10 @@ async def _handle_raybot_event(payload: dict, event_type: str) -> None:
             except Exception:  # noqa: BLE001
                 pass
             continue
-        if verdict.past_max:
+        if verdict.past_max and (
+            verdict.rank is None
+            or int(verdict.rank) not in (cfg.alert_on_deals or [2, 3, 4, 5])
+        ):
             continue
         if verdict.rank is None or int(verdict.rank) not in (
             cfg.alert_on_deals or [2, 3, 4, 5]

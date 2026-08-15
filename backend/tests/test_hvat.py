@@ -6,7 +6,7 @@ from pathlib import Path
 
 from app.followup_store import FollowupStore
 from app.hvat import HVAT_FOLLOWUP_TOPIC, HVAT_MCAP, apply_hvat_profile
-from app.models import FollowupConfig, WatchConfig
+from app.models import BuyerRow, FollowupConfig, WatchConfig
 from app.watch_store import WatchStore
 
 
@@ -43,7 +43,7 @@ def test_apply_hvat_profile(tmp_path: Path, monkeypatch):
     assert w.wallet.mcap_threshold == HVAT_MCAP
     assert w.wallet.min_tokens_traded_7d == 1
     assert w.wallet.max_tokens_traded_7d == 1
-    assert w.wallet.tokens_unique_period.value == "7d"
+    assert w.wallet.tokens_unique_period.value == "30d"
 
     f = fstore.load_config()
     assert f.enabled is True
@@ -140,6 +140,105 @@ def test_apply_preserves_custom_followup_topic(tmp_path: Path, monkeypatch):
 
     apply_hvat_profile(enable=True)
     assert fstore.load_config().telegram_topic_id == "9245"
+
+
+def test_apply_hvat_disable_only_pauses(tmp_path: Path, monkeypatch):
+    wstore = WatchStore(
+        config_path=tmp_path / "watch.json",
+        seen_path=tmp_path / "seen.json",
+        state_path=tmp_path / "state.json",
+        hold_path=tmp_path / "hold.json",
+    )
+    fstore = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    import app.hvat as hvat_mod
+
+    monkeypatch.setattr(hvat_mod, "watch_store", wstore)
+    monkeypatch.setattr(hvat_mod, "followup_store", fstore)
+    monkeypatch.setattr(hvat_mod.watch_runner, "notify_config_changed", lambda: None)
+    monkeypatch.setattr(hvat_mod.followup_runner, "notify_config_changed", lambda: None)
+
+    apply_hvat_profile(enable=True)
+    fstore.save_config(
+        FollowupConfig.model_validate(
+            {
+                **fstore.load_config().model_dump(),
+                "max_mcap_alert": 12_000,
+                "telegram_topic_id": "9245",
+            }
+        )
+    )
+    wallet = "0xaaa0000000000000000000000000000000000001"
+    fstore.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token="0xbbb0000000000000000000000000000000000001",
+                token_symbol="SEED",
+                bought_tokens=1.0,
+                bought_usd=40.0,
+                mcap_at_first_buy=5_000.0,
+                buys_count=1,
+                first_tx="0xseed",
+            )
+        ],
+        max_deals=5,
+    )
+    fstore.mark_wallet_done(wallet, deal_count=5)
+    assert fstore.get_wallet_scan_meta(wallet)[2] == "done"
+
+    apply_hvat_profile(enable=False)
+    w = wstore.load_config()
+    f = fstore.load_config()
+    assert w.enabled is False
+    assert f.enabled is False
+    assert f.ingest_from_watch is False
+    assert f.max_mcap_alert == 12_000
+    assert f.telegram_topic_id == "9245"
+    # Disable must not reopen done wallets.
+    assert fstore.get_wallet_scan_meta(wallet)[2] == "done"
+
+
+def test_apply_hvat_forces_one_trade_even_if_max_null(tmp_path: Path, monkeypatch):
+    wstore = WatchStore(
+        config_path=tmp_path / "watch.json",
+        seen_path=tmp_path / "seen.json",
+        state_path=tmp_path / "state.json",
+        hold_path=tmp_path / "hold.json",
+    )
+    from app.models import WatchWalletFilters
+
+    wstore.save_config(
+        WatchConfig(
+            wallet=WatchWalletFilters(
+                min_tokens_traded_7d=1.0,
+                max_tokens_traded_7d=None,
+                mcap_threshold=0.0,
+            )
+        )
+    )
+    fstore = FollowupStore(
+        db_path=str(tmp_path / "followup.db"),
+        config_path=str(tmp_path / "followup.json"),
+    )
+    import app.hvat as hvat_mod
+
+    monkeypatch.setattr(hvat_mod, "watch_store", wstore)
+    monkeypatch.setattr(hvat_mod, "followup_store", fstore)
+    monkeypatch.setattr(hvat_mod.watch_runner, "notify_config_changed", lambda: None)
+    monkeypatch.setattr(hvat_mod.followup_runner, "notify_config_changed", lambda: None)
+
+    out = apply_hvat_profile(enable=True)
+    w = wstore.load_config()
+    assert w.wallet.min_tokens_traded_7d == 1.0
+    assert w.wallet.max_tokens_traded_7d == 1.0
+    # Explicit 0 discovery mcap must not become HVAT_MCAP via `or`.
+    assert w.wallet.mcap_threshold == 0.0
+    assert out["mcap_cap"] == 0.0
+    # Alert ceiling must stay positive — 0 would silence every deal alert.
+    assert fstore.load_config().max_mcap_alert == HVAT_MCAP
 
 
 def test_tokens_unique_period_hours():

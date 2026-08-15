@@ -12,18 +12,28 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urljoin
 
 import httpx
 
 from .config import settings
 from .models import ScreenRequest, ScreenedToken
-from .screener import screen_tokens as screen_tokens_local
+from .screener import (
+    _sorted_rows,
+    screen_tokens as screen_tokens_local,
+)
 
 logger = logging.getLogger(__name__)
 
 ProgressCb = Callable[[str, str, float], Awaitable[None]]
+
+
+class ScreenFeedResult(NamedTuple):
+    """Screen rows plus which feed produced the primary list."""
+
+    tokens: list[ScreenedToken]
+    source: str  # truegnomode | truegnomode+local | local-fallback | local
 
 
 def truegnomode_base_url() -> str:
@@ -225,17 +235,99 @@ async def fetch_truegnomode_screen(
             await asyncio.sleep(poll)
 
 
+def _merge_screen_rows(
+    primary: list[ScreenedToken],
+    extra: list[ScreenedToken],
+    req: ScreenRequest,
+) -> tuple[list[ScreenedToken], int]:
+    """Union screen rows by address; keep max ATH, prefer higher liquidity.
+
+    Returns ``(merged, n_added)`` where ``n_added`` is addresses only in ``extra``.
+    """
+    if not extra:
+        return primary, 0
+    merged: dict[str, ScreenedToken] = {row.address.lower(): row for row in primary}
+    added = 0
+    for row in extra:
+        key = row.address.lower()
+        prev = merged.get(key)
+        if prev is None:
+            merged[key] = row
+            added += 1
+            continue
+        peak = max(
+            float(prev.ath_mcap or 0.0),
+            float(row.ath_mcap or 0.0),
+            float(prev.market_cap or 0.0),
+            float(row.market_cap or 0.0),
+        )
+        winner = row if row.liquidity_usd > prev.liquidity_usd else prev
+        merged[key] = winner.model_copy(update={"ath_mcap": peak})
+    return _sorted_rows(list(merged.values()), req), added
+
+
 async def fetch_screened_tokens(
     req: ScreenRequest,
     *,
     on_progress: ProgressCb | None = None,
     force_enrich_addresses: list[str] | None = None,
-) -> list[ScreenedToken]:
-    """Watch token feed: remote truegnomode when configured, else local screener."""
-    if using_remote_screener():
-        return await fetch_truegnomode_screen(
-            req,
-            on_progress=on_progress,
-            force_enrich_addresses=force_enrich_addresses,
-        )
-    return await screen_tokens_local(req, on_progress=on_progress)
+) -> ScreenFeedResult:
+    """Watch token feed: remote-first, local fallback, remote∪local union.
+
+    When the donor is unreachable, fall back to the in-process token_index
+    screener. When the donor succeeds, still merge local results so silent
+    omissions (token absent from remote ``results[]``) cannot zero a qualify.
+    """
+    remote = using_remote_screener()
+    source = "local"
+    if remote:
+        try:
+            primary = await fetch_truegnomode_screen(
+                req,
+                on_progress=on_progress,
+                force_enrich_addresses=force_enrich_addresses,
+            )
+            source = "truegnomode"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "truegnomode screen failed (%s) — falling back to local screener",
+                type(exc).__name__,
+            )
+            if on_progress is not None:
+                await on_progress(
+                    "screen",
+                    f"truegnomode недоступен ({type(exc).__name__}) — local fallback",
+                    0.08,
+                )
+            primary = await screen_tokens_local(req, on_progress=on_progress)
+            source = "local-fallback"
+            return ScreenFeedResult(tokens=primary, source=source)
+
+        # Silent-omission guard: union with local even when remote is healthy.
+        try:
+            local_rows = await screen_tokens_local(req, on_progress=None)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "local screen union failed (%s) — keeping remote-only",
+                type(exc).__name__,
+            )
+            return ScreenFeedResult(tokens=primary, source=source)
+        tokens, added = _merge_screen_rows(primary, local_rows, req)
+        if added:
+            logger.info(
+                "Screen feed union: remote=%s local_extra=%s total=%s",
+                len(primary),
+                added,
+                len(tokens),
+            )
+            if on_progress is not None:
+                await on_progress(
+                    "screen",
+                    f"truegnomode∪local: +{added} ток. (всего {len(tokens)})",
+                    0.18,
+                )
+            source = "truegnomode+local"
+        return ScreenFeedResult(tokens=tokens, source=source)
+
+    primary = await screen_tokens_local(req, on_progress=on_progress)
+    return ScreenFeedResult(tokens=primary, source=source)

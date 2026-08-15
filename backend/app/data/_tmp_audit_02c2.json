@@ -1,0 +1,36 @@
+{
+  "wallet": "0x02c2faedb05cc1ddd40738a975f57d217ad33ecc",
+  "filters": {
+    "wallet": {
+      "mcap_threshold": 30000.0,
+      "exclude_honeypots": false,
+      "min_wallet_balance_eth": 0.001,
+      "max_wallet_balance_eth": null,
+      "min_hold_time_minutes": null,
+      "max_hold_time_minutes": null,
+      "min_tokens_traded_7d": 1.0,
+      "max_tokens_traded_7d": 1.0,
+      "tokens_unique_period": "30d"
+    },
+    "screen": {
+      "min_liq": 500.0,
+      "max_liq": null,
+      "min_mcap": null,
+      "max_mcap": null,
+      "min_ath_mcap": 40000.0,
+      "min_traders": null,
+      "max_traders": null,
+      "min_pair_age_hours": null,
+      "max_pair_age_hours": 24.0,
+      "exclude_honeypots": false,
+      "sort_by": "liquidity",
+      "sort_order": "desc",
+      "max_results": 10000
+    }
+  },
+  "n_unique_gmgn": 0,
+  "n_unique_period": 0,
+  "period": "30d",
+  "balance_eth": 0.0,
+  "buys": []
+}

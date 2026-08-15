@@ -18,18 +18,19 @@ from .constants import QUOTE_TOKENS, TRANSFER_TOPIC
 logger = logging.getLogger(__name__)
 
 # Soft cap on addresses OR'd into topics[2] per request.
-# 200 OR topics × wide block ranges timed out under 548-wallet load; 100
-# keeps each eth_getLogs small enough for progressive catch-up.
-TOPIC_WALLET_CHUNK = 100
+# Alchemy and public RH RPC often 400 on ≥100 OR topics under load; 50 keeps
+# each eth_getLogs small enough for tip + progressive catch-up.
+TOPIC_WALLET_CHUNK = 50
 _TOPIC_WALLET_CHUNK = TOPIC_WALLET_CHUNK  # backwards-compat alias
 
 
-def topic_batch_count(n_wallets: int) -> int:
+def topic_batch_count(n_wallets: int, *, chunk: int | None = None) -> int:
     """How many OR'd topic batches ``fetch_inbound_transfers`` will issue."""
     n = max(0, int(n_wallets or 0))
     if n <= 0:
         return 1
-    return max(1, (n + TOPIC_WALLET_CHUNK - 1) // TOPIC_WALLET_CHUNK)
+    size = max(1, int(chunk if chunk is not None else TOPIC_WALLET_CHUNK))
+    return max(1, (n + size - 1) // size)
 
 
 def topic_address(addr: str) -> str:
@@ -119,6 +120,7 @@ async def fetch_inbound_transfers(
     batch_timeout_sec: float | None = None,
     batch_parallel: int | None = None,
     deadline_mono: float | None = None,
+    topic_wallet_chunk: int | None = None,
 ) -> list[InboundTransfer]:
     """Fetch ERC-20 Transfer logs where ``to`` ∈ ``wallets`` in ``[from, to]``.
 
@@ -137,6 +139,7 @@ async def fetch_inbound_transfers(
         batch_timeout_sec=batch_timeout_sec,
         batch_parallel=batch_parallel,
         deadline_mono=deadline_mono,
+        topic_wallet_chunk=topic_wallet_chunk,
     )
     return transfers
 
@@ -152,6 +155,7 @@ async def fetch_inbound_transfers_result(
     batch_timeout_sec: float | None = None,
     batch_parallel: int | None = None,
     deadline_mono: float | None = None,
+    topic_wallet_chunk: int | None = None,
 ) -> tuple[list[InboundTransfer], bool]:
     """Like ``fetch_inbound_transfers`` but also returns incomplete flag.
 
@@ -186,7 +190,15 @@ async def fetch_inbound_transfers_result(
 
     # Topic OR batches in parallel. Tip soft_partial raises parallel so one
     # slow Alchemy batch cannot zero the whole tip window.
-    batches = list(_chunked(addrs, _TOPIC_WALLET_CHUNK))
+    wallet_chunk = max(
+        20,
+        int(
+            topic_wallet_chunk
+            if topic_wallet_chunk is not None
+            else TOPIC_WALLET_CHUNK
+        ),
+    )
+    batches = list(_chunked(addrs, wallet_chunk))
     parallel = max(1, int(batch_parallel or (4 if soft_partial else 2)))
     sem = asyncio.Semaphore(parallel)
     per_batch = batch_timeout_sec
@@ -265,6 +277,13 @@ async def fetch_inbound_transfers_result(
             raw_logs.extend(part)
 
     if failed and not soft_partial:
+        # Cancel siblings so their TimeoutError is not "never retrieved" and
+        # zombie getLogs do not keep holding scoped RPC semaphores.
+        if pending:
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            pending.clear()
         assert first_exc is not None
         raise first_exc
     incomplete = failed > 0

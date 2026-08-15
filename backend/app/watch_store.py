@@ -47,16 +47,22 @@ class WatchStore:
         seen_path: str | Path | None = None,
         state_path: str | Path | None = None,
         hold_path: str | Path | None = None,
+        alert_path: str | Path | None = None,
     ) -> None:
         self._config_path = Path(config_path or settings.watch_config_path)
         self._seen_path = Path(seen_path or settings.watch_seen_path)
         self._state_path = Path(state_path or settings.watch_state_path)
         self._hold_path = Path(hold_path or settings.watch_hold_path)
+        self._alert_path = Path(
+            alert_path
+            or (self._hold_path.parent / "watch_alert_outbox.json")
+        )
         self._lock = threading.Lock()
         self._seen: set[str] | None = None
         self._hold: dict[str, dict[str, Any]] | None = None
         # token -> unix parsed_at (0.0 = legacy / unknown → eligible for young requeue)
         self._parsed: dict[str, float] | None = None
+        self._alerts: dict[str, list[dict[str, Any]]] | None = None
         self._last_success_ts: float | None | object = _UNSET
 
     def load_config(self) -> WatchConfig:
@@ -183,11 +189,36 @@ class WatchStore:
                             if not isinstance(v, dict):
                                 continue
                             addr = str(k).lower()
-                            hold[addr] = {
+                            ent: dict[str, Any] = {
                                 "first_seen": float(v.get("first_seen") or time.time()),
                                 "ath_mcap": float(v.get("ath_mcap") or 0.0),
                                 "symbol": str(v.get("symbol") or ""),
                             }
+                            # Pending-parse / probe stamps must survive reload
+                            # (drain-all resumes mid-cycle after restart).
+                            try:
+                                queued = float(v.get("queued_at") or 0.0)
+                            except (TypeError, ValueError):
+                                queued = 0.0
+                            if queued > 0.0:
+                                ent["queued_at"] = queued
+                            try:
+                                probed = float(v.get("ath_probed_at") or 0.0)
+                            except (TypeError, ValueError):
+                                probed = 0.0
+                            if probed > 0.0:
+                                ent["ath_probed_at"] = probed
+                            if v.get("partial_unique"):
+                                ent["partial_unique"] = True
+                            if v.get("filter_wipe"):
+                                ent["filter_wipe"] = True
+                            try:
+                                last_p = float(v.get("last_parsed_at") or 0.0)
+                            except (TypeError, ValueError):
+                                last_p = 0.0
+                            if last_p > 0.0:
+                                ent["last_parsed_at"] = last_p
+                            hold[addr] = ent
                     raw_at = raw.get("parsed_at")
                     if isinstance(raw_at, dict):
                         for k, v in raw_at.items():
@@ -252,14 +283,101 @@ class WatchStore:
             return dict(parsed)
 
     def hold_count(self) -> int:
+        """Hold rows that are not merely parsed requeue-meta (queued or under-gate)."""
         with self._lock:
-            hold, _ = self._ensure_hold_loaded()
-            return len(hold)
+            hold, parsed = self._ensure_hold_loaded()
+            n = 0
+            for addr, ent in hold.items():
+                if addr in parsed and float(ent.get("queued_at") or 0.0) <= 0.0:
+                    continue
+                n += 1
+            return n
 
     def parsed_token_count(self) -> int:
         with self._lock:
             _, parsed = self._ensure_hold_loaded()
             return len(parsed)
+
+    def load_pending_parse(
+        self, *, min_ath_mcap: float | None = None
+    ) -> list[str]:
+        """Unparsed qualify addresses waiting for drain-all parse.
+
+        A hold row becomes pending when it first crosses the ATH gate
+        (``queued_at`` stamped). Survives classify wipe and process restart.
+        """
+        thr = float(min_ath_mcap or 0.0)
+        with self._lock:
+            hold, parsed = self._ensure_hold_loaded()
+            out: list[str] = []
+            for addr, ent in hold.items():
+                if addr in parsed:
+                    continue
+                if float(ent.get("queued_at") or 0.0) <= 0.0:
+                    continue
+                if thr > 0.0 and float(ent.get("ath_mcap") or 0.0) < thr:
+                    continue
+                out.append(addr)
+            return out
+
+    def remove_hold_tokens(self, tokens: list[str] | set[str]) -> int:
+        """Drop hold rows (TTL dust / left-index expire, etc.)."""
+        keys = {str(t).strip().lower() for t in tokens if t}
+        if not keys:
+            return 0
+        with self._lock:
+            hold, _ = self._ensure_hold_loaded()
+            n = 0
+            for key in keys:
+                if key in hold:
+                    del hold[key]
+                    n += 1
+            if n:
+                self._persist_hold()
+            return n
+
+    def clear_pending_queued(self, tokens: list[str] | set[str]) -> int:
+        """Soft age-out: clear ``queued_at`` but keep hold row + ATH peak.
+
+        Aged pending must leave the drain queue (early buyers outside the
+        window), but wiping the row erased Gecko/DS peaks so dump-after-pump
+        tokens could never re-qualify.
+        """
+        keys = {str(t).strip().lower() for t in tokens if t}
+        if not keys:
+            return 0
+        with self._lock:
+            hold, _ = self._ensure_hold_loaded()
+            n = 0
+            for key in keys:
+                ent = hold.get(key)
+                if not ent:
+                    continue
+                if float(ent.get("queued_at") or 0.0) <= 0.0:
+                    continue
+                ent["queued_at"] = 0.0
+                n += 1
+            if n:
+                self._persist_hold()
+            return n
+
+    def clear_all_pending_queued(self) -> int:
+        """Soft-clear every pending-parse stamp (``queued_at``); keep hold/ATH.
+
+        Used by ops to drop a dead backlog without wiping peaks so tokens can
+        re-qualify on the next screen/ATH probe.
+        """
+        with self._lock:
+            hold, _ = self._ensure_hold_loaded()
+            n = 0
+            for ent in hold.values():
+                if float(ent.get("queued_at") or 0.0) <= 0.0:
+                    continue
+                ent["queued_at"] = 0.0
+                n += 1
+            if n:
+                self._persist_hold()
+            return n
 
     def apply_qualify_updates(
         self,
@@ -269,17 +387,30 @@ class WatchStore:
         expired: list[str],
         candidates: list[str] | None = None,
         now: float | None = None,
+        probed_at: dict[str, float] | None = None,
     ) -> None:
         """Persist ATH peaks, upsert hold entries, drop expired ones.
 
-        Waiting tokens (``held``) always get a hold row. Candidates that were
-        already on hold stay until ``mark_token_parsed`` so a failed parse
-        (no pool) can retry next cycle.
+        Waiting tokens (``held``) always get a hold row. Parse candidates are
+        stamped with ``queued_at`` (pending-parse) so drain-all / restart can
+        resume without losing qualify that were not in this screen slice.
+
+        Unparsed pending (``queued_at`` set) is **not** wiped when absent from
+        the current ``held ∪ candidates`` set — only ``expired``, ``parsed``,
+        or explicit ``remove_hold_tokens`` clears it.
+
+        ``probed_at`` stamps ``ath_probed_at`` on hold rows so Gecko probe
+        budget rotates instead of sticky-reprobing the same dust forever.
         """
         now_ts = time.time() if now is None else now
         held_set = {a.lower() for a in held}
         cand_set = {a.lower() for a in (candidates or [])}
         expired_set = {a.lower() for a in expired}
+        probe_stamp = {
+            str(k).strip().lower(): float(v)
+            for k, v in (probed_at or {}).items()
+            if k and float(v) > 0.0
+        }
         with self._lock:
             hold, parsed = self._ensure_hold_loaded()
             dirty = False
@@ -289,14 +420,31 @@ class WatchStore:
                     del hold[key]
                     dirty = True
 
-            def _upsert(key: str, *, create: bool) -> None:
+            def _upsert(key: str, *, create: bool, as_candidate: bool = False) -> None:
                 nonlocal dirty
-                if key in parsed:
-                    if key in hold:
-                        del hold[key]
-                        dirty = True
-                    return
                 ath, sym = ath_updates.get(key, (0.0, ""))
+                if key in parsed:
+                    # Keep ATH/first_seen for young requeue; never wipe meta.
+                    ent = hold.get(key)
+                    if ent is None:
+                        if not create and not ath:
+                            return
+                        hold[key] = {
+                            "first_seen": now_ts,
+                            "ath_mcap": float(ath),
+                            "symbol": sym or "",
+                            "queued_at": 0.0,
+                        }
+                        dirty = True
+                        return
+                    new_ath = max(float(ent.get("ath_mcap") or 0.0), float(ath))
+                    new_sym = sym or str(ent.get("symbol") or "")
+                    if new_ath != ent.get("ath_mcap") or new_sym != ent.get("symbol"):
+                        ent["ath_mcap"] = new_ath
+                        ent["symbol"] = new_sym
+                        dirty = True
+                    # Candidates while still parsed are handled via unparse_tokens.
+                    return
                 ent = hold.get(key)
                 if ent is None:
                     if not create:
@@ -307,25 +455,51 @@ class WatchStore:
                         "symbol": sym or "",
                     }
                     dirty = True
-                    return
-                new_ath = max(float(ent.get("ath_mcap") or 0.0), float(ath))
-                new_sym = sym or str(ent.get("symbol") or "")
-                if new_ath != ent.get("ath_mcap") or new_sym != ent.get("symbol"):
-                    ent["ath_mcap"] = new_ath
-                    ent["symbol"] = new_sym
+                    ent = hold[key]
+                else:
+                    new_ath = max(float(ent.get("ath_mcap") or 0.0), float(ath))
+                    new_sym = sym or str(ent.get("symbol") or "")
+                    if new_ath != ent.get("ath_mcap") or new_sym != ent.get("symbol"):
+                        ent["ath_mcap"] = new_ath
+                        ent["symbol"] = new_sym
+                        dirty = True
+                if as_candidate and float(ent.get("queued_at") or 0.0) <= 0.0:
+                    # First time this addr crossed ATH gate → pending drain.
+                    ent["queued_at"] = now_ts
                     dirty = True
+                if key in probe_stamp:
+                    ts = probe_stamp[key]
+                    if float(ent.get("ath_probed_at") or 0.0) != ts:
+                        ent["ath_probed_at"] = ts
+                        dirty = True
 
             for key in held_set:
                 _upsert(key, create=True)
 
             for key in cand_set:
-                # Keep prior hold rows for retry; do not create new ones.
-                _upsert(key, create=False)
+                # Persist candidates so drain-all / restart never drops qualify.
+                _upsert(key, create=True, as_candidate=True)
+
+            # Stamp probes even when the addr is only in ath_updates / probed set.
+            for key, ts in probe_stamp.items():
+                ent = hold.get(key)
+                if ent is None or key in parsed:
+                    continue
+                if float(ent.get("ath_probed_at") or 0.0) != ts:
+                    ent["ath_probed_at"] = ts
+                    dirty = True
 
             for key in list(hold.keys()):
-                if key in parsed or key in expired_set:
+                if key in expired_set:
                     del hold[key]
                     dirty = True
+                    continue
+                # Parsed requeue-meta rows must survive classify wipe.
+                if key in parsed:
+                    continue
+                ent = hold[key]
+                # Keep unparsed pending-parse across partial classify / restart.
+                if float(ent.get("queued_at") or 0.0) > 0.0:
                     continue
                 if key not in held_set and key not in cand_set:
                     del hold[key]
@@ -334,7 +508,20 @@ class WatchStore:
             if dirty:
                 self._persist_hold()
 
-    def mark_token_parsed(self, token: str, *, at: float | None = None) -> None:
+    def mark_token_parsed(
+        self,
+        token: str,
+        *,
+        at: float | None = None,
+        partial_unique: bool = False,
+        filter_wipe: bool = False,
+    ) -> None:
+        """Stamp parsed_at and clear pending queue flag — keep ATH/first_seen.
+
+        Hold meta must survive so young requeue (``still_young`` via
+        ``first_seen``) works even when the screener omits pair_age. Wiping the
+        row after a successful parse permanently hid pumps from cooldown reparse.
+        """
         key = token.strip().lower()
         if not key:
             return
@@ -342,8 +529,20 @@ class WatchStore:
         with self._lock:
             hold, parsed = self._ensure_hold_loaded()
             parsed[key] = ts
-            if key in hold:
-                del hold[key]
+            ent = hold.get(key)
+            if ent is None:
+                ent = {
+                    "first_seen": ts,
+                    "ath_mcap": 0.0,
+                    "symbol": "",
+                }
+                hold[key] = ent
+            ent["queued_at"] = 0.0
+            ent["last_parsed_at"] = ts
+            if partial_unique:
+                ent["partial_unique"] = True
+            if filter_wipe:
+                ent["filter_wipe"] = True
             self._persist_hold()
 
     def unparse_tokens(self, tokens: list[str] | set[str]) -> int:
@@ -352,12 +551,19 @@ class WatchStore:
         if not keys:
             return 0
         with self._lock:
-            _, parsed = self._ensure_hold_loaded()
+            hold, parsed = self._ensure_hold_loaded()
             n = 0
             for key in keys:
                 if key in parsed:
                     del parsed[key]
                     n += 1
+                ent = hold.get(key)
+                if ent is not None:
+                    # Allow drain-all to pick them up again if still qualify.
+                    if float(ent.get("queued_at") or 0.0) <= 0.0:
+                        ent["queued_at"] = time.time()
+                    ent.pop("partial_unique", None)
+                    ent.pop("filter_wipe", None)
             if n:
                 self._persist_hold()
             return n
@@ -374,6 +580,96 @@ class WatchStore:
             self._parsed = {}
             self._persist_hold()
 
+    # ---------------------------------------------------------------- alert outbox (TG retry, no re-parse)
+
+    def _ensure_alerts_loaded(self) -> dict[str, list[dict[str, Any]]]:
+        if self._alerts is not None:
+            return self._alerts
+        alerts: dict[str, list[dict[str, Any]]] = {}
+        if self._alert_path.is_file():
+            try:
+                raw = json.loads(self._alert_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    for k, v in raw.items():
+                        if not k or not isinstance(v, list):
+                            continue
+                        rows = [x for x in v if isinstance(x, dict)]
+                        if rows:
+                            alerts[str(k).lower()] = rows[:80]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to load alert outbox %s: %r", self._alert_path, exc)
+        self._alerts = alerts
+        return alerts
+
+    def _persist_alerts(self) -> None:
+        assert self._alerts is not None
+        # Bound: newest tokens only.
+        if len(self._alerts) > 80:
+            items = list(self._alerts.items())[-80:]
+            self._alerts = dict(items)
+        self._alert_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._alert_path.with_suffix(self._alert_path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps(self._alerts, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(self._alert_path)
+
+    def enqueue_alert_outbox(
+        self, token: str, buyers: list[Any]
+    ) -> int:
+        """Persist undelivered buyers for a later TG-only flush (no re-parse)."""
+        key = token.strip().lower()
+        if not key or not buyers:
+            return 0
+        rows: list[dict[str, Any]] = []
+        for b in buyers:
+            if hasattr(b, "model_dump"):
+                rows.append(b.model_dump(mode="json"))
+            elif isinstance(b, dict):
+                rows.append(dict(b))
+        if not rows:
+            return 0
+        with self._lock:
+            alerts = self._ensure_alerts_loaded()
+            prev = alerts.get(key) or []
+            seen_w = {
+                str(x.get("wallet") or "").lower()
+                for x in prev
+                if isinstance(x, dict)
+            }
+            added = 0
+            for row in rows:
+                w = str(row.get("wallet") or "").lower()
+                if not w or w in seen_w:
+                    continue
+                prev.append(row)
+                seen_w.add(w)
+                added += 1
+            alerts[key] = prev[:80]
+            self._persist_alerts()
+            return added
+
+    def load_alert_outbox(self) -> dict[str, list[dict[str, Any]]]:
+        with self._lock:
+            return {
+                k: [dict(x) for x in v]
+                for k, v in self._ensure_alerts_loaded().items()
+            }
+
+    def clear_alert_outbox(self, token: str) -> None:
+        key = token.strip().lower()
+        if not key:
+            return
+        with self._lock:
+            alerts = self._ensure_alerts_loaded()
+            if key in alerts:
+                del alerts[key]
+                self._persist_alerts()
+
+    def alert_outbox_count(self) -> int:
+        with self._lock:
+            return sum(len(v) for v in self._ensure_alerts_loaded().values())
 
 _UNSET = object()
 

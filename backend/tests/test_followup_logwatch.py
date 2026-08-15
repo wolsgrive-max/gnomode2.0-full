@@ -67,11 +67,11 @@ def test_parse_transfer_log_skips_non_erc20_topics():
     assert parse_transfer_log({**log, "topics": log["topics"][:2]}) is None
 
 
-def test_topic_batch_count_chunks_at_100():
+def test_topic_batch_count_chunks_at_50():
     assert topic_batch_count(0) == 1
-    assert topic_batch_count(100) == 1
-    assert topic_batch_count(101) == 2
-    assert topic_batch_count(250) == 3
+    assert topic_batch_count(50) == 1
+    assert topic_batch_count(51) == 2
+    assert topic_batch_count(125) == 3
 
 
 @pytest.mark.asyncio

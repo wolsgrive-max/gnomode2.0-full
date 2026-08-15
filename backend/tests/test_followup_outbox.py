@@ -269,6 +269,156 @@ async def test_deliver_soft_honeypot_enqueues_outbox_recheck(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_deliver_hard_honeypot_tip_fresh_enqueues_recheck(tmp_path):
+    """Tip-fresh hard HP must not mark_notified — enqueue for outbox recheck."""
+    store = _store(tmp_path)
+    store.save_config(
+        FollowupConfig(
+            enabled=True,
+            alert_skip_honeypot=True,
+            telegram_chat_id="-1001",
+            alert_max_buy_age_sec=900,
+        )
+    )
+    now = time.time()
+    wallet = "0xaaa0000000000000000000000000000000000001"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token="0xbbb0000000000000000000000000000000000001",
+                token_symbol="SEED",
+                bought_tokens=1.0,
+                bought_usd=40.0,
+                mcap_at_first_buy=5_000.0,
+                buys_count=1,
+                first_tx="0xseed",
+            )
+        ],
+        max_deals=5,
+    )
+    deal = store.record_deal(
+        wallet=wallet,
+        token="0xccc0000000000000000000000000000000000002",
+        token_symbol="TIP",
+        mcap_at_buy=9_000.0,
+        bought_usd=70.0,
+        max_deals=5,
+        block_number=99_990,
+        bought_at=now - 30,
+    )
+    assert deal is not None
+    runner = FollowupRunner(store=store)
+    runner._last_known_tip = 100_000
+
+    with (
+        patch.object(
+            runner,
+            "_gate_outbox_deal",
+            AsyncMock(
+                return_value=(
+                    "ok",
+                    {
+                        "deal_index": deal.deal_index,
+                        "wallet": deal.wallet,
+                        "token": deal.token,
+                    },
+                )
+            ),
+        ),
+        patch.object(runner, "_dispatch_outbox", AsyncMock(return_value=0)),
+        patch.object(
+            runner,
+            "_ensure_deal_token_labels",
+            AsyncMock(side_effect=lambda d, **_: d),
+        ),
+    ):
+        ok = await runner._deliver_deal_alert(
+            "-1001",
+            deal=deal,
+            topic_id=None,
+            honeypot_reason="gmgn:honeypot",
+            origin="live",
+        )
+
+    assert ok is True
+    rows = store.list_deals_for_wallet(wallet)
+    tip_row = next(r for r in rows if r["token"] == deal.token)
+    assert tip_row["notified"] in (0, 1)  # claimed via outbox
+    assert store.outbox_stats()["pending"] == 1
+    # Must have claimed (notified) via outbox path, not silent honeypot burn
+    # without enqueue — pending outbox proves enqueue happened.
+
+
+@pytest.mark.asyncio
+async def test_deliver_gmgn_discard_tip_fresh_does_not_burn(tmp_path):
+    store = _store(tmp_path)
+    store.save_config(
+        FollowupConfig(
+            enabled=True,
+            telegram_chat_id="-1001",
+            alert_max_buy_age_sec=900,
+        )
+    )
+    now = time.time()
+    wallet = "0xaaa0000000000000000000000000000000000001"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token="0xbbb0000000000000000000000000000000000001",
+                token_symbol="SEED",
+                bought_tokens=1.0,
+                bought_usd=40.0,
+                mcap_at_first_buy=5_000.0,
+                buys_count=1,
+                first_tx="0xseed",
+            )
+        ],
+        max_deals=5,
+    )
+    deal = store.record_deal(
+        wallet=wallet,
+        token="0xccc0000000000000000000000000000000000002",
+        token_symbol="TIP",
+        mcap_at_buy=9_000.0,
+        bought_usd=70.0,
+        max_deals=5,
+        block_number=99_990,
+        bought_at=now - 20,
+    )
+    assert deal is not None
+    runner = FollowupRunner(store=store)
+    runner._last_known_tip = 100_000
+
+    with (
+        patch.object(
+            runner,
+            "_gate_outbox_deal",
+            AsyncMock(return_value=("discard", None)),
+        ),
+        patch.object(
+            runner,
+            "_ensure_deal_token_labels",
+            AsyncMock(side_effect=lambda d, **_: d),
+        ),
+    ):
+        ok = await runner._deliver_deal_alert(
+            "-1001",
+            deal=deal,
+            topic_id=None,
+            origin="live",
+        )
+
+    assert ok is False
+    tip_row = next(
+        r for r in store.list_deals_for_wallet(wallet) if r["token"] == deal.token
+    )
+    assert tip_row["notified"] == 0
+    assert store.outbox_stats().get("pending", 0) == 0
+
+
+@pytest.mark.asyncio
 async def test_deliver_gmgn_uncertain_still_enqueues(tmp_path):
     """GMGN defer must durable-enqueue so tip buys survive 429/circuit."""
     store = _store(tmp_path)
@@ -342,6 +492,7 @@ async def test_buys_only_accepts_quote_spend_router(tmp_path):
     router = "0xrouter0000000000000000000000000000000001"
     rpc = SimpleNamespace(
         batch_is_eoa=AsyncMock(return_value={pool: False}),
+        batch_get_receipts=AsyncMock(return_value={}),
     )
 
     with (
@@ -500,6 +651,37 @@ async def test_classify_logwatch_buys_unit():
     assert buys[0].tx_hash == "0xbuy"
     assert skipped >= 1
     assert not uncertain
+
+
+@pytest.mark.asyncio
+async def test_classify_third_party_requeues_when_quote_disabled():
+    """Router/aggregator buys must not hard-skip when tip disables quote lookup."""
+    from app.followup import classify_logwatch_buys
+    from app.followup_logwatch import InboundTransfer
+    from types import SimpleNamespace
+
+    wallet = "0xaaa0000000000000000000000000000000000001"
+    pool = "0x8366a39cc670b4001a1121b8f6a443a643e40951"
+    router = "0xbbb000000000000000000000000000000000000b"
+    buy = InboundTransfer(
+        wallet=wallet,
+        token="0xccc0000000000000000000000000000000000002",
+        sender=pool,
+        tx_hash="0xrouter",
+        block_number=1,
+        bought_at=time.time(),
+    )
+    rpc = SimpleNamespace(batch_is_eoa=AsyncMock(return_value={pool: False}))
+    buys, uncertain, skipped = await classify_logwatch_buys(
+        [buy],
+        rpc=rpc,
+        sender_map={"0xrouter": router},
+        senders_ok=True,
+        allow_quote_lookup=False,
+    )
+    assert buys == []
+    assert skipped == 0
+    assert len(uncertain) == 1
 
 
 @pytest.mark.asyncio
@@ -817,6 +999,39 @@ async def test_dispatch_discards_past_max_invent_junk(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_gate_outbox_allows_max_deals_rank(tmp_path):
+    """Deal #max_deals (past_max window length) must not be discarded."""
+    from app.followup import GmgnRankVerdict
+
+    store = _store(tmp_path)
+    deal = _seed_deal(store)
+    runner = FollowupRunner(store=store)
+    # Simulate old buggy shape: past_max True but rank still alertable #5.
+    # Gate must still allow (defensive); verdict fix sets past_max False.
+    verdict = GmgnRankVerdict(
+        uncertain=False,
+        reason="ok",
+        seed_token="0xbbb0000000000000000000000000000000000001",
+        post_seed=(),
+        rank=5,
+        past_max=True,
+    )
+    with patch.object(runner, "_gmgn_rank_verdict", AsyncMock(return_value=verdict)):
+        action, gated = await runner._gate_outbox_deal(
+            {
+                "kind": "deal",
+                "wallet": deal.wallet,
+                "token": deal.token,
+                "deal_index": 5,
+            },
+            FollowupConfig(max_deals=5, alert_on_deals=[2, 3, 4, 5]),
+        )
+    assert action == "ok"
+    assert gated is not None
+    assert gated["deal_index"] == 5
+
+
+@pytest.mark.asyncio
 async def test_gate_outbox_defers_when_rank_none(tmp_path):
     """Unranked tip must soft-defer, not permanently discard+burn."""
     from app.followup import GmgnRankVerdict
@@ -968,6 +1183,89 @@ async def test_drain_keeps_durable_row_when_tip_lag_requeues(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_drain_continues_under_gmgn_circuit(tmp_path):
+    """Circuit must not hard-pause drain — classify/rank from cache can proceed."""
+    from unittest.mock import MagicMock
+
+    from app.followup import GmgnRankVerdict
+    from app.followup_logwatch import InboundTransfer
+
+    store = _store(tmp_path)
+    cfg = FollowupConfig(
+        enabled=True,
+        max_deals=5,
+        alert_on_deals=[2, 3, 4, 5],
+        alert_max_buy_age_sec=900,
+        buys_only=False,
+        alert_skip_honeypot=False,
+        telegram_chat_id="-1001",
+    )
+    store.save_config(cfg)
+    wallet = "0xaaa0000000000000000000000000000000000001"
+    tip_token = "0xbbb0000000000000000000000000000000000002"
+    store.ingest_buyers(
+        [
+            BuyerRow(
+                wallet=wallet,
+                token="0xbbb0000000000000000000000000000000000001",
+                token_symbol="SEED",
+                bought_tokens=1.0,
+                bought_usd=40.0,
+                mcap_at_first_buy=5_000.0,
+                buys_count=1,
+                first_tx="0xseed",
+            )
+        ],
+        max_deals=5,
+    )
+    runner = FollowupRunner(store=store)
+    runner._last_known_tip = 100_000
+    now = time.time()
+    tr = InboundTransfer(
+        wallet=wallet,
+        token=tip_token,
+        sender=wallet,
+        tx_hash="0xabc",
+        block_number=99_900,
+        bought_at=now - 30,
+    )
+    runner._queue_skip_enrich_transfers([tr])
+    ok = GmgnRankVerdict(
+        uncertain=False,
+        reason="ok",
+        seed_token="0xbbb0000000000000000000000000000000000001",
+        post_seed=(),
+        rank=2,
+        past_max=False,
+    )
+    rpc = MagicMock()
+    with (
+        patch.object(runner, "_gmgn_rank_verdict", AsyncMock(return_value=ok)),
+        patch.object(
+            runner,
+            "_enrich_transfer",
+            AsyncMock(return_value=(1_000.0, 50.0, None, "TOK", "")),
+        ),
+        patch.object(
+            runner,
+            "_prefetch_transfer_enrichment",
+            AsyncMock(return_value={}),
+        ),
+        patch.object(runner, "_deliver_deal_alert", AsyncMock(return_value=True)),
+        patch("app.gmgn_portfolio.gmgn_api_configured", return_value=True),
+        patch("app.gmgn_portfolio.gmgn_circuit_open", return_value=True),
+        patch("app.followup.telegram_configured", return_value=True),
+        patch("app.followup.resolve_chat_id", return_value="-1001"),
+    ):
+        stats = await runner._drain_pending_skip_transfers(cfg, rpc=rpc)
+    assert stats["new_deals"] >= 1 or tip_token.lower() in store.known_tokens(wallet)
+    # Must not leave the tip forever parked solely because circuit was open.
+    assert not any(
+        t.token.lower() == tip_token.lower() for t, _ in runner._pending_skip_transfers
+    )
+
+
+@pytest.mark.asyncio
 async def test_dispatch_releases_lease_on_cancel(tmp_path):
     """CancelledError must not leave the row stuck in ``sending``."""
     store = _store(tmp_path)
@@ -1012,7 +1310,8 @@ async def test_dispatch_releases_lease_on_cancel(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_soft_honeypot_defers_not_sent(tmp_path):
+async def test_dispatch_soft_honeypot_ships_immediately(tmp_path):
+    """Soft DexScreener heuristics must not delay tip alerts by 45s loops."""
     store = _store(tmp_path)
     store.save_config(
         FollowupConfig(
@@ -1023,6 +1322,7 @@ async def test_dispatch_soft_honeypot_defers_not_sent(tmp_path):
     )
     deal = _seed_deal(store)
     key = f"deal:{deal.wallet.lower()}:{deal.token.lower()}"
+    now = time.time()
     payload = json.dumps(
         {
             "v": 1,
@@ -1036,12 +1336,16 @@ async def test_dispatch_soft_honeypot_defers_not_sent(tmp_path):
             "bought_usd": 70.0,
             "honeypot_reason": "no_sells:fresh",
             "check_honeypot": False,
+            "bought_at": now - 20,
+            "block_number": 99_950,
+            "origin": "live",
         }
     )
     store.claim_and_enqueue_deal(
         deal.wallet, deal.token, dedup_key=key, payload=payload
     )
     runner = FollowupRunner(store=store)
+    runner._last_known_tip = 100_000
     sent = AsyncMock(return_value=None)
     with (
         patch("app.followup.send_followup_deal", sent),
@@ -1053,10 +1357,65 @@ async def test_dispatch_soft_honeypot_defers_not_sent(tmp_path):
     ):
         delivered = await runner._dispatch_outbox(store.load_config())
 
-    assert delivered == 0
-    assert sent.await_count == 0
-    assert store.outbox_stats()["sent"] == 0
-    assert store.outbox_stats()["pending"] == 1
+    assert delivered == 1
+    assert sent.await_count == 1
+    assert store.outbox_stats()["sent"] == 1
+    assert store.outbox_stats()["pending"] == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_hard_honeypot_tip_fresh_ships_immediately(tmp_path):
+    """Tip-fresh hard HP false positives must ship now, not sit in outbox."""
+    store = _store(tmp_path)
+    store.save_config(
+        FollowupConfig(
+            enabled=True,
+            alert_skip_honeypot=True,
+            telegram_chat_id="-1001",
+            alert_max_buy_age_sec=900,
+        )
+    )
+    now = time.time()
+    deal = _seed_deal(store)
+    key = f"deal:{deal.wallet.lower()}:{deal.token.lower()}"
+    payload = json.dumps(
+        {
+            "v": 1,
+            "kind": "deal",
+            "chat": "-1001",
+            "wallet": deal.wallet,
+            "token": deal.token,
+            "token_symbol": "T2",
+            "deal_index": deal.deal_index,
+            "mcap_at_buy": 9_000.0,
+            "bought_usd": 70.0,
+            "honeypot_reason": "gmgn:honeypot",
+            "check_honeypot": False,
+            "bought_at": now - 40,
+            "block_number": 99_950,
+            "origin": "live",
+        }
+    )
+    store.claim_and_enqueue_deal(
+        deal.wallet, deal.token, dedup_key=key, payload=payload
+    )
+    runner = FollowupRunner(store=store)
+    runner._last_known_tip = 100_000
+    sent = AsyncMock(return_value=None)
+    with (
+        patch("app.followup.send_followup_deal", sent),
+        patch.object(
+            runner,
+            "_gate_outbox_deal",
+            AsyncMock(return_value=("ok", json.loads(payload))),
+        ),
+    ):
+        delivered = await runner._dispatch_outbox(store.load_config())
+
+    assert delivered == 1
+    assert sent.await_count == 1
+    assert store.outbox_stats()["sent"] == 1
+    assert store.outbox_stats()["pending"] == 0
 
 
 @pytest.mark.asyncio

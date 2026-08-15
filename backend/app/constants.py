@@ -17,6 +17,13 @@ UNI_V3_FACTORY = "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA"
 UNI_V3_ROUTER = "0xCaf681a66D020601342297493863E78C959E5cb2"
 UNIVERSAL_ROUTER = "0x8876789976dEcBfCbBbe364623C63652db8C0904"
 UNI_V4_POOL_MANAGER = "0x8366A39cC670b4001A1121B8f6a443A643e40951"
+# Canonical off-chain lens for PoolManager state on Robinhood Chain.
+# StateView.getSlot0(poolId) exposes current sqrtPriceX96 without relying on an
+# indexer. Deployment is documented by Robinhood Uniswap integrations.
+UNI_V4_STATE_VIEW = "0xF3334192D15450CdD385c8B70e03f9A6bD9E673b"
+# Deep WETH/USDG V3 0.05% pool, used as an indexer-free ETH/USD oracle for
+# alert-time valuation. Resolved from the canonical V3 factory on chain 4663.
+WETH_USDG_V3_POOL = "0x69BfaF19C9f377BB306a89aEd9F6B07e2c1a8d9a"
 
 ZERO = "0x0000000000000000000000000000000000000000"
 
@@ -186,6 +193,21 @@ UNI_V3_POOL_ABI = [
         "inputs": [],
         "name": "liquidity",
         "outputs": [{"type": "uint128"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
+
+UNI_V4_STATE_VIEW_ABI = [
+    {
+        "inputs": [{"name": "poolId", "type": "bytes32"}],
+        "name": "getSlot0",
+        "outputs": [
+            {"name": "sqrtPriceX96", "type": "uint160"},
+            {"name": "tick", "type": "int24"},
+            {"name": "protocolFee", "type": "uint24"},
+            {"name": "lpFee", "type": "uint24"},
+        ],
         "stateMutability": "view",
         "type": "function",
     },

@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     )
 
     rpc_url: str = "https://rpc.mainnet.chain.robinhood.com"
+    # Alchemy Robinhood mainnet key → primary HTTPS endpoint when set.
+    alchemy_api_key: str = ""
+    # Extra comma-separated RPC URLs used after Alchemy / rpc_url on failover.
+    rpc_urls: str = ""
     blockscout_api_key: str = ""
     # GMGN OpenAPI (https://openapi.gmgn.ai) — portfolio activity / verify deals.
     # Empty → public docs key (rate-limited). Create your own at https://gmgn.ai/ai
@@ -53,6 +57,9 @@ class Settings(BaseSettings):
     # Follow-up watchlist (SQLite) + optional RayBot EVM sync
     followup_db_path: str = str(_DEFAULT_DATA / "followup.db")
     followup_config_path: str = str(_DEFAULT_DATA / "followup.json")
+    # Durable exact unique-token counts (survives restart; TTL default 6h).
+    unique_cache_path: str = str(_DEFAULT_DATA / "wallet_unique.db")
+    unique_cache_ttl_sec: float = 6 * 3600
     raybot_api_user: str = ""
     raybot_api_token: str = ""
     # Bot number from RayBot docs (1 = @ray_purple_bot). 0 = webhook destination.

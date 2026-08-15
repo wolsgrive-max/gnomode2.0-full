@@ -22,13 +22,16 @@ logger = logging.getLogger(__name__)
 # for the rest of the process lifetime.
 _pro_disabled: bool = False
 
-# Global Blockscout pacing (shared limiter). Keep conservative — follow-up
-# accuracy/speed comes from paid GMGN; Blockscout is fallback + watch metrics.
+# Global Blockscout pacing (shared limiter). Keep conservative on the public
+# explorer; Pro key unlocks a modestly higher ceiling for watch unique enrich.
 # ~2–3 req/s with concurrency 2 avoided transfer 429 storms in production.
 _BS_CONCURRENCY = 2
 _BS_MIN_INTERVAL = 0.40  # seconds between request *starts*
+_BS_CONCURRENCY_PRO = 4
+_BS_MIN_INTERVAL_PRO = 0.22
 _BS_MAX_ATTEMPTS = 8
-_bs_sem = asyncio.Semaphore(_BS_CONCURRENCY)
+_bs_sem_public = asyncio.Semaphore(_BS_CONCURRENCY)
+_bs_sem_pro = asyncio.Semaphore(_BS_CONCURRENCY_PRO)
 _bs_pace_lock = asyncio.Lock()
 _bs_next_ok = 0.0
 
@@ -39,6 +42,14 @@ def _public_base() -> str:
 
 def _use_pro() -> bool:
     return bool(settings.blockscout_api_key) and not _pro_disabled
+
+
+def _bs_sem() -> asyncio.Semaphore:
+    return _bs_sem_pro if _use_pro() else _bs_sem_public
+
+
+def _bs_min_interval() -> float:
+    return _BS_MIN_INTERVAL_PRO if _use_pro() else _BS_MIN_INTERVAL
 
 
 def disable_blockscout_pro(reason: str) -> None:
@@ -84,12 +95,13 @@ def blockscout_auth_params() -> dict[str, str]:
 async def _pace_blockscout() -> None:
     """Wait until the shared Blockscout token-bucket allows another request."""
     global _bs_next_ok
+    interval = _bs_min_interval()
     async with _bs_pace_lock:
         now = time.time()
         wait = _bs_next_ok - now
         if wait > 0:
             await asyncio.sleep(wait)
-        _bs_next_ok = time.time() + _BS_MIN_INTERVAL
+        _bs_next_ok = time.time() + interval
 
 
 def _retry_after_seconds(resp: Any, fallback: float, *, cap: float = 60.0) -> float:
@@ -119,7 +131,7 @@ async def _get_json(
         url = f"{_base_url()}{path}"
         req_params = {**blockscout_auth_params(), **params}
         resp = None
-        async with _bs_sem:
+        async with _bs_sem():
             await _pace_blockscout()
             try:
                 resp = await client.get(url, params=req_params, headers=_headers())

@@ -26,11 +26,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
 from .blockscout import _get_json, blockscout_api_base
-from .buy_gate import is_wallet_initiated_buy
+from .buy_gate import is_dex_buy_transfer, is_wallet_initiated_buy
 from .chain import RpcClient, checksum, topic_address
 from .config import settings
 from .constants import BLOCKS_PER_SECOND, QUOTE_TOKENS, TRANSFER_TOPIC
 from .models import BuyerRow, ParseRequest
+from . import wallet_unique_cache as unique_cache
 
 logger = logging.getLogger(__name__)
 
@@ -44,14 +45,74 @@ _BALANCE_TTL = 120.0
 _balance_cache: dict[str, tuple[float, float]] = {}
 
 _TOKENS7D_TTL = 600.0
-_TOKENS7D_CACHE_VER = "v7"  # fail-open on unknown + sender retries / quote-spend
+_TOKENS7D_CACHE_VER = "v10"  # SPCX removed from QUOTE_TOKENS
 _tokens7d_cache: dict[str, tuple[int, float]] = {}
+
+
+def followup_unique_floor(wallet: str, token: str) -> int:
+    """Lower bound on distinct buys from follow-up deals.
+
+    Relay / permit2 routes often never Transfer the bought token to the EOA
+    (tokens stay on intermediate contracts), so Blockscout inbound unique
+    undercounts. Follow-up already recorded prior watch/GMGN buys — treat the
+    current parse token as +1 when it is not yet in deals.
+    """
+    try:
+        from .followup_store import followup_store
+
+        known = followup_store.known_tokens(wallet)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("followup unique floor skipped: %s", exc)
+        return 0
+    token_l = (token or "").strip().lower()
+    n = len(known)
+    if token_l and token_l not in known:
+        n += 1
+    return n
+
+
+def apply_followup_unique_floor(
+    count: int | None, wallet: str, token: str
+) -> int | None:
+    """Raise ``count`` to at least the follow-up floor; keep ``None`` if floor=0."""
+    floor = followup_unique_floor(wallet, token)
+    if floor <= 0:
+        return count
+    if count is None:
+        return floor
+    return max(int(count), floor)
 
 _HOLDING_TTL = 180.0
 _hold_cache: dict[tuple[str, str], tuple[int, int | None, float]] = {}
 
 _CACHE_MAX = 50_000
 _CACHE_PRUNE_AGE = 3600.0
+
+# Process-wide: at most N tokens run unique/Blockscout enrich at once.
+# Created lazily so tests can monkeypatch PARSE_UNIQUE_CONCURRENCY.
+_unique_enrich_sem: asyncio.Semaphore | None = None
+_unique_enrich_sem_n: int | None = None
+_unique_enrich_sem_lock = asyncio.Lock()
+
+
+async def _unique_enrich_semaphore() -> asyncio.Semaphore:
+    """Shared unique-enrich gate (resized if constant changes in tests)."""
+    global _unique_enrich_sem, _unique_enrich_sem_n
+    from .watch_qualify import PARSE_UNIQUE_CONCURRENCY
+
+    n = max(1, int(PARSE_UNIQUE_CONCURRENCY))
+    async with _unique_enrich_sem_lock:
+        if _unique_enrich_sem is None or _unique_enrich_sem_n != n:
+            _unique_enrich_sem = asyncio.Semaphore(n)
+            _unique_enrich_sem_n = n
+        return _unique_enrich_sem
+
+
+def reset_unique_enrich_semaphore_for_tests() -> None:
+    """Drop cached sem so the next acquire picks up a monkeypatched concurrency."""
+    global _unique_enrich_sem, _unique_enrich_sem_n
+    _unique_enrich_sem = None
+    _unique_enrich_sem_n = None
 
 
 def _prune_cache(cache: dict, now: float) -> None:
@@ -85,6 +146,44 @@ def _passes(value: float | None, lo: float | None, hi: float | None) -> bool:
     if hi is not None and value > hi:
         return False
     return True
+
+
+async def _gmgn_unique_buys_in_window(
+    wallet: str,
+    *,
+    lookback_hours: float,
+) -> int | None:
+    """Count distinct non-quote GMGN buys in the lookback window.
+
+    Used as fail-soft when Blockscout undercounts (exact 0 / None) and as a
+    max-filter guard when a low BS count would PASS early-buyer (Relay wallets
+    with no inbound Transfer still show unique=0/1 on BS while GMGN has many).
+    Returns ``None`` when the OpenAPI fetch fails / rate-limits.
+    """
+    from .gmgn_portfolio import fetch_unique_buys
+
+    try:
+        result = await fetch_unique_buys(wallet, max_pages=3)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "GMGN unique fail-soft lookup failed for %s: %s",
+            wallet[:12],
+            type(exc).__name__,
+        )
+        return None
+    if not result.ok or result.rate_limited:
+        return None
+    cutoff_ts = time.time() - max(float(lookback_hours or 168.0), 1.0) * 3600.0
+    tokens: set[str] = set()
+    for buy in result.buys:
+        tok = str(buy.token or "").lower()
+        if not tok or tok in QUOTE_TOKENS:
+            continue
+        ts = int(buy.timestamp or 0)
+        if ts > 0 and ts < cutoff_ts:
+            continue
+        tokens.add(tok)
+    return len(tokens)
 
 
 async def batch_wallet_balances(
@@ -369,6 +468,11 @@ async def _tokens_traded_7d_one(
     A transfer counts only when ``tx.from == wallet`` (wallet-initiated swap).
     Airdrops / third-party multicalls that credit the wallet are ignored.
 
+    Cheap multi-trader reject: accumulate sync ``is_dex_buy_transfer`` hits in
+    ``approx``; when ``too_many`` is set and ``len(approx) > too_many``, run the
+    full buy-gate only until confirmed buys exceed ``too_many``. In the pass
+    band (``len(approx) <= too_many``), every approx token gets a full gate.
+
     Returns ``(count, exact)``. May stop early when:
     - ``enough`` is met (min-only pass) → ``exact=False``
     - ``too_many`` is exceeded (max fail) → ``exact=False``
@@ -379,6 +483,25 @@ async def _tokens_traded_7d_one(
     # Inbound-only pages: sells/outbound noise must not fill the window.
     params: dict[str, object] = {"filter": "to"}
     tokens: set[str] = set()
+    approx: set[str] = set()
+    pending: dict[str, dict] = {}
+
+    async def _confirm_pending(*, stop_when_approx_ok: bool) -> tuple[int, bool] | None:
+        """Full buy-gate on pending items. Return early-exit or None."""
+        for addr in list(pending):
+            if stop_when_approx_ok and too_many is not None and len(approx) <= too_many:
+                break
+            item = pending.pop(addr)
+            if await is_wallet_initiated_buy(item, wallet_l):
+                tokens.add(addr)
+                if enough is not None and too_many is None and len(tokens) >= enough:
+                    return len(tokens), False
+                if too_many is not None and len(tokens) > too_many:
+                    return len(tokens), False
+            else:
+                approx.discard(addr)
+        return None
+
     try:
         for _ in range(_MAX_TRANSFER_PAGES):
             resp = await _bs_get(url, params)
@@ -396,21 +519,32 @@ async def _tokens_traded_7d_one(
                     break
                 tok = item.get("token") or {}
                 addr = str(tok.get("address") or tok.get("address_hash") or "").lower()
-                if not addr or addr in QUOTE_TOKENS or addr in tokens:
+                if not addr or addr in QUOTE_TOKENS or addr in approx or addr in tokens:
                     continue
-                if not await is_wallet_initiated_buy(item, wallet_l):
+                if not is_dex_buy_transfer(item, wallet_l):
                     continue
-                tokens.add(addr)
-                if enough is not None and too_many is None and len(tokens) >= enough:
-                    return len(tokens), False
-                if too_many is not None and len(tokens) > too_many:
-                    return len(tokens), False
+                approx.add(addr)
+                pending[addr] = item
+                # Multi-trader: confirm only until real buys exceed too_many.
+                if too_many is not None and len(approx) > too_many:
+                    early = await _confirm_pending(stop_when_approx_ok=True)
+                    if early is not None:
+                        return early
+                # Min-only: confirm once cheap hits cover the floor.
+                elif enough is not None and too_many is None and len(approx) >= enough:
+                    early = await _confirm_pending(stop_when_approx_ok=False)
+                    if early is not None:
+                        return early
             next_params = data.get("next_page_params")
             if reached_cutoff or not next_params or not items:
                 break
             params = dict(next_params)
             if "filter" not in params:
                 params["filter"] = "to"
+        # Pass band (or no max): full buy-gate for remaining approx tokens.
+        early = await _confirm_pending(stop_when_approx_ok=False)
+        if early is not None:
+            return early
     except Exception as exc:  # noqa: BLE001
         logger.warning("tokens-7d lookup failed for %s: %s", wallet, exc)
         return None
@@ -428,16 +562,31 @@ async def batch_tokens_traded_7d(
     """Distinct ERC-20 tokens traded in ``lookback_hours``; paced + bounded retries."""
     now = time.time()
     hours = max(float(lookback_hours or 168.0), 1.0)
-    cache_prefix = f"{_TOKENS7D_CACHE_VER}:h{int(hours)}:"
+    period_hours = max(int(hours), 1)
+    cache_prefix = f"{_TOKENS7D_CACHE_VER}:h{period_hours}:"
     out: dict[str, int | None] = {}
     misses: list[str] = []
+    unique_cache.maybe_seed()
+
+    def _trust_cached(count: int) -> bool:
+        # Stale low counts falsely PASS max filters (unique=1 after 2nd buy).
+        if too_many is not None and int(count) <= int(too_many):
+            return False
+        return True
+
     for w in dict.fromkeys(w.lower() for w in wallets):
         cached = _tokens7d_cache.get(f"{cache_prefix}{w}")
         if cached is not None and now - cached[1] < _TOKENS7D_TTL:
-            out[w] = cached[0]
-        else:
-            out[w] = None
-            misses.append(w)
+            if _trust_cached(cached[0]):
+                out[w] = cached[0]
+                continue
+        durable = unique_cache.get_exact(w, period_hours, now=now)
+        if durable is not None and _trust_cached(durable):
+            out[w] = durable
+            _tokens7d_cache[f"{cache_prefix}{w}"] = (durable, now)
+            continue
+        out[w] = None
+        misses.append(w)
 
     if not misses:
         return out
@@ -447,31 +596,43 @@ async def batch_tokens_traded_7d(
     total = len(misses)
     lock = asyncio.Lock()
     label = f"{hours:g}h"
+    from .watch_qualify import PARSE_UNIQUE_WALLET_FANOUT
+
+    fanout = max(1, int(PARSE_UNIQUE_WALLET_FANOUT))
+    wallet_sem = asyncio.Semaphore(fanout)
 
     async def one(wallet: str) -> None:
         nonlocal done
-        delay = 0.6
-        for attempt in range(_MAX_METRIC_ATTEMPTS):
-            result = await _tokens_traded_7d_one(
-                wallet, cutoff, enough=enough, too_many=too_many
-            )
-            if result is not None:
-                count, exact = result
-                out[wallet] = count
-                # Never cache early-exit lower/upper bounds — a later tighter
-                # filter would otherwise reuse an incomplete count.
-                if exact:
-                    _tokens7d_cache[f"{cache_prefix}{wallet}"] = (
-                        count, time.time()
-                    )
-                break
-            if attempt + 1 < _MAX_METRIC_ATTEMPTS:
-                logger.warning(
-                    "tokens-%s retry %s/%s for %s in %.1fs",
-                    label, attempt + 1, _MAX_METRIC_ATTEMPTS, wallet[:12], delay,
+        async with wallet_sem:
+            delay = 0.6
+            for attempt in range(_MAX_METRIC_ATTEMPTS):
+                result = await _tokens_traded_7d_one(
+                    wallet, cutoff, enough=enough, too_many=too_many
                 )
-                await asyncio.sleep(delay)
-                delay = min(delay * 1.6, 10.0)
+                if result is not None:
+                    count, exact = result
+                    out[wallet] = count
+                    # Never cache early-exit lower/upper bounds — a later tighter
+                    # filter would otherwise reuse an incomplete count.
+                    if exact:
+                        stamp = time.time()
+                        _tokens7d_cache[f"{cache_prefix}{wallet}"] = (count, stamp)
+                        await asyncio.to_thread(
+                            unique_cache.put_exact,
+                            wallet,
+                            period_hours,
+                            count,
+                            exact=True,
+                            now=stamp,
+                        )
+                    break
+                if attempt + 1 < _MAX_METRIC_ATTEMPTS:
+                    logger.warning(
+                        "tokens-%s retry %s/%s for %s in %.1fs",
+                        label, attempt + 1, _MAX_METRIC_ATTEMPTS, wallet[:12], delay,
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 1.6, 10.0)
         async with lock:
             done += 1
             if on_progress and (done == total or done % 5 == 0 or done <= 3):
@@ -500,12 +661,16 @@ async def enrich_and_filter_buyers(
     start_block: int,
     end_block: int,
     on_progress: ProgressCb | None = None,
+    out_meta: dict | None = None,
 ) -> list[BuyerRow]:
     """Filter buyers with metrics — expensive work only on surviving wallets.
 
     Order: balance (cheap RPC) → hold (shared log scan, early-stop) →
     tokens 7d (Blockscout, early-exit on min/max) → fill missing display
     balances for the final shortlist.
+
+    ``out_meta`` (optional) receives ``unique_partial`` / ``unique_skipped`` so
+    watch can stamp hold for young requeue without raising the unique wall.
     """
     if not buyers:
         return buyers
@@ -520,44 +685,75 @@ async def enrich_and_filter_buyers(
     want_t7 = tokens_7d_filter_active(req)
     initial = len(kept)
 
+    # Drop smart-contract "buyers" (relay / helper hops). V2 used to attribute
+    # pool→contract before EOA resolve; contracts must never enter Хвать TG.
+    if kept and hasattr(rpc, "batch_is_eoa"):
+        try:
+            eoa_map = await rpc.batch_is_eoa([b.wallet for b in kept])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("EOA filter skipped: %s", exc)
+            eoa_map = {}
+        if isinstance(eoa_map, dict) and eoa_map:
+            before_c = len(kept)
+            # Explicit False drops; missing key keeps (fail-open on partial maps).
+            kept = [
+                b
+                for b in kept
+                if eoa_map.get(b.wallet.lower(), True) is not False
+            ]
+            dropped = before_c - len(kept)
+            if dropped:
+                await prog(
+                    "filter",
+                    f"Contracts: dropped {dropped} non-EOA hop(s) "
+                    f"({before_c} → {len(kept)})",
+                    0.855,
+                )
+            if not kept:
+                return []
+
     if not (want_bal or want_hold or want_t7):
         await prog(
             "wallets",
-            f"No wallet filters — keeping all {initial} early buyers",
+            f"No wallet filters — keeping all {len(kept)} early buyers",
             0.95,
         )
     else:
         await prog(
             "wallets",
-            f"Wallet filters on {initial} buyers "
+            f"Wallet filters on {len(kept)} buyers "
             f"(balance={want_bal}, hold={want_hold}, tokens7d={want_t7})",
             0.86,
         )
 
-    # 1) Balance first — cheapest and often the strongest cut.
-    if want_bal and kept:
-        before = len(kept)
-        await prog("filter", f"Balance: fetching {before} wallets…", 0.88)
-        balances = await batch_wallet_balances(rpc, [b.wallet for b in kept])
-        survivors: list[BuyerRow] = []
-        unknown = 0
-        for row in kept:
-            row.wallet_balance_eth = balances.get(row.wallet.lower())
-            if row.wallet_balance_eth is None:
-                unknown += 1
-            if _passes(
-                row.wallet_balance_eth,
-                req.min_wallet_balance_eth,
-                req.max_wallet_balance_eth,
-            ):
-                survivors.append(row)
-        kept = survivors
-        await prog(
-            "filter",
-            f"Balance: {before} → {len(kept)} kept"
-            + (f" ({unknown} unknown dropped)" if unknown else ""),
-            0.89,
-        )
+        # 1) Balance first — cheapest and often the strongest cut.
+        # Fail-open on unknown balance (RPC miss) — mirror unique fail-open so
+        # transient eth_getBalance flakes do not wipe early buyers.
+        if want_bal and kept:
+            before = len(kept)
+            await prog("filter", f"Balance: fetching {before} wallets…", 0.88)
+            balances = await batch_wallet_balances(rpc, [b.wallet for b in kept])
+            survivors: list[BuyerRow] = []
+            unknown = 0
+            for row in kept:
+                row.wallet_balance_eth = balances.get(row.wallet.lower())
+                if row.wallet_balance_eth is None:
+                    unknown += 1
+                    survivors.append(row)
+                    continue
+                if _passes(
+                    row.wallet_balance_eth,
+                    req.min_wallet_balance_eth,
+                    req.max_wallet_balance_eth,
+                ):
+                    survivors.append(row)
+            kept = survivors
+            await prog(
+                "filter",
+                f"Balance: {before} → {len(kept)} kept"
+                + (f" ({unknown} unknown kept)" if unknown else ""),
+                0.89,
+            )
 
     # 2) Hold time — one chronological Transfer scan, stop when all sold.
     if want_hold and kept:
@@ -582,7 +778,18 @@ async def enrich_and_filter_buyers(
         await prog("filter", f"Hold time: {before} → {len(kept)} kept", 0.91)
 
     # 3) Unique tokens in lookback — most expensive; run on the shortlist only.
+    # Process in batches and stop once we have enough passers (Хвать does not
+    # need every unique=1 wallet on a 300-buyer token).
+    # Process-wide unique slot: parse ×N otherwise stampede Blockscout and the
+    # per-token wall trips with fewer wallets examined.
     if want_t7 and kept:
+        from .watch_qualify import (
+            PARSE_MAX_PASSING_BUYERS,
+            PARSE_UNIQUE_BATCH,
+            unique_lookup_batch_size,
+            unique_wall_sec,
+        )
+
         before = len(kept)
         enough: int | None = None
         too_many: int | None = None
@@ -602,39 +809,229 @@ async def enrich_and_filter_buyers(
             "value",
             None,
         ) or f"{lookback_h:g}h"
+        pass_cap = max(1, int(PARSE_MAX_PASSING_BUYERS))
+        max_batch = max(1, int(PARSE_UNIQUE_BATCH))
+        wall_sec = unique_wall_sec(before)
+
         await prog(
             "filter",
-            f"Tokens {period_label}: counting for {before} wallets…",
-            0.92,
+            f"Tokens {period_label}: waiting unique slot "
+            f"(up to {before} wallets, cap {pass_cap}, wall {wall_sec:.0f}s)…",
+            0.915,
         )
-        tokens_7d = await batch_tokens_traded_7d(
-            [b.wallet for b in kept],
-            on_progress=on_progress,
-            enough=enough,
-            too_many=too_many,
-            lookback_hours=lookback_h,
-        )
-        survivors = []
-        unknown = 0
-        for row in kept:
-            row.tokens_traded_7d = tokens_7d.get(row.wallet.lower())
-            if row.tokens_traded_7d is None:
-                # Blockscout flake: keep candidate (fail-open) so one-trade wallets
-                # are not dropped when unique lookup temporarily fails.
-                unknown += 1
-                survivors.append(row)
-                continue
-            if _passes(
-                float(row.tokens_traded_7d),
-                req.min_tokens_traded_7d,
-                req.max_tokens_traded_7d,
-            ):
-                survivors.append(row)
+        unique_sem = await _unique_enrich_semaphore()
+        wait_t0 = time.time()
+        async with unique_sem:
+            waited = time.time() - wait_t0
+            if waited >= 0.5:
+                logger.info(
+                    "unique slot waited %.1fs token=%s",
+                    waited,
+                    token[:12],
+                )
+            # Wall starts only after we own the slot — queue wait must not burn it.
+            wall_deadline = time.time() + wall_sec
+            await prog(
+                "filter",
+                f"Tokens {period_label}: counting up to {before} wallets "
+                f"(adaptive batches ≤{max_batch}, stop at {pass_cap} pass "
+                f"or {wall_sec:.0f}s)…",
+                0.92,
+            )
+            survivors = []
+            unknown = 0
+            soft_rescued = 0
+            examined = 0
+            idx = 0
+            wall_hit = False
+            while idx < len(kept) and len(survivors) < pass_cap:
+                if time.time() >= wall_deadline:
+                    wall_hit = True
+                    break
+                batch_n = unique_lookup_batch_size(
+                    pass_cap=pass_cap,
+                    n_survivors=len(survivors),
+                    max_batch=max_batch,
+                )
+                if batch_n <= 0:
+                    break
+                batch = kept[idx : idx + batch_n]
+                idx += len(batch)
+                tokens_7d = await batch_tokens_traded_7d(
+                    [b.wallet for b in batch],
+                    on_progress=on_progress,
+                    enough=enough,
+                    too_many=too_many,
+                    lookback_hours=lookback_h,
+                )
+                # Decide the whole fetched batch even if wall expired mid-decide —
+                # RPC already paid; dropping the tail silently hid valid wallets.
+                # With a max unique bound, unknown counts must not reach TG
+                # (MANCER: wall + fail-open → "30d tokens —" multi-traders).
+                # Min-only stays fail-open so indexer flakes do not erase uniques.
+                fail_closed_unknown = too_many is not None
+                for row in batch:
+                    if len(survivors) >= pass_cap:
+                        break
+                    examined += 1
+                    raw_n = tokens_7d.get(row.wallet.lower())
+                    # Follow-up prior deals beat BS undercount (Relay/permit2:
+                    # token never lands on the EOA → inbound unique misses).
+                    floored = apply_followup_unique_floor(raw_n, row.wallet, token)
+                    if (
+                        floored is not None
+                        and raw_n is not None
+                        and int(floored) > int(raw_n)
+                    ):
+                        logger.info(
+                            "unique floor: BS=%s → FU=%s wallet=%s token=%s",
+                            raw_n,
+                            floored,
+                            row.wallet[:12],
+                            token[:12],
+                        )
+                    elif floored is not None and raw_n is None:
+                        logger.info(
+                            "unique floor: BS=None → FU=%s wallet=%s token=%s",
+                            floored,
+                            row.wallet[:12],
+                            token[:12],
+                        )
+                    row.tokens_traded_7d = floored
+                    if row.tokens_traded_7d is None:
+                        gmgn_n = await _gmgn_unique_buys_in_window(
+                            row.wallet, lookback_hours=lookback_h
+                        )
+                        if gmgn_n is not None and _passes(
+                            float(gmgn_n),
+                            req.min_tokens_traded_7d,
+                            req.max_tokens_traded_7d,
+                        ):
+                            row.tokens_traded_7d = gmgn_n
+                            soft_rescued += 1
+                            survivors.append(row)
+                            logger.info(
+                                "unique fail-soft: BS=None GMGN=%s wallet=%s",
+                                gmgn_n,
+                                row.wallet[:12],
+                            )
+                            continue
+                        if fail_closed_unknown:
+                            unknown += 1
+                            continue
+                        # Min-only: keep candidate so one-trade wallets are not
+                        # dropped when unique lookup temporarily fails.
+                        unknown += 1
+                        survivors.append(row)
+                        continue
+                    if _passes(
+                        float(row.tokens_traded_7d),
+                        req.min_tokens_traded_7d,
+                        req.max_tokens_traded_7d,
+                    ):
+                        # Max filter: BS undercount (Relay / no inbound Transfer)
+                        # + FU floor=1 (current token only) falsely PASSes
+                        # early-buyer. WOOF: BS=0 → FU=1 while GMGN had ~60.
+                        # Cross-check GMGN whenever a low/unknown BS count would
+                        # admit the wallet.
+                        if too_many is not None and (
+                            raw_n is None or int(raw_n) <= int(too_many)
+                        ):
+                            gmgn_n = await _gmgn_unique_buys_in_window(
+                                row.wallet, lookback_hours=lookback_h
+                            )
+                            if gmgn_n is not None:
+                                merged = max(
+                                    int(row.tokens_traded_7d), int(gmgn_n)
+                                )
+                                if merged != int(row.tokens_traded_7d):
+                                    logger.info(
+                                        "unique max-guard: BS=%s FU=%s "
+                                        "GMGN=%s → %s wallet=%s",
+                                        raw_n,
+                                        floored,
+                                        gmgn_n,
+                                        merged,
+                                        row.wallet[:12],
+                                    )
+                                row.tokens_traded_7d = merged
+                                if not _passes(
+                                    float(merged),
+                                    req.min_tokens_traded_7d,
+                                    req.max_tokens_traded_7d,
+                                ):
+                                    continue
+                        survivors.append(row)
+                        continue
+                    # Fail-soft: exact Blockscout 0 can miss a real buy (indexer lag).
+                    # Only rescue the min-floor case — never soft-pass overshoot > max.
+                    if (
+                        int(row.tokens_traded_7d) == 0
+                        and raw_n is not None
+                        and int(raw_n) == 0
+                        and req.min_tokens_traded_7d is not None
+                        and float(req.min_tokens_traded_7d) > 0
+                    ):
+                        gmgn_n = await _gmgn_unique_buys_in_window(
+                            row.wallet, lookback_hours=lookback_h
+                        )
+                        if gmgn_n is not None and _passes(
+                            float(gmgn_n),
+                            req.min_tokens_traded_7d,
+                            req.max_tokens_traded_7d,
+                        ):
+                            row.tokens_traded_7d = gmgn_n
+                            soft_rescued += 1
+                            survivors.append(row)
+                            logger.info(
+                                "unique fail-soft: BS=0 GMGN=%s wallet=%s",
+                                gmgn_n,
+                                row.wallet[:12],
+                            )
+                            continue
+                if time.time() >= wall_deadline:
+                    wall_hit = True
+                    break
+
+            # Wall left a tail never fetched.
+            # Max set → fail-closed (unexamined stay out; young requeue via meta).
+            # Min-only → fail-open (same as historical BS-None path).
+            if len(survivors) < pass_cap and idx < len(kept):
+                wall_hit = True
+                if too_many is None:
+                    for row in kept[idx:]:
+                        if len(survivors) >= pass_cap:
+                            break
+                        unknown += 1
+                        survivors.append(row)
+                else:
+                    unknown += max(0, len(kept) - idx)
+
+        skipped = max(0, before - len(survivors))
         kept = survivors
+        soft_note = f", soft_rescue={soft_rescued}" if soft_rescued else ""
+        wall_note = ", wall_stop" if wall_hit else ""
+        open_note = f", open/unknown={unknown}" if unknown else ""
+        if out_meta is not None:
+            out_meta["unique_partial"] = bool(wall_hit and examined < before)
+            out_meta["unique_skipped"] = int(skipped)
+            out_meta["unique_wall"] = bool(wall_hit)
+        if wall_hit or examined < before:
+            logger.info(
+                "unique capped: kept=%s examined=%s (cap=%s wall=%s open=%s) token=%s",
+                len(kept),
+                examined,
+                pass_cap,
+                wall_hit,
+                unknown,
+                token[:12],
+            )
         await prog(
             "filter",
             f"Tokens 7d: {before} → {len(kept)} kept"
-            + (f" ({unknown} unknown kept)" if unknown else ""),
+            + open_note
+            + soft_note
+            + wall_note,
             0.96,
         )
 

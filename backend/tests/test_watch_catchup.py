@@ -56,3 +56,35 @@ def test_last_success_ts_persists(tmp_path):
         state_path=tmp_path / "state.json",
     )
     assert store2.load_last_success_ts() == 123456.0
+
+
+def test_should_drain_without_sleep():
+    from app.watch import should_drain_without_sleep
+
+    assert should_drain_without_sleep(
+        pending_count=12, enabled=True, user_stopped=False
+    )
+    assert not should_drain_without_sleep(
+        pending_count=0, enabled=True, user_stopped=False
+    )
+    assert not should_drain_without_sleep(
+        pending_count=5, enabled=True, user_stopped=True
+    )
+    assert not should_drain_without_sleep(
+        pending_count=5, enabled=False, user_stopped=False
+    )
+    assert not should_drain_without_sleep(
+        pending_count=5, enabled=True, user_stopped=False, force_run=True
+    )
+
+
+def test_should_defer_ath_probe():
+    from app.watch_qualify import should_defer_ath_probe
+
+    assert not should_defer_ath_probe(1)
+    assert not should_defer_ath_probe(11)
+    assert should_defer_ath_probe(12)
+    assert should_defer_ath_probe(1282)
+    assert not should_defer_ath_probe(0)
+    assert not should_defer_ath_probe(2, min_pending=5)
+    assert should_defer_ath_probe(5, min_pending=5)

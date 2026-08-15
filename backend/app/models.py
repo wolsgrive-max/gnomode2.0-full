@@ -383,19 +383,22 @@ class FollowupConfig(BaseModel):
     # Live gap backfill may enrich+alert only when live cursor is this close
     # to tip. Larger gaps are cursor-only (skip_enrich) — otherwise hist lag
     # replays old buys as fake «deal #2/#3» Telegram spam.
-    live_gap_enrich_max_blocks: int = Field(default=2_000, ge=100, le=50_000)
+    # Tip enrich always runs on the tip window regardless; this caps gap enrich.
+    live_gap_enrich_max_blocks: int = Field(default=3_000, ge=100, le=50_000)
     # Do not Telegram-alert deals whose buy is older than this (seconds).
     alert_max_buy_age_sec: int = Field(default=900, ge=60, le=86_400)
     # Do not Telegram-alert deals whose block is more than this behind tip.
-    alert_max_block_lag: int = Field(default=2_000, ge=100, le=50_000)
+    # Slightly above typical tip-growth during a live tick / short burst.
+    alert_max_block_lag: int = Field(default=4_000, ge=100, le=50_000)
     # Tip-first / live-priority threshold for hist (hist no longer embeds live).
     logwatch_live_priority_lag: int = Field(default=3_000, ge=100, le=200_000)
     # Dedicated live tip poll period (seconds). Independent of hist cycle.
     live_interval_sec: float = Field(default=1.5, ge=0.5, le=30.0)
     # Wall-time for live tip enrich (parallel mcap/meta/honeypot).
     live_enrich_budget_sec: float = Field(default=3.0, ge=1.0, le=15.0)
-    # Watchdog for one live tip tick (must stay well under hist cycle_timeout).
-    live_cycle_timeout_sec: int = Field(default=45, ge=10, le=180)
+    # Watchdog for one live tip tick (tip getLogs + enrich + soft_partial).
+    # Floor in _live_loop is max(55, this); default must match real budget.
+    live_cycle_timeout_sec: int = Field(default=60, ge=10, le=180)
     # Hard wall-time for one logwatch getLogs pass (excludes enrichment).
     logwatch_fetch_timeout_sec: int = Field(default=45, ge=5, le=300)
     # Confirmations before advancing the log cursor (reorg safety).
